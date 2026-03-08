@@ -1,0 +1,16 @@
+faster-whisper
+vosk
+sounddevice
+torch
+requests
+edge-tts
+playsound==1.2.2
+pyttsx3
+rich
+textual
+keyboard
+numpy
+pyyaml
+scipy
+piper-tts
+pywin32; platform_system == "Windows"

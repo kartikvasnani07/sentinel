@@ -1,0 +1,16 @@
+venv/
+models/
+logs/
+build/
+__pycache__/
+*.pt
+*.bin
+*.onnx
+*.ckpt
+*.wav
+*.mp3
+*.zip
+*.tar
+*.exe
+qwen3tts/
+*.safetensors

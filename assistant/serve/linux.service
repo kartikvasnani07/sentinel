@@ -1,0 +1,12 @@
+[Unit]
+Description=AI Assistant Service
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+ExecStart=/usr/bin/python3 /path/to/assistant/main.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

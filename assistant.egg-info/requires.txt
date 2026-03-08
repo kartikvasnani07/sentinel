@@ -1,0 +1,9 @@
+faster-whisper
+vosk
+sounddevice
+torch
+requests
+pyttsx3
+rich
+textual
+keyboard

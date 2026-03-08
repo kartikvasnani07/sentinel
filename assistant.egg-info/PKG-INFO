@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: assistant
+Version: 1.0
+Requires-Dist: faster-whisper
+Requires-Dist: vosk
+Requires-Dist: sounddevice
+Requires-Dist: torch
+Requires-Dist: requests
+Requires-Dist: pyttsx3
+Requires-Dist: rich
+Requires-Dist: textual
+Requires-Dist: keyboard
+Dynamic: requires-dist
