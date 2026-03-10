@@ -5,12 +5,30 @@ import platform
 import re
 import shutil
 import subprocess
+import time
 import webbrowser
+from ctypes import POINTER, cast
 from dataclasses import dataclass
 from difflib import get_close_matches
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import quote_plus
+
+import keyboard
+import requests
+
+try:
+    from comtypes import CLSCTX_ALL
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+except Exception:  # pragma: no cover - optional dependency
+    CLSCTX_ALL = None
+    AudioUtilities = None
+    IAudioEndpointVolume = None
+
+try:
+    from yt_dlp import YoutubeDL
+except Exception:  # pragma: no cover - optional dependency
+    YoutubeDL = None
 
 from .utils import draw_file_tree
 
@@ -22,6 +40,16 @@ class ProjectChange:
     after: str
     mode: str
     reason: str = ""
+
+
+@dataclass
+class ApplicationMatch:
+    requested: str
+    display_name: str
+    kind: str
+    command: str
+    aliases: tuple[str, ...] = ()
+    exact: bool = True
 
 
 class SystemActions:
@@ -69,15 +97,21 @@ class SystemActions:
         "microsoft edge": ["msedge.exe", "microsoft-edge", "edge"],
         "firefox": ["firefox.exe", "firefox"],
         "blender": ["blender.exe", "blender"],
+        "matlab": ["matlab.exe", "matlab"],
+        "vlc": ["vlc.exe", "vlc"],
+        "vlc media player": ["vlc.exe", "vlc"],
         "vscode": ["code.exe", "code"],
+        "vs code": ["code.exe", "code"],
         "visual studio code": ["code.exe", "code"],
         "code": ["code.exe", "code"],
         "spotify": ["spotify.exe", "spotify"],
         "notepad": ["notepad.exe", "notepad"],
         "terminal": ["wt.exe", "powershell.exe", "cmd.exe"],
         "powershell": ["powershell.exe", "pwsh.exe"],
+        "windows powershell": ["powershell.exe", "pwsh.exe"],
         "cmd": ["cmd.exe"],
         "camera": ["microsoft.windows.camera:"],
+        "camera app": ["microsoft.windows.camera:"],
         "calculator": ["calc.exe"],
         "paint": ["mspaint.exe"],
         "explorer": ["explorer.exe"],
@@ -118,6 +152,70 @@ class SystemActions:
         ".mypy_cache",
         ".pytest_cache",
     }
+    POWER_SAVER_GUID = "a1841308-3541-4fab-bc81-f71556f20b4a"
+    BALANCED_POWER_GUID = "381b4222-f694-41f0-9685-ff5bb260df2e"
+    DEFAULT_VOLUME_STEP = 10
+    START_MENU_DIRS = (
+        Path(os.getenv("ProgramData", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs",
+        Path(os.getenv("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs",
+    )
+    APP_NAME_REPLACEMENTS = (
+        ("vs code", "visual studio code"),
+        ("v s code", "visual studio code"),
+        ("visual studio", "visual studio code"),
+        ("vlc media player", "vlc"),
+        ("camera app", "camera"),
+        ("file explorer", "explorer"),
+    )
+    APP_CONTEXT_TERMS = (
+        "youtube music",
+        "vlc media player",
+        "visual studio code",
+        "windows powershell",
+        "file explorer",
+        "brave browser",
+        "google chrome",
+        "microsoft edge",
+        "camera app",
+        "media player",
+        "youtube",
+        "spotify",
+        "vlc",
+        "brave",
+        "chrome",
+        "edge",
+        "firefox",
+        "camera",
+        "blender",
+        "matlab",
+        "powershell",
+        "terminal",
+        "explorer",
+        "browser",
+        "app",
+        "application",
+    )
+    PROCESS_HINTS = {
+        "camera": {"names": {"windowscamera", "camera"}, "titles": {"camera"}},
+        "brave": {"names": {"brave"}, "titles": {"brave"}},
+        "brave browser": {"names": {"brave"}, "titles": {"brave"}},
+        "visual studio code": {"names": {"code"}, "titles": {"visual studio code", "vs code"}},
+        "vs code": {"names": {"code"}, "titles": {"visual studio code", "vs code"}},
+        "vscode": {"names": {"code"}, "titles": {"visual studio code", "vs code"}},
+        "vlc": {"names": {"vlc"}, "titles": {"vlc"}},
+        "vlc media player": {"names": {"vlc"}, "titles": {"vlc"}},
+        "blender": {"names": {"blender"}, "titles": {"blender"}},
+        "matlab": {"names": {"matlab"}, "titles": {"matlab"}},
+        "chrome": {"names": {"chrome"}, "titles": {"chrome"}},
+        "edge": {"names": {"msedge"}, "titles": {"edge"}},
+        "microsoft edge": {"names": {"msedge"}, "titles": {"edge"}},
+        "firefox": {"names": {"firefox"}, "titles": {"firefox"}},
+        "spotify": {"names": {"spotify"}, "titles": {"spotify"}},
+        "explorer": {"names": {"explorer"}, "titles": {"file explorer", "explorer"}},
+        "file explorer": {"names": {"explorer"}, "titles": {"file explorer", "explorer"}},
+        "powershell": {"names": {"powershell", "pwsh"}, "titles": {"powershell", "windows powershell"}},
+        "windows powershell": {"names": {"powershell", "pwsh"}, "titles": {"powershell", "windows powershell"}},
+    }
 
     def __init__(self, base_dir=None, llm=None):
         self.base_dir = Path(base_dir or os.getcwd()).resolve()
@@ -129,6 +227,8 @@ class SystemActions:
             for alias, suffix in self.SPECIAL_FOLDERS.items()
         }
         self.session_context = {}
+        self._start_apps_cache = None
+        self._shortcut_apps_cache = None
 
     def execute(self, action, parameters):
         action = str(action or "").strip().lower()
@@ -153,9 +253,14 @@ class SystemActions:
             "rename_path": self._rename_path,
             "duplicate_path": self._duplicate_path,
             "set_brightness": self._set_brightness,
+            "set_volume": self._set_volume,
+            "set_microphone": self._set_microphone,
+            "get_setting_status": self._get_setting_status,
+            "open_setting_panel": self._open_setting_panel,
             "set_wifi": self._set_wifi,
             "set_bluetooth": self._set_bluetooth,
             "set_airplane_mode": self._set_airplane_mode,
+            "set_energy_saver": self._set_energy_saver,
             "set_night_light": self._set_night_light,
             "eject_drive": self._eject_drive,
             "run_as_admin": self._run_as_admin,
@@ -186,19 +291,169 @@ class SystemActions:
             return str(data["website"])
         return str(data.get("name") or "the requested item")
 
+    def _spoken_target_name(self, params):
+        data = self._prepare_params(params or {})
+        if data.get("application"):
+            return str(data["application"]).strip()
+        if data.get("website"):
+            website = str(data["website"]).strip()
+            return website.split("/", 1)[0] if "/" in website else website
+        target = self._resolve_path(data, expect_existing=False)
+        if target is not None:
+            return target.name or str(target)
+        return str(data.get("name") or "it").strip()
+
+    def _short_error_message(self, text):
+        first_line = next((line.strip() for line in str(text or "").splitlines() if line.strip()), "")
+        return first_line or str(text or "").strip()
+
+    def _strip_usage_context(self, value):
+        pattern = r"\s+\b(?:in|using|with|on)\b\s+(?=(?:the\s+)?(?:%s)\b)" % "|".join(
+            re.escape(term) for term in self.APP_CONTEXT_TERMS
+        )
+        return re.split(pattern, str(value or "").strip(), maxsplit=1, flags=re.IGNORECASE)[0]
+
+    def _clean_directory_reference(self, value):
+        cleaned = str(value or "").strip().strip("\"'")
+        if not cleaned:
+            return ""
+        lowered = self._normalize_query(cleaned)
+        if lowered in {"current directory", "current folder", "this directory", "this folder", "here"}:
+            return ""
+        cleaned = self._strip_usage_context(cleaned)
+        cleaned = re.sub(r"^(?:the|a|an)\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(?:folder|directory|path)\b$", "", cleaned, flags=re.IGNORECASE).strip(" .")
+        lowered = self._normalize_query(cleaned)
+        if lowered in {"current directory", "current folder", "this directory", "this folder", "here"}:
+            return ""
+        return cleaned
+
+    def _clean_target_reference(self, value):
+        cleaned = str(value or "").strip().strip("\"'")
+        if not cleaned:
+            return ""
+        cleaned = self._strip_usage_context(cleaned)
+        cleaned = re.sub(r"^(?:the|a|an)\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r"^(?:file|folder|directory|path|app|application|program|software)\s+(?:named|called)\s+",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"^(?:named|called)\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r"\b(?:file|folder|directory|path|app|application|program|software)\b$",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip(" .")
+        return cleaned
+
+    def _spoken_path_label(self, params):
+        target = self._resolve_path(params, expect_existing=False)
+        if target is None:
+            target = self._path_from_fragment(params.get("path") or params.get("directory") or "")
+        if target is None:
+            name = self._clean_target_reference(params.get("name") or "")
+            return name or "item"
+        path = Path(target)
+        if path.suffix:
+            return path.stem
+        return path.name or str(path)
+
+    def _spoken_directory_label(self, params, result):
+        first_line = self._short_error_message(result)
+        if first_line.startswith("Contents of ") and first_line.endswith(":"):
+            directory = self._path_from_fragment(first_line[len("Contents of ") : -1].strip())
+            if directory is not None:
+                return directory.name or "current directory"
+        directory = self._path_from_fragment(params.get("directory") or "")
+        if directory is None:
+            return "current directory"
+        return directory.name or "current directory"
+
     def build_voice_summary(self, action, params, result):
         text = str(result or "").strip()
         if not text:
             return ""
         lowered = text.lower()
-        if "error" in lowered or "failed" in lowered or "not found" in lowered:
-            return text
-        if action in {"read_file", "list_directory", "draw_file_tree", "project_code"}:
-            return text[:700]
+        first_line_lower = self._short_error_message(text).lower()
+        if first_line_lower.startswith("system action error:") or first_line_lower.startswith("unknown system action:") or "failed" in first_line_lower or "not found" in first_line_lower:
+            return self._short_error_message(text)
+        spoken_target = self._spoken_target_name(params)
+        if action == "open_application":
+            if text.startswith("Captured ") or text.startswith("Started "):
+                return text
+            return f"Opened {spoken_target}."
+        if action == "close_application":
+            return f"Closed {spoken_target}."
+        if action == "open_path":
+            file_label = self._spoken_path_label(params)
+            if params.get("application"):
+                app_name = self._clean_target_reference(params.get("application") or spoken_target) or "the app"
+                return f"{file_label} opened in {app_name}."
+            return f"Opened {file_label}."
+        if action == "create_file":
+            created_path = self._resolve_path(params, expect_existing=False)
+            created_name = created_path.name if created_path is not None else str(params.get("name") or self._spoken_path_label(params))
+            return f"Created {created_name}."
+        if action == "create_folder":
+            return f"Created folder {self._spoken_path_label(params)}."
+        if action == "delete_path":
+            return f"Deleted {self._spoken_path_label(params)}."
+        if action == "modify_file":
+            return f"Updated {self._spoken_path_label(params)}."
+        if action == "read_file":
+            return f"Reading {self._spoken_path_label(params)}."
+        if action == "play_music":
+            platform = str(params.get("platform") or "").strip().lower()
+            if platform == "youtube_music":
+                return f"Playing {params.get('song') or spoken_target} on YouTube Music."
+            if platform == "spotify":
+                return f"Playing {params.get('song') or spoken_target} on Spotify."
+            return f"Playing {params.get('song') or spoken_target} on YouTube."
+        if action in {"set_volume", "set_microphone", "set_brightness", "set_wifi", "set_bluetooth", "set_airplane_mode", "set_energy_saver", "set_night_light"}:
+            return self._short_error_message(text) if "error" in lowered else text
+        if action == "list_directory":
+            return f"Listing the contents of {self._spoken_directory_label(params, result)}."
+        if action == "draw_file_tree":
+            return f"Showing the file tree for {self._spoken_directory_label(params, result)}."
+        if action == "project_code":
+            return "Project changes are ready."
         return text
 
     def clear_context(self):
         self.session_context.clear()
+
+    def resolve_application_request(self, params):
+        data = self._prepare_params(params or {})
+        requested = str(data.get("application") or data.get("name") or "").strip()
+        if not requested:
+            return {"status": "missing", "requested": ""}
+
+        exact_match = self._find_application_match(requested, exact_only=True)
+        if exact_match:
+            return {
+                "status": "exact",
+                "requested": requested,
+                "display_name": exact_match.display_name,
+                "kind": exact_match.kind,
+                "command": exact_match.command,
+                "aliases": list(exact_match.aliases),
+            }
+
+        fuzzy_match = self._find_application_match(requested, exact_only=False)
+        if fuzzy_match:
+            return {
+                "status": "needs_confirmation",
+                "requested": requested,
+                "display_name": fuzzy_match.display_name,
+                "kind": fuzzy_match.kind,
+                "command": fuzzy_match.command,
+                "aliases": list(fuzzy_match.aliases),
+            }
+
+        return {"status": "missing", "requested": requested}
 
     def find_path_candidates(self, name, directory=None, source_hint=None, max_results=10):
         target_name = self._normalize_spoken_filename(name)
@@ -296,12 +551,353 @@ class SystemActions:
             ("blue tooth", "bluetooth"),
             ("air plane", "airplane"),
             ("flight mode", "airplane mode"),
+            ("enery saver", "energy saver"),
+            ("battery saver", "energy saver"),
+            ("night ligh", "night light"),
+            ("vs code", "visual studio code"),
             ("c plus plus", "cpp"),
         )
         for source, target in replacements:
             value = value.replace(source, target)
         value = re.sub(r"\s+", " ", value).strip()
         return value
+
+    def _normalize_app_name(self, text):
+        value = self._normalize_query(text)
+        for source, target in self.APP_NAME_REPLACEMENTS:
+            value = value.replace(source, target)
+        value = re.sub(
+            r"\b(?:open|run|launch|start|show|use|using|in|with|the|app|application|program|software)\b",
+            " ",
+            value,
+        )
+        value = re.sub(r"\s+", " ", value).strip()
+        return value
+
+    def _get_start_apps(self):
+        if not self.is_windows:
+            return []
+        if self._start_apps_cache is not None:
+            return self._start_apps_cache
+        try:
+            raw = self._powershell("Get-StartApps | Sort-Object Name | Select-Object Name, AppID | ConvertTo-Json -Depth 3", timeout=20)
+            data = json.loads(raw) if raw else []
+            if isinstance(data, dict):
+                data = [data]
+        except Exception:
+            data = []
+        self._start_apps_cache = [item for item in data if isinstance(item, dict) and item.get("Name") and item.get("AppID")]
+        return self._start_apps_cache
+
+    def _get_shortcut_apps(self):
+        if self._shortcut_apps_cache is not None:
+            return self._shortcut_apps_cache
+        entries = []
+        seen = set()
+        for root in self.START_MENU_DIRS:
+            if not root.exists():
+                continue
+            for shortcut in root.rglob("*.lnk"):
+                key = str(shortcut).lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                entries.append({"Name": shortcut.stem, "Path": str(shortcut)})
+        self._shortcut_apps_cache = entries
+        return self._shortcut_apps_cache
+
+    def _candidate_to_app_match(self, alias, candidate):
+        display_name = alias.title()
+        aliases = tuple({self._normalize_app_name(alias), self._normalize_app_name(display_name), alias.lower()})
+        if str(candidate).endswith(":"):
+            return ApplicationMatch(requested=alias, display_name=display_name, kind="uri", command=str(candidate), aliases=aliases)
+        executable = self._find_executable(candidate)
+        if executable:
+            return ApplicationMatch(requested=alias, display_name=display_name, kind="executable", command=str(executable), aliases=aliases)
+        return None
+
+    def _application_catalog(self):
+        matches = []
+        seen = set()
+        for alias, candidates in self.APP_ALIASES.items():
+            for candidate in candidates:
+                match = self._candidate_to_app_match(alias, candidate)
+                if match is None:
+                    continue
+                key = (match.kind, match.command.lower())
+                if key in seen:
+                    continue
+                seen.add(key)
+                matches.append(match)
+                break
+
+        for item in self._get_start_apps():
+            display_name = str(item.get("Name") or "").strip()
+            app_id = str(item.get("AppID") or "").strip()
+            if not display_name or not app_id:
+                continue
+            executable = None
+            if app_id.lower().endswith(".exe"):
+                executable = self._find_executable(Path(app_id).name)
+            kind = "executable" if executable else "appid"
+            command = executable or app_id
+            key = (kind, command.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            matches.append(
+                ApplicationMatch(
+                    requested=display_name,
+                    display_name=display_name,
+                    kind=kind,
+                    command=command,
+                    aliases=(self._normalize_app_name(display_name), display_name.lower()),
+                )
+            )
+
+        return matches
+
+    def _resolve_alias_application(self, alias):
+        for candidate in self.APP_ALIASES.get(alias, []):
+            match = self._candidate_to_app_match(alias, candidate)
+            if match is not None:
+                return match
+        return None
+
+    def _start_app_match(self, display_name, app_id, requested, *, exact):
+        return ApplicationMatch(
+            requested=requested,
+            display_name=display_name,
+            kind="appid",
+            command=app_id,
+            aliases=(self._normalize_app_name(display_name), display_name.lower()),
+            exact=exact,
+        )
+
+    def _find_application_match(self, requested, exact_only=False):
+        normalized_requested = self._normalize_app_name(requested)
+        if not normalized_requested:
+            return None
+        alias_lookup = {}
+        for alias in self.APP_ALIASES:
+            normalized_alias = self._normalize_app_name(alias)
+            current = alias_lookup.get(normalized_alias)
+            if current is None or len(alias) > len(current):
+                alias_lookup[normalized_alias] = alias
+            current_lower = alias_lookup.get(alias.lower())
+            if current_lower is None or len(alias) > len(current_lower):
+                alias_lookup[alias.lower()] = alias
+
+        alias = alias_lookup.get(normalized_requested)
+        if alias:
+            match = self._resolve_alias_application(alias)
+            if match is not None:
+                return ApplicationMatch(
+                    requested=requested,
+                    display_name=match.display_name,
+                    kind=match.kind,
+                    command=match.command,
+                    aliases=match.aliases,
+                    exact=True,
+                )
+
+        start_apps = self._get_start_apps()
+        normalized_start_apps = {}
+        exact_start = None
+        for item in start_apps:
+            display_name = str(item.get("Name") or "").strip()
+            app_id = str(item.get("AppID") or "").strip()
+            if not display_name or not app_id:
+                continue
+            normalized_name = self._normalize_app_name(display_name)
+            normalized_start_apps.setdefault(normalized_name, (display_name, app_id))
+            if normalized_name == normalized_requested:
+                exact_start = (display_name, app_id)
+        if exact_start is not None:
+            return self._start_app_match(exact_start[0], exact_start[1], requested, exact=True)
+
+        if exact_only:
+            return None
+
+        close_alias = get_close_matches(normalized_requested, list(alias_lookup.keys()), n=1, cutoff=0.62)
+        if close_alias:
+            alias = alias_lookup[close_alias[0]]
+            match = self._resolve_alias_application(alias)
+            if match is not None:
+                return ApplicationMatch(
+                    requested=requested,
+                    display_name=match.display_name,
+                    kind=match.kind,
+                    command=match.command,
+                    aliases=match.aliases,
+                    exact=False,
+                )
+
+        close_start = get_close_matches(normalized_requested, list(normalized_start_apps.keys()), n=1, cutoff=0.64)
+        if close_start:
+            display_name, app_id = normalized_start_apps[close_start[0]]
+            return self._start_app_match(display_name, app_id, requested, exact=False)
+        return None
+
+    def _launch_application_match(self, match, arguments=None):
+        args = [str(item) for item in (arguments or []) if str(item).strip()]
+        if match.kind == "uri":
+            os.startfile(match.command)
+            return
+        if match.kind == "shortcut":
+            if args:
+                raise RuntimeError(f"{match.display_name} does not support file arguments through its shortcut.")
+            os.startfile(match.command)
+            return
+        if match.kind == "appid":
+            if args:
+                raise RuntimeError(f"{match.display_name} cannot open files directly through its Start menu AppID.")
+            subprocess.Popen(["explorer.exe", f"shell:AppsFolder\\{match.command}"])
+            return
+        subprocess.Popen([match.command, *args])
+
+    def _process_hints_for_application(self, requested, match=None):
+        normalized_requested = self._normalize_app_name(requested or (match.display_name if match else ""))
+        names = set()
+        titles = set()
+        if match is not None and match.kind == "executable":
+            names.add(Path(match.command).stem.lower())
+        hint_key = normalized_requested
+        if hint_key in self.PROCESS_HINTS:
+            names.update(self.PROCESS_HINTS[hint_key]["names"])
+            titles.update(self.PROCESS_HINTS[hint_key]["titles"])
+        names.update(part for part in re.split(r"[^a-z0-9]+", normalized_requested) if len(part) >= 3)
+        titles.add(normalized_requested)
+        return sorted(names), sorted(titles)
+
+    def _query_matching_processes(self, names=None, titles=None):
+        if not self.is_windows:
+            return {"count": 0, "names": []}
+        names_json = self._ps_quote(json.dumps(list(names or [])))
+        titles_json = self._ps_quote(json.dumps(list(titles or [])))
+        script = f"""
+$names = ConvertFrom-Json {names_json}
+$titles = ConvertFrom-Json {titles_json}
+$matches = @(Get-Process | Where-Object {{
+    $proc = $_.ProcessName.ToLower()
+    $title = if ($_.MainWindowTitle) {{ $_.MainWindowTitle.ToLower() }} else {{ '' }}
+    (($names | Where-Object {{ $_ -and ($proc -eq $_ -or $proc -like ('*' + $_ + '*')) }}).Count -gt 0) -or
+    (($titles | Where-Object {{ $_ -and $title -and $title -like ('*' + $_ + '*') }}).Count -gt 0)
+}})
+@{{ count = $matches.Count; names = @($matches | Select-Object -ExpandProperty ProcessName -Unique) }} | ConvertTo-Json -Compress
+""".strip()
+        payload = self._powershell(script, timeout=20)
+        data = json.loads(payload)
+        return data if isinstance(data, dict) else {"count": 0, "names": []}
+
+    def _stop_matching_processes(self, names=None, titles=None):
+        if not self.is_windows:
+            raise RuntimeError("Application closing is only implemented on Windows in this build.")
+        names_json = self._ps_quote(json.dumps(list(names or [])))
+        titles_json = self._ps_quote(json.dumps(list(titles or [])))
+        script = f"""
+$names = ConvertFrom-Json {names_json}
+$titles = ConvertFrom-Json {titles_json}
+$matches = @(Get-Process | Where-Object {{
+    $proc = $_.ProcessName.ToLower()
+    $title = if ($_.MainWindowTitle) {{ $_.MainWindowTitle.ToLower() }} else {{ '' }}
+    (($names | Where-Object {{ $_ -and ($proc -eq $_ -or $proc -like ('*' + $_ + '*')) }}).Count -gt 0) -or
+    (($titles | Where-Object {{ $_ -and $title -and $title -like ('*' + $_ + '*') }}).Count -gt 0)
+}} | Sort-Object Id -Unique)
+if (-not $matches) {{
+    throw 'No running process matched.'
+}}
+$namesOut = @($matches | Select-Object -ExpandProperty ProcessName -Unique)
+$matches | Stop-Process -Force
+@{{ count = $matches.Count; names = $namesOut }} | ConvertTo-Json -Compress
+""".strip()
+        payload = self._powershell(script, timeout=20)
+        data = json.loads(payload)
+        return data if isinstance(data, dict) else {"count": 0, "names": []}
+
+    def _trigger_camera_shortcut(self, mode, *, warmup_seconds):
+        time.sleep(max(0.0, warmup_seconds))
+        try:
+            if mode == "video":
+                keyboard.send("ctrl+r")
+            else:
+                keyboard.send("space")
+        except Exception as exc:
+            raise RuntimeError(f"Camera shortcut failed: {exc}") from exc
+
+    def _find_youtube_video_url(self, song, *, music=False):
+        query = str(song or "").strip()
+        if not query:
+            return ""
+        if YoutubeDL is not None:
+            try:
+                ydl = YoutubeDL(
+                    {
+                        "quiet": True,
+                        "skip_download": True,
+                        "extract_flat": "in_playlist",
+                        "default_search": "ytsearch",
+                        "noplaylist": True,
+                    }
+                )
+                payload = ydl.extract_info(f"ytsearch5:{query}", download=False) or {}
+                entries = payload.get("entries") or []
+                query_tokens = {token for token in re.findall(r"[a-z0-9]+", query.lower()) if len(token) >= 2}
+                ranked = []
+                for index, entry in enumerate(entries):
+                    video_id = str(entry.get("id") or "").strip()
+                    title = str(entry.get("title") or "").strip()
+                    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+                        continue
+                    title_tokens = {token for token in re.findall(r"[a-z0-9]+", title.lower()) if len(token) >= 2}
+                    score = len(query_tokens & title_tokens)
+                    lowered_title = title.lower()
+                    if "official" in lowered_title:
+                        score += 1.0
+                    if "lyrics" in lowered_title and "lyrics" not in query.lower():
+                        score -= 0.3
+                    if "live" in lowered_title and "live" not in query.lower():
+                        score -= 0.2
+                    ranked.append((score, -index, video_id))
+                if ranked:
+                    ranked.sort(reverse=True)
+                    video_id = ranked[0][2]
+                    if music:
+                        return f"https://music.youtube.com/watch?v={video_id}&autoplay=1"
+                    return f"https://www.youtube.com/watch?v={video_id}&autoplay=1"
+            except Exception:
+                pass
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(
+            "https://www.youtube.com/results",
+            params={"search_query": query},
+            headers=headers,
+            timeout=12,
+        )
+        response.raise_for_status()
+        query_tokens = {token for token in re.findall(r"[a-z0-9]+", query.lower()) if len(token) >= 2}
+        ranked = []
+        for video_id, title in re.findall(
+            r'"videoId":"([A-Za-z0-9_-]{11})".{0,400}?"title":\{"runs":\[\{"text":"([^"]+)"',
+            response.text,
+            flags=re.DOTALL,
+        ):
+            title_tokens = {token for token in re.findall(r"[a-z0-9]+", title.lower()) if len(token) >= 2}
+            score = len(query_tokens & title_tokens)
+            if "official" in title.lower():
+                score += 0.5
+            ranked.append((score, video_id))
+        if ranked:
+            ranked.sort(key=lambda item: item[0], reverse=True)
+            video_id = ranked[0][1]
+        else:
+            matches = re.findall(r'"videoId":"([A-Za-z0-9_-]{11})"', response.text)
+            video_id = next((item for item in matches if item), "")
+        if not video_id:
+            return ""
+        if music:
+            return f"https://music.youtube.com/watch?v={video_id}&autoplay=1"
+        return f"https://www.youtube.com/watch?v={video_id}&autoplay=1"
 
     def _refers_to_previous_target(self, normalized):
         tokens = set(re.findall(r"[a-z0-9_./\\-]+", normalized))
@@ -312,6 +908,9 @@ class SystemActions:
         for alias in sorted(self.APP_ALIASES, key=len, reverse=True):
             if alias in lowered:
                 return alias
+        normalized = self._normalize_app_name(text)
+        if normalized in self.APP_ALIASES:
+            return normalized
         return None
 
     def _extract_website_from_text(self, text):
@@ -328,14 +927,17 @@ class SystemActions:
 
     def _extract_directory_from_text(self, text):
         match = re.search(
-            r"\b(?:in|inside|under|at|from)\s+(.+?)(?=\s+\b(?:named|called|with|and|that|which|into)\b|$)",
+            r"\b(?:in|inside|under|at|from)\s+(.+?)(?=\s+\b(?:named|called|with|and|that|which|into|using|on|open|launch|run|start|read|delete|create|make|copy|move|rename|duplicate|list|show|display)\b|$)",
             text,
             flags=re.IGNORECASE,
         )
         if not match:
             return None
-        directory = match.group(1).strip(" .")
-        if directory.lower() in {"text mode", "voice mode"}:
+        directory = self._clean_directory_reference(match.group(1).strip(" ."))
+        lowered = directory.lower()
+        if lowered in {"text mode", "voice mode"} or lowered.startswith(("which ", "that ", "where ")):
+            return None
+        if lowered in {"which", "that", "where"}:
             return None
         return directory
 
@@ -344,15 +946,23 @@ class SystemActions:
         if quoted:
             return quoted[0].strip()
 
+        explicit = re.search(
+            r"\b(?:file|folder|directory|path)\s+(?:named|called)\s+(.+?)(?=\s+\b(?:in|inside|under|at|from|to|with|using|and|on)\b|$)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if explicit:
+            value = self._clean_target_reference(explicit.group(1))
+            return value or None
+
         match = re.search(
-            r"\b(?:create|make|generate|write|open|launch|run|start|show|delete|remove|erase|copy|move|rename|duplicate|read|list|display|play)\s+(.+?)(?=\s+\b(?:in|inside|under|at|with|from|to|called|named|that|which|on)\b|$)",
+            r"\b(?:create|make|generate|write|open|launch|run|start|show|delete|remove|erase|copy|move|rename|duplicate|read|list|display|play)\s+(.+?)(?=\s+\b(?:in|inside|under|at|with|using|from|to|called|named|that|which|on)\b|$)",
             text,
             flags=re.IGNORECASE,
         )
         if not match:
             return None
-        value = match.group(1).strip(" .")
-        value = re.sub(r"^(?:the|a|an)\s+", "", value, flags=re.IGNORECASE)
+        value = self._clean_target_reference(match.group(1).strip(" ."))
         return value or None
 
     def _extract_literal_content(self, text):
@@ -382,10 +992,15 @@ class SystemActions:
         raw = str(fragment).strip().strip("\"'")
         if not raw:
             return None
+        raw = self._clean_directory_reference(raw)
+        if not raw:
+            return Path.cwd()
         if raw.startswith(("/", "\\")) and not re.match(r"^[A-Za-z]:", raw):
             raw = raw.lstrip("/\\")
 
         normalized = self._normalize_query(raw)
+        if normalized in {"current directory", "current folder", "this directory", "this folder", "here"}:
+            return Path.cwd()
         if normalized in {"recycle bin", "trash"} and self.is_windows:
             return Path("shell:RecycleBinFolder")
 
@@ -448,24 +1063,24 @@ class SystemActions:
         return Path(path).exists()
 
     def _normalize_spoken_filename(self, value):
-        text = str(value or "").strip().strip("\"'")
+        text = self._clean_target_reference(value)
+        if not text:
+            return ""
         lowered = self._normalize_query(text)
         spoken_match = re.search(r"(.+?)\s+dot\s+([a-z0-9]+)$", lowered)
         if spoken_match:
-            stem = spoken_match.group(1).strip().replace(" ", "_")
+            stem = self._clean_target_reference(spoken_match.group(1)).strip()
             extension = spoken_match.group(2).strip()
             if extension == "pi":
                 extension = "py"
             return f"{stem}.{extension}"
         match = re.search(r"(.+?)\.([a-z0-9]+)$", lowered)
         if match:
-            stem = match.group(1).strip().replace(" ", "_")
+            stem = self._clean_target_reference(match.group(1)).strip()
             extension = match.group(2).strip()
             if extension == "pi":
                 extension = "py"
             return f"{stem}.{extension}"
-        if "." not in text and " " in text:
-            return "_".join(text.split())
         return text.replace(" .", ".").replace(". ", ".")
 
     def _find_closest_path(self, target_name, start_dir, source_hint=None):
@@ -555,28 +1170,43 @@ class SystemActions:
     def _find_executable(self, command_name):
         if str(command_name).endswith(":"):
             return command_name
+        if command_name and Path(str(command_name)).is_absolute() and Path(str(command_name)).exists():
+            return str(command_name)
         located = shutil.which(command_name)
         if located:
             return located
         if not self.is_windows:
             return None
+        try:
+            output = self._run_process(["where.exe", command_name], timeout=5)
+            first = next((line.strip() for line in output.splitlines() if line.strip()), "")
+            if first:
+                return first
+        except Exception:
+            pass
 
-        search_roots = [
-            Path(os.getenv("ProgramFiles", "")),
-            Path(os.getenv("ProgramFiles(x86)", "")),
-            Path(os.getenv("LOCALAPPDATA", "")),
-        ]
-        matches = []
-        for root in search_roots:
-            if not root.exists():
-                continue
-            for path in root.rglob(command_name):
-                matches.append(path)
-                if len(matches) >= 8:
-                    break
-            if matches:
-                break
-        return str(matches[0]) if matches else None
+        common_locations = {
+            "brave.exe": [
+                Path(os.getenv("ProgramFiles", "")) / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe",
+                Path(os.getenv("ProgramFiles(x86)", "")) / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe",
+                Path(os.getenv("LOCALAPPDATA", "")) / "BraveSoftware" / "Brave-Browser" / "Application" / "brave.exe",
+            ],
+            "code.exe": [
+                Path(os.getenv("LOCALAPPDATA", "")) / "Programs" / "Microsoft VS Code" / "Code.exe",
+                Path(os.getenv("ProgramFiles", "")) / "Microsoft VS Code" / "Code.exe",
+                Path(os.getenv("ProgramFiles(x86)", "")) / "Microsoft VS Code" / "Code.exe",
+            ],
+            "vlc.exe": [
+                Path(os.getenv("ProgramFiles", "")) / "VideoLAN" / "VLC" / "vlc.exe",
+                Path(os.getenv("ProgramFiles(x86)", "")) / "VideoLAN" / "VLC" / "vlc.exe",
+            ],
+            "blender.exe": list((Path(os.getenv("ProgramFiles", "")) / "Blender Foundation").glob("Blender*\\blender.exe")),
+            "matlab.exe": list((Path(os.getenv("ProgramFiles", "")) / "MATLAB").glob("R*\\bin\\matlab.exe")),
+        }
+        for candidate in common_locations.get(str(command_name).lower(), []):
+            if candidate.exists():
+                return str(candidate)
+        return None
 
     def _open_path(self, params):
         website = params.get("website")
@@ -587,8 +1217,26 @@ class SystemActions:
         if target is None:
             application = params.get("application") or params.get("name")
             if application:
-                return self._open_application({"application": application})
+                fallback_params = dict(params)
+                fallback_params["application"] = application
+                return self._open_application(fallback_params)
             return "No file, folder, or website matched that request."
+
+        if params.get("application"):
+            app_data = params.get("resolved_application") or self.resolve_application_request(params)
+            if app_data.get("status") == "missing":
+                requested = app_data.get("requested") or params.get("application")
+                return f"I could not find an installed application matching {requested}."
+            match = ApplicationMatch(
+                requested=app_data.get("requested") or params.get("application") or "",
+                display_name=app_data.get("display_name") or str(params.get("application") or ""),
+                kind=app_data.get("kind") or "executable",
+                command=app_data.get("command") or "",
+                aliases=tuple(app_data.get("aliases") or ()),
+                exact=app_data.get("status") == "exact",
+            )
+            self._launch_application_match(match, arguments=[str(target)])
+            return f"Opened {target} in {match.display_name}."
 
         if self.is_windows and str(target).lower() == "shell:recyclebinfolder":
             os.startfile(str(target))
@@ -624,47 +1272,56 @@ class SystemActions:
         requested = str(params.get("application") or params.get("name") or "").strip()
         if not requested:
             return "No application name was provided."
+        app_data = params.get("resolved_application") or self.resolve_application_request(params)
+        if app_data.get("status") == "missing":
+            return f"I could not find an installed application matching {requested}."
 
-        alias_key = requested.lower()
-        candidates = self.APP_ALIASES.get(alias_key, [requested])
-        for candidate in candidates:
-            executable = self._find_executable(candidate)
-            if executable is None:
-                continue
-            if executable.endswith(":"):
-                os.startfile(executable)
-                return f"Launched {requested}."
-            subprocess.Popen([executable])
-            return f"Launched {requested}."
+        match = ApplicationMatch(
+            requested=app_data.get("requested") or requested,
+            display_name=app_data.get("display_name") or requested,
+            kind=app_data.get("kind") or "executable",
+            command=app_data.get("command") or "",
+            aliases=tuple(app_data.get("aliases") or ()),
+            exact=app_data.get("status") == "exact",
+        )
 
-        if self.is_windows:
-            script = f"Start-Process -FilePath {self._ps_quote(requested)}"
-            self._powershell(script)
-            return f"Launched {requested}."
+        raw_text = self._normalize_query(params.get("raw_text") or "")
+        if match.display_name.lower().startswith("camera") or requested.lower() in {"camera", "camera app"}:
+            camera_mode = ""
+            if any(token in raw_text for token in {"record", "recording", "video"}):
+                camera_mode = "video"
+            elif any(token in raw_text for token in {"picture", "photo", "capture", "selfie"}):
+                camera_mode = "photo"
+            camera_running = self._query_matching_processes(names=["windowscamera", "camera"], titles=["camera"]).get("count", 0) > 0
+            if not camera_running:
+                self._launch_application_match(match)
+            if camera_mode:
+                self._trigger_camera_shortcut(camera_mode, warmup_seconds=2.3 if not camera_running else 0.3)
+                return "Captured a picture." if camera_mode == "photo" else "Started camera recording."
+            return "Opened Camera."
 
-        subprocess.Popen([requested])
-        return f"Launched {requested}."
+        self._launch_application_match(match)
+        return f"Launched {match.display_name}."
 
     def _close_application(self, params):
         requested = str(params.get("application") or params.get("name") or "").strip()
         if not requested:
             return "No application was provided to close."
-
-        alias_key = requested.lower()
-        executable_names = self.APP_ALIASES.get(alias_key, [requested])
-        failures = []
-        for executable in executable_names:
-            try:
-                if self.is_windows:
-                    image = Path(executable).name
-                    self._run_process(["taskkill", "/IM", image, "/F"], timeout=15)
-                else:
-                    self._run_process(["pkill", "-f", executable], timeout=15)
-                return f"Closed {requested}."
-            except Exception as exc:
-                failures.append(str(exc))
-        details = failures[0] if failures else "No running process matched."
-        return f"Could not close {requested}. {details}"
+        app_data = params.get("resolved_application") or self.resolve_application_request(params)
+        match = None
+        if app_data.get("status") != "missing":
+            match = ApplicationMatch(
+                requested=app_data.get("requested") or requested,
+                display_name=app_data.get("display_name") or requested,
+                kind=app_data.get("kind") or "executable",
+                command=app_data.get("command") or "",
+                aliases=tuple(app_data.get("aliases") or ()),
+                exact=app_data.get("status") == "exact",
+            )
+        names, titles = self._process_hints_for_application(requested, match)
+        result = self._stop_matching_processes(names=names, titles=titles)
+        process_names = ", ".join(sorted(set(result.get("names") or [])))
+        return f"Closed {requested}." if not process_names else f"Closed {requested} ({process_names})."
 
     def _list_directory(self, params):
         directory = self._resolve_directory(params)
@@ -901,6 +1558,345 @@ class SystemActions:
             return f"Brightness set to {percent} percent."
         raise RuntimeError("Brightness control is not available on this system.")
 
+    def _windows_audio_endpoint_script(self, flow, *, percent=None, delta=None, mute_action=""):
+        target_level = "" if percent is None else max(0, min(100, int(percent))) / 100.0
+        delta_level = 0.0 if delta is None else float(delta)
+        return f"""
+$flow = {int(flow)}
+$targetLevel = {'$null' if percent is None else target_level}
+$delta = {delta_level}
+$muteAction = {self._ps_quote(mute_action)}
+if (-not ([System.Management.Automation.PSTypeName]'AudioUtil.AudioManager').Type) {{
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+namespace AudioUtil {{
+    public enum EDataFlow {{ eRender, eCapture, eAll }}
+    public enum ERole {{ eConsole, eMultimedia, eCommunications }}
+    [Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDeviceEnumerator {{
+        int NotImpl1();
+        [PreserveSig] int GetDefaultAudioEndpoint(EDataFlow dataFlow, ERole role, out IMMDevice ppDevice);
+    }}
+    [Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDevice {{
+        [PreserveSig] int Activate(ref Guid iid, int dwClsCtx, IntPtr pActivationParams, [MarshalAs(UnmanagedType.IUnknown)] out object ppInterface);
+    }}
+    [Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioEndpointVolume {{
+        int RegisterControlChangeNotify(IntPtr pNotify);
+        int UnregisterControlChangeNotify(IntPtr pNotify);
+        int GetChannelCount(out uint pnChannelCount);
+        int SetMasterVolumeLevel(float fLevelDB, Guid pguidEventContext);
+        int SetMasterVolumeLevelScalar(float fLevel, Guid pguidEventContext);
+        int GetMasterVolumeLevel(out float pfLevelDB);
+        int GetMasterVolumeLevelScalar(out float pfLevel);
+        int SetChannelVolumeLevel(uint nChannel, float fLevelDB, Guid pguidEventContext);
+        int SetChannelVolumeLevelScalar(uint nChannel, float fLevel, Guid pguidEventContext);
+        int GetChannelVolumeLevel(uint nChannel, out float pfLevelDB);
+        int GetChannelVolumeLevelScalar(uint nChannel, out float pfLevel);
+        int SetMute([MarshalAs(UnmanagedType.Bool)] bool bMute, Guid pguidEventContext);
+        int GetMute(out bool pbMute);
+        int GetVolumeStepInfo(out uint pnStep, out uint pnStepCount);
+        int VolumeStepUp(Guid pguidEventContext);
+        int VolumeStepDown(Guid pguidEventContext);
+        int QueryHardwareSupport(out uint pdwHardwareSupportMask);
+        int GetVolumeRange(out float pflVolumeMindB, out float pflVolumeMaxdB, out float pflVolumeIncrementdB);
+    }}
+    [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+    class MMDeviceEnumeratorComObject {{ }}
+    public static class AudioManager {{
+        public static IAudioEndpointVolume GetEndpoint(int flow) {{
+            IMMDeviceEnumerator enumerator = (IMMDeviceEnumerator)(new MMDeviceEnumeratorComObject());
+            IMMDevice device;
+            Marshal.ThrowExceptionForHR(enumerator.GetDefaultAudioEndpoint((EDataFlow)flow, ERole.eMultimedia, out device));
+            Guid iid = typeof(IAudioEndpointVolume).GUID;
+            object endpoint;
+            Marshal.ThrowExceptionForHR(device.Activate(ref iid, 23, IntPtr.Zero, out endpoint));
+            return (IAudioEndpointVolume)endpoint;
+        }}
+        public static float GetLevel(int flow) {{
+            float level;
+            Marshal.ThrowExceptionForHR(GetEndpoint(flow).GetMasterVolumeLevelScalar(out level));
+            return level;
+        }}
+        public static bool GetMute(int flow) {{
+            bool muted;
+            Marshal.ThrowExceptionForHR(GetEndpoint(flow).GetMute(out muted));
+            return muted;
+        }}
+        public static void SetLevel(int flow, float level) {{
+            Marshal.ThrowExceptionForHR(GetEndpoint(flow).SetMasterVolumeLevelScalar(Math.Max(0, Math.Min(1, level)), Guid.Empty));
+        }}
+        public static void SetMute(int flow, bool muted) {{
+            Marshal.ThrowExceptionForHR(GetEndpoint(flow).SetMute(muted, Guid.Empty));
+        }}
+    }}
+}}
+"@ -Language CSharp
+}}
+$level = [AudioUtil.AudioManager]::GetLevel($flow)
+if ($muteAction -eq 'mute') {{
+    [AudioUtil.AudioManager]::SetMute($flow, $true)
+}}
+elseif ($muteAction -eq 'unmute') {{
+    [AudioUtil.AudioManager]::SetMute($flow, $false)
+}}
+if ($targetLevel -ne $null) {{
+    [AudioUtil.AudioManager]::SetLevel($flow, [float]$targetLevel)
+    if ($targetLevel -gt 0) {{
+        [AudioUtil.AudioManager]::SetMute($flow, $false)
+    }}
+}}
+elseif ($delta -ne 0) {{
+    $newLevel = [Math]::Max(0, [Math]::Min(1, $level + $delta))
+    [AudioUtil.AudioManager]::SetLevel($flow, [float]$newLevel)
+    if ($newLevel -gt 0) {{
+        [AudioUtil.AudioManager]::SetMute($flow, $false)
+    }}
+}}
+$finalLevel = [Math]::Round([AudioUtil.AudioManager]::GetLevel($flow) * 100)
+$finalMuted = [AudioUtil.AudioManager]::GetMute($flow)
+@{{ level = $finalLevel; muted = $finalMuted }} | ConvertTo-Json -Compress
+""".strip()
+
+    def _python_audio_endpoint(self, flow):
+        if not self.is_windows or AudioUtilities is None or IAudioEndpointVolume is None or CLSCTX_ALL is None:
+            return None
+        if flow == 0:
+            device = AudioUtilities.GetSpeakers()
+            endpoint = getattr(device, "EndpointVolume", None)
+            if endpoint is not None:
+                return endpoint
+        else:
+            if not hasattr(AudioUtilities, "GetMicrophone"):
+                return None
+            device = AudioUtilities.GetMicrophone()
+            interface = device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            return cast(interface, POINTER(IAudioEndpointVolume))
+        return None
+
+    def _python_audio_state(self, flow, *, percent=None, delta=None, mute_action=""):
+        endpoint = self._python_audio_endpoint(flow)
+        if endpoint is None:
+            return None
+        if mute_action == "mute":
+            endpoint.SetMute(1, None)
+        elif mute_action == "unmute":
+            endpoint.SetMute(0, None)
+        if percent is not None:
+            scalar = max(0.0, min(1.0, float(percent) / 100.0))
+            endpoint.SetMasterVolumeLevelScalar(scalar, None)
+            if scalar > 0:
+                endpoint.SetMute(0, None)
+        elif delta is not None and delta != 0:
+            current = float(endpoint.GetMasterVolumeLevelScalar())
+            scalar = max(0.0, min(1.0, current + float(delta)))
+            endpoint.SetMasterVolumeLevelScalar(scalar, None)
+            if scalar > 0:
+                endpoint.SetMute(0, None)
+        final_level = int(round(float(endpoint.GetMasterVolumeLevelScalar()) * 100))
+        final_muted = bool(endpoint.GetMute())
+        return {"level": final_level, "muted": final_muted}
+
+    def _set_audio_endpoint(self, params, *, flow, label):
+        percent = params.get("percent")
+        direction = str(params.get("direction") or "").lower()
+        turn_on = params.get("on")
+        mute_action = ""
+        delta = None
+
+        if percent is not None:
+            percent = max(0, min(100, int(percent)))
+            if percent == 0:
+                mute_action = "mute"
+            else:
+                mute_action = "unmute"
+        elif direction == "down":
+            delta = -(self.DEFAULT_VOLUME_STEP / 100.0)
+        elif direction == "up":
+            delta = self.DEFAULT_VOLUME_STEP / 100.0
+        elif turn_on is False:
+            mute_action = "mute"
+        elif turn_on is True:
+            mute_action = "unmute"
+            percent = 50
+        else:
+            raise RuntimeError(f"No {label.lower()} level or state was provided.")
+
+        if self.is_windows:
+            state = self._python_audio_state(flow, percent=percent, delta=delta, mute_action=mute_action)
+            if state is None:
+                payload = self._powershell(
+                    self._windows_audio_endpoint_script(flow, percent=percent, delta=delta, mute_action=mute_action),
+                    timeout=25,
+                )
+                state = json.loads(payload)
+                if not isinstance(state, dict):
+                    state = {}
+            final_level = int(state.get("level") or state.get("Level") or 0)
+            is_muted = bool(state.get("muted") if "muted" in state else state.get("Muted", False))
+            if is_muted or final_level == 0:
+                return f"{label} turned off."
+            return f"{label} set to {final_level} percent."
+
+        if shutil.which("pactl"):
+            target = "@DEFAULT_SINK@" if flow == 0 else "@DEFAULT_SOURCE@"
+            if mute_action == "mute":
+                self._run_process(["pactl", "set-source-mute" if flow else "set-sink-mute", target, "1"])
+                return f"{label} turned off."
+            if mute_action == "unmute":
+                self._run_process(["pactl", "set-source-mute" if flow else "set-sink-mute", target, "0"])
+            if percent is not None:
+                self._run_process(["pactl", "set-source-volume" if flow else "set-sink-volume", target, f"{percent}%"])
+                return f"{label} set to {percent} percent."
+            if delta is not None:
+                amount = f"{abs(int(delta * 100))}%"
+                command = ["pactl", "set-source-volume" if flow else "set-sink-volume", target, f"{'+' if delta > 0 else '-'}{amount}"]
+                self._run_process(command)
+                direction_text = "up" if delta > 0 else "down"
+                return f"{label} adjusted {direction_text}."
+        raise RuntimeError(f"{label} control is not available on this system.")
+
+    def _set_volume(self, params):
+        return self._set_audio_endpoint(params, flow=0, label="System sound")
+
+    def _set_microphone(self, params):
+        return self._set_audio_endpoint(params, flow=1, label="Microphone")
+
+    def _normalize_setting_name(self, value):
+        lowered = self._normalize_query(value)
+        aliases = {
+            "sound": "volume",
+            "volume": "volume",
+            "microphone": "microphone",
+            "mic": "microphone",
+            "wifi": "wifi",
+            "bluetooth": "bluetooth",
+            "airplane mode": "airplane mode",
+            "brightness": "brightness",
+            "energy saver": "energy saver",
+            "night light": "night light",
+            "vpn": "vpn",
+            "display": "display",
+            "screen saver": "screen saver",
+            "screensaver": "screen saver",
+        }
+        for key, target in aliases.items():
+            if key in lowered:
+                return target
+        return lowered.strip()
+
+    def _windows_bluetooth_adapters(self):
+        script = r"""
+$devices = @(Get-PnpDevice -Class Bluetooth -ErrorAction SilentlyContinue | Where-Object {
+    $_.InstanceId -match '^(USB|PCI|ACPI)\\' -and
+    $_.FriendlyName -and
+    $_.FriendlyName -notmatch 'Enumerator|RFCOMM|Transport|Service|Protocol TDI|Device \(RFCOMM'
+} | Select-Object Status, FriendlyName, InstanceId)
+$devices | ConvertTo-Json -Depth 4 -Compress
+""".strip()
+        payload = self._powershell(script, timeout=20)
+        if not payload:
+            return []
+        data = json.loads(payload)
+        if isinstance(data, dict):
+            data = [data]
+        return [item for item in data if isinstance(item, dict) and item.get("InstanceId")]
+
+    def _windows_audio_status(self, flow, label):
+        state = self._python_audio_state(flow, percent=None, delta=None, mute_action="")
+        if state is None:
+            script = self._windows_audio_endpoint_script(flow, percent=None, delta=None, mute_action="")
+            payload = self._powershell(script, timeout=20)
+            state = json.loads(payload)
+            if not isinstance(state, dict):
+                state = {}
+        level = int(state.get("level") or state.get("Level") or 0)
+        muted = bool(state.get("muted") if "muted" in state else state.get("Muted", False))
+        if muted or level == 0:
+            return f"{label} is off."
+        return f"{label} is at {level} percent."
+
+    def _open_setting_panel(self, params):
+        setting = self._normalize_setting_name(params.get("setting") or params.get("raw_text") or "")
+        if not self.is_windows:
+            raise RuntimeError("Settings panels are only implemented on Windows in this build.")
+        uri_map = {
+            "wifi": "ms-settings:network-wifi",
+            "bluetooth": "ms-settings:bluetooth",
+            "airplane mode": "ms-settings:network-airplanemode",
+            "brightness": "ms-settings:display",
+            "volume": "ms-settings:sound",
+            "microphone": "ms-settings:privacy-microphone",
+            "energy saver": "ms-settings:powersleep",
+            "night light": "ms-settings:nightlight",
+            "vpn": "ms-settings:network-vpn",
+            "display": "ms-settings:display",
+        }
+        if setting == "screen saver":
+            subprocess.Popen(["control.exe", "desk.cpl,,@screensaver"])
+            return "Opened Screen Saver settings."
+        uri = uri_map.get(setting)
+        if not uri:
+            raise RuntimeError(f"Settings panel not mapped for {setting or 'that request'}.")
+        os.startfile(uri)
+        return f"Opened {setting} settings."
+
+    def _get_setting_status(self, params):
+        setting = self._normalize_setting_name(params.get("setting") or params.get("raw_text") or "")
+        if setting == "wifi":
+            output = self._run_process(["netsh", "interface", "show", "interface"], timeout=20)
+            for line in output.splitlines():
+                if "Wi-Fi" in line or "Wireless" in line:
+                    return f"Wi-Fi status: {'enabled' if 'Enabled' in line else 'disabled'}."
+            return "Wi-Fi status is unavailable."
+        if setting == "bluetooth":
+            adapters = self._windows_bluetooth_adapters()
+            if not adapters:
+                return "Bluetooth status is unavailable."
+            active = next((item for item in adapters if str(item.get("Status") or "").strip().lower() == "ok"), None)
+            if active:
+                return f"Bluetooth is on ({active.get('FriendlyName')})."
+            name = str(adapters[0].get("FriendlyName") or "adapter").strip()
+            return f"Bluetooth is off ({name})."
+        if setting == "airplane mode":
+            output = self._run_process(["netsh", "interface", "show", "interface"], timeout=20)
+            enabled_count = sum(1 for line in output.splitlines() if "Enabled" in line and ("Wi-Fi" in line or "Bluetooth" in line or "Wireless" in line))
+            return "Airplane mode appears to be on." if enabled_count == 0 else "Airplane mode appears to be off."
+        if setting == "brightness":
+            script = "(Get-WmiObject -Namespace root\\wmi -Class WmiMonitorBrightness | Select-Object -First 1 -ExpandProperty CurrentBrightness)"
+            value = self._powershell(script)
+            return f"Brightness is at {value.strip()} percent."
+        if setting == "volume":
+            return self._windows_audio_status(0, "System sound")
+        if setting == "microphone":
+            return self._windows_audio_status(1, "Microphone")
+        if setting == "energy saver":
+            output = self._run_process(["powercfg", "/getactivescheme"], timeout=20)
+            return "Energy saver is on." if self.POWER_SAVER_GUID.lower() in output.lower() else "Energy saver is off."
+        if setting == "night light":
+            return "Night Light status is not directly available in this build."
+        if setting == "vpn":
+            script = (
+                "$vpn = Get-VpnConnection -ErrorAction SilentlyContinue | Where-Object { $_.ConnectionStatus -eq 'Connected' } | "
+                "Select-Object -First 1 -ExpandProperty Name; "
+                "if ($vpn) { \"VPN is connected: $vpn.\" } else { 'VPN is not connected.' }"
+            )
+            return self._powershell(script)
+        if setting == "display":
+            script = (
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                "$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; "
+                "\"Display resolution is $($bounds.Width) by $($bounds.Height).\""
+            )
+            return self._powershell(script)
+        if setting == "screen saver":
+            script = "(Get-ItemProperty -Path 'HKCU:\\Control Panel\\Desktop' -Name ScreenSaveActive).ScreenSaveActive"
+            value = self._powershell(script).strip()
+            return "Screen saver is on." if value == "1" else "Screen saver is off."
+        raise RuntimeError(f"Status is not available for {setting or 'that setting'}.")
+
     def _wireless_interface_names(self):
         if not self.is_windows:
             return []
@@ -938,21 +1934,26 @@ class SystemActions:
     def _set_bluetooth(self, params):
         turn_on = bool(params.get("on", True))
         if self.is_windows:
-            state = "On" if turn_on else "Off"
-            script = (
-                "[void][Windows.Devices.Radios.Radio,Windows.System.Devices,ContentType=WindowsRuntime]; "
-                "$accessTask = [Windows.Devices.Radios.Radio]::RequestAccessAsync(); "
-                "$accessTask.AsTask().Wait(); "
-                "$access = $accessTask.GetResults(); "
-                "if ($access -ne [Windows.Devices.Radios.RadioAccessStatus]::Allowed) { throw 'Radio access denied.' } "
-                "$radiosTask = [Windows.Devices.Radios.Radio]::GetRadiosAsync(); "
-                "$radiosTask.AsTask().Wait(); "
-                "$radios = $radiosTask.GetResults(); "
-                "$bt = $radios | Where-Object { $_.Kind -eq [Windows.Devices.Radios.RadioKind]::Bluetooth }; "
-                "if (-not $bt) { throw 'Bluetooth radio not found.' } "
-                f"foreach ($radio in $bt) {{ $op = $radio.SetStateAsync([Windows.Devices.Radios.RadioState]::{state}); $op.AsTask().Wait(); }}"
-            )
-            self._powershell(script)
+            adapters = self._windows_bluetooth_adapters()
+            if not adapters:
+                raise RuntimeError("Bluetooth adapter not found.")
+            errors = []
+            for adapter in adapters:
+                command = "Enable-PnpDevice" if turn_on else "Disable-PnpDevice"
+                script = (
+                    f"{command} -InstanceId {self._ps_quote(adapter['InstanceId'])} -Confirm:$false -ErrorAction Stop | Out-Null"
+                )
+                try:
+                    self._powershell(script, timeout=25)
+                except Exception as exc:
+                    errors.append(str(exc).splitlines()[0].strip())
+            if errors:
+                os.startfile("ms-settings:bluetooth")
+                joined = "; ".join(errors)
+                raise RuntimeError(
+                    f"Bluetooth {'enable' if turn_on else 'disable'} requires device permission or administrator access. "
+                    f"Opened Bluetooth settings. Details: {joined}"
+                )
             return f"Bluetooth turned {'on' if turn_on else 'off'}."
         if shutil.which("rfkill"):
             self._run_process(["rfkill", "unblock" if turn_on else "block", "bluetooth"])
@@ -962,27 +1963,42 @@ class SystemActions:
     def _set_airplane_mode(self, params):
         turn_on = bool(params.get("on", True))
         if self.is_windows:
-            state = "Off" if turn_on else "On"
-            script = (
-                "[void][Windows.Devices.Radios.Radio,Windows.System.Devices,ContentType=WindowsRuntime]; "
-                "$accessTask = [Windows.Devices.Radios.Radio]::RequestAccessAsync(); "
-                "$accessTask.AsTask().Wait(); "
-                "$access = $accessTask.GetResults(); "
-                "if ($access -ne [Windows.Devices.Radios.RadioAccessStatus]::Allowed) { throw 'Radio access denied.' } "
-                "$radiosTask = [Windows.Devices.Radios.Radio]::GetRadiosAsync(); "
-                "$radiosTask.AsTask().Wait(); "
-                "$radios = $radiosTask.GetResults(); "
-                f"foreach ($radio in $radios) {{ if ($radio.Kind -ne [Windows.Devices.Radios.RadioKind]::Unknown) {{ $op = $radio.SetStateAsync([Windows.Devices.Radios.RadioState]::{state}); $op.AsTask().Wait(); }} }}"
-            )
-            self._powershell(script)
+            updates = []
+            errors = []
+            try:
+                updates.append(self._set_wifi({"on": not turn_on}))
+            except Exception as exc:
+                errors.append(str(exc).splitlines()[0].strip())
+            try:
+                updates.append(self._set_bluetooth({"on": not turn_on}))
+            except Exception as exc:
+                errors.append(str(exc).splitlines()[0].strip())
+            if errors and not updates:
+                raise RuntimeError("; ".join(errors))
+            if errors:
+                return f"Airplane mode changed with partial success. {' '.join(updates)} {'; '.join(errors)}"
             return f"Airplane mode turned {'on' if turn_on else 'off'}."
         if shutil.which("nmcli"):
             self._run_process(["nmcli", "radio", "all", "off" if turn_on else "on"])
             return f"Airplane mode turned {'on' if turn_on else 'off'}."
         raise RuntimeError("Airplane mode control is not available on this system.")
 
+    def _set_energy_saver(self, params):
+        turn_on = bool(params.get("on", True))
+        if self.is_windows:
+            self._run_process(
+                ["powercfg", "/setactive", self.POWER_SAVER_GUID if turn_on else self.BALANCED_POWER_GUID],
+                timeout=20,
+            )
+            return f"Energy saver turned {'on' if turn_on else 'off'}."
+        raise RuntimeError("Energy saver control is not available on this system.")
+
     def _set_night_light(self, params):
-        raise RuntimeError("Night light control is not available through this build yet.")
+        turn_on = bool(params.get("on", True))
+        if self.is_windows:
+            os.startfile("ms-settings:nightlight")
+            return f"Opened Night Light settings to turn it {'on' if turn_on else 'off'}."
+        raise RuntimeError("Night light control is not available on this system.")
 
     def _eject_drive(self, params):
         requested = str(params.get("name") or params.get("path") or "").strip()
@@ -1003,29 +2019,47 @@ class SystemActions:
         if not application:
             raise RuntimeError("No application was provided.")
         if self.is_windows:
-            executable = self._find_executable(application) or application
+            app_data = params.get("resolved_application") or self.resolve_application_request(params)
+            executable = app_data.get("command") if app_data.get("kind") == "executable" else self._find_executable(application) or application
             script = f"Start-Process -FilePath {self._ps_quote(executable)} -Verb RunAs"
             self._powershell(script)
             return f"Launched {application} as administrator."
         raise RuntimeError("Run-as-administrator is only implemented on Windows.")
 
     def _play_music(self, params):
+        raw_text = self._normalize_query(params.get("raw_text") or "")
         song = str(params.get("song") or params.get("name") or "").strip()
         if not song:
             raise RuntimeError("No song title was provided.")
         platform_name = str(params.get("platform") or "").strip().lower()
+        if "youtube music" in raw_text:
+            platform_name = "youtube_music"
+        elif "spotify" in raw_text:
+            platform_name = "spotify"
+        elif "youtube" in raw_text or not platform_name:
+            platform_name = "youtube"
+
+        song = re.sub(r"\b(song|music|video)\b", "", song, flags=re.IGNORECASE).strip(" .")
+        song = re.sub(r"\b(?:on|in)\s+(youtube music|youtube|spotify)\b.*$", "", song, flags=re.IGNORECASE).strip(" .")
         browser = params.get("browser")
         if platform_name == "spotify":
+            if self.is_windows:
+                os.startfile(f"spotify:search:{song}")
+                return f"Opened Spotify for {song}."
             url = f"https://open.spotify.com/search/{quote_plus(song)}"
+        elif platform_name == "youtube_music":
+            url = self._find_youtube_video_url(song, music=True) or f"https://music.youtube.com/search?q={quote_plus(song)}"
         else:
-            url = f"https://www.youtube.com/results?search_query={quote_plus(song)}"
+            url = self._find_youtube_video_url(song, music=False) or f"https://www.youtube.com/results?search_query={quote_plus(song)}"
         open_params = {"website": url}
         if browser:
             open_params["browser"] = browser
         self._open_website(open_params)
         if platform_name == "spotify":
-            return f"Opened Spotify results for {song}."
-        return f"Opened YouTube results for {song}."
+            return f"Opened Spotify for {song}."
+        if platform_name == "youtube_music":
+            return f"Playing {song} on YouTube Music."
+        return f"Playing {song} on YouTube."
 
     def _draw_file_tree(self, params):
         directory = self._resolve_directory(params)

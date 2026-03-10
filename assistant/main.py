@@ -29,6 +29,8 @@ from .wake_word import WakeWordDetector
 
 
 INTERRUPT_STOP_WORDS = {"stop", "cancel", "quiet", "pause", "never mind", "wait"}
+YES_WORDS = {"yes", "y", "yeah", "yep", "sure", "correct", "do it", "go ahead", "proceed", "please do"}
+NO_WORDS = {"no", "n", "nope", "cancel", "stop", "dont", "do not", "negative", "never mind"}
 TEXT_VOICE_ENABLE_PHRASES = {
     "enable voice mode",
     "turn on voice mode",
@@ -131,6 +133,39 @@ def _prompt_yes_no(question):
     return answer in {"yes", "y"}
 
 
+def _interpret_yes_no(text):
+    normalized = _normalize_text(text)
+    if not normalized:
+        return None
+    if normalized in YES_WORDS or any(phrase in normalized for phrase in YES_WORDS):
+        return True
+    if normalized in NO_WORDS or any(phrase in normalized for phrase in NO_WORDS):
+        return False
+    return None
+
+
+def _confirm_prompt(prompt, *, tts, voice, is_text_mode):
+    if is_text_mode or voice is None:
+        return _prompt_yes_no(f"{prompt} (yes/no): ")
+
+    print(f"Assistant: {prompt}")
+    tts.speak(prompt, replace=True, interrupt=True)
+    tts.wait_until_done(timeout=6.0)
+    for _ in range(2):
+        audio = voice.record_until_silence(max_duration=4.0, silence_duration=0.6, min_duration=0.2, start_timeout=3.0)
+        transcript = voice.transcribe(audio) if audio is not None else ""
+        if transcript:
+            print(f"User: {transcript}")
+        interpreted = _interpret_yes_no(transcript)
+        if interpreted is not None:
+            return interpreted
+        retry_prompt = "Please say yes or no."
+        print(f"Assistant: {retry_prompt}")
+        tts.speak(retry_prompt, replace=True, interrupt=True)
+        tts.wait_until_done(timeout=4.0)
+    return False
+
+
 def _prompt_choice(question, options):
     print(question)
     for index, option in enumerate(options, start=1):
@@ -145,7 +180,7 @@ def _prompt_choice(question, options):
     return answer
 
 
-def _resolve_delete_request(system, params):
+def _resolve_delete_request(system, params, *, tts, voice, is_text_mode):
     candidates = system.find_path_candidates(params.get("name", ""), directory=params.get("directory"), source_hint=None)
     if not candidates:
         return None, "No matching file or folder was found to delete."
@@ -161,8 +196,46 @@ def _resolve_delete_request(system, params):
         if chosen is None:
             return None, "Deletion cancelled."
 
-    if not _prompt_yes_no(f"Delete {chosen}? (yes/no): "):
+    if not _confirm_prompt(f"Delete {chosen}?", tts=tts, voice=voice, is_text_mode=is_text_mode):
         return None, f"Deletion cancelled for {chosen.name}."
+
+    resolved = dict(params)
+    resolved["path"] = str(chosen)
+    resolved["name"] = chosen.name
+    return resolved, ""
+
+
+def _resolve_existing_path_request(system, params, *, tts, voice, is_text_mode, source_hint=None, purpose="open"):
+    requested_name = str(params.get("name") or "").strip()
+    candidates = system.find_path_candidates(requested_name, directory=params.get("directory"), source_hint=source_hint)
+    if not candidates:
+        return None, f"No matching file or folder was found to {purpose}."
+
+    target_lower = requested_name.lower()
+    target_stem = pathlib.Path(requested_name).stem.lower()
+    exact_matches = [
+        candidate
+        for candidate in candidates
+        if candidate.name.lower() == target_lower or candidate.stem.lower() == target_stem
+    ]
+
+    chosen = exact_matches[0] if exact_matches else candidates[0]
+    if len(candidates) > 1 and not exact_matches:
+        choices = [str(candidate) for candidate in candidates]
+        selected = _prompt_choice(f"Multiple close matches were found. Choose the exact path to {purpose}:", choices)
+        if not selected:
+            return None, f"{purpose.title()} cancelled."
+        chosen = next((candidate for candidate in candidates if str(candidate) == selected or candidate.name == selected), None)
+        if chosen is None:
+            return None, f"{purpose.title()} cancelled."
+    elif not exact_matches:
+        if not _confirm_prompt(
+            f"I found {chosen}. Do you want me to {purpose} it?",
+            tts=tts,
+            voice=voice,
+            is_text_mode=is_text_mode,
+        ):
+            return None, f"{purpose.title()} cancelled."
 
     resolved = dict(params)
     resolved["path"] = str(chosen)
@@ -173,6 +246,12 @@ def _resolve_delete_request(system, params):
 def _resolve_create_request(system, params):
     requested_name = str(params.get("name") or "notes.txt").strip()
     directory = params.get("directory")
+    if not directory:
+        selected_path = input(f"Enter a directory path for '{requested_name}' (blank for Home): ").strip()
+        if _normalize_text(selected_path) == "cancel":
+            return None, "Creation cancelled."
+        params["directory"] = selected_path or str(pathlib.Path.home())
+        directory = params["directory"]
     candidates = system.find_path_candidates(requested_name, directory=directory, source_hint="file")
     if candidates:
         choices = [candidate.name for candidate in candidates]
@@ -273,6 +352,14 @@ def _process_command(
 
     if action == "enter_text_mode":
         return "ENTER_TEXT_MODE" if not is_text_mode else None
+
+    if action == "stop_assistant":
+        result = "Shutting down the assistant."
+        print(result)
+        _record_terminal_response(terminal_state, system, result)
+        tts.speak(result, replace=True, interrupt=True)
+        tts.wait_until_done(timeout=4.0)
+        return "EXIT_ASSISTANT"
 
     if action == "restart_setup":
         result = _run_setup_flow(config, voice, tts, llm, system, memory, terminal_state, wake_detector, factory_reset=False)
@@ -391,6 +478,32 @@ def _process_command(
         params.setdefault("raw_text", query)
         params = _apply_contextual_follow_up(action, params, system)
 
+        if action in {"open_application", "close_application", "run_as_admin"} or (action == "open_path" and params.get("application")):
+            app_match = system.resolve_application_request(params)
+            if app_match.get("status") == "missing":
+                result = f"I could not find an installed application matching {app_match.get('requested') or params.get('application') or 'that request'}."
+                print(result)
+                _record_terminal_response(terminal_state, system, result)
+                if not is_text_mode or text_mode_state["voice_enabled"]:
+                    _speak_with_barge_in(
+                        tts,
+                        result,
+                        wake_detector=wake_detector if not is_text_mode else None,
+                        voice=voice if not is_text_mode else None,
+                    )
+                return None
+            if app_match.get("status") == "needs_confirmation":
+                prompt = (
+                    f"I could not find {app_match.get('requested')} exactly. "
+                    f"Do you want me to open {app_match.get('display_name')} instead?"
+                )
+                if not _confirm_prompt(prompt, tts=tts, voice=voice, is_text_mode=is_text_mode):
+                    result = "Application action cancelled."
+                    print(result)
+                    _record_terminal_response(terminal_state, system, result)
+                    return None
+            params["resolved_application"] = app_match
+
         if action == "create_file":
             resolved, error = _resolve_create_request(system, dict(params))
             if not resolved:
@@ -399,8 +512,24 @@ def _process_command(
                 return None
             params = resolved
 
+        if action in {"open_path", "read_file"} and params.get("name") and not params.get("website") and not params.get("application"):
+            resolved, error = _resolve_existing_path_request(
+                system,
+                dict(params),
+                tts=tts,
+                voice=voice,
+                is_text_mode=is_text_mode,
+                source_hint="file" if action == "read_file" else None,
+                purpose="read" if action == "read_file" else "open",
+            )
+            if not resolved:
+                print(error)
+                _record_terminal_response(terminal_state, system, error)
+                return None
+            params = resolved
+
         if action == "delete_path":
-            resolved, error = _resolve_delete_request(system, dict(params))
+            resolved, error = _resolve_delete_request(system, dict(params), tts=tts, voice=voice, is_text_mode=is_text_mode)
             if not resolved:
                 print(error)
                 _record_terminal_response(terminal_state, system, error)
@@ -504,7 +633,7 @@ def _run_text_mode(
                 print(response)
                 _record_terminal_response(terminal_state, system, response)
                 continue
-            _process_command(
+            result = _process_command(
                 query,
                 config=config,
                 intent_engine=intent_engine,
@@ -519,6 +648,8 @@ def _run_text_mode(
                 text_mode_state=text_mode_state,
                 is_text_mode=True,
             )
+            if result == "EXIT_ASSISTANT":
+                return "EXIT_ASSISTANT"
         return None
 
     buffer = []
@@ -569,7 +700,7 @@ def _run_text_mode(
                 print("\nText > ", end="", flush=True)
                 continue
 
-            _process_command(
+            result = _process_command(
                 query,
                 config=config,
                 intent_engine=intent_engine,
@@ -584,6 +715,9 @@ def _run_text_mode(
                 text_mode_state=text_mode_state,
                 is_text_mode=True,
             )
+            if result == "EXIT_ASSISTANT":
+                print("Stopping assistant.\n")
+                return "EXIT_ASSISTANT"
             print("\nText > ", end="", flush=True)
             continue
 
@@ -682,6 +816,8 @@ def run():
                 result = _run_setup_flow(config, voice, tts, llm, system, memory, terminal_state, wake_detector, factory_reset=True)
                 print(result)
                 _record_terminal_response(terminal_state, system, result)
+            elif text_mode_result == "EXIT_ASSISTANT":
+                break
             continue
 
         print("Listening for wake word...")
@@ -734,6 +870,8 @@ def run():
         )
         if result == "ENTER_TEXT_MODE":
             text_mode_toggle_event.set()
+        elif result == "EXIT_ASSISTANT":
+            break
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ class IntentEngine:
         "shutdown_system",
         "restart_system",
         "sleep_system",
+        "stop_assistant",
         "open_application",
         "open_path",
         "close_application",
@@ -25,9 +26,14 @@ class IntentEngine:
         "rename_path",
         "duplicate_path",
         "set_brightness",
+        "set_volume",
+        "set_microphone",
+        "get_setting_status",
+        "open_setting_panel",
         "set_wifi",
         "set_bluetooth",
         "set_airplane_mode",
+        "set_energy_saver",
         "set_night_light",
         "eject_drive",
         "run_as_admin",
@@ -87,6 +93,10 @@ class IntentEngine:
         "vscode",
         "code",
         "camera",
+        "matlab",
+        "vlc",
+        "video",
+        "player",
         "chrome",
         "edge",
         "firefox",
@@ -98,6 +108,10 @@ class IntentEngine:
         "calculator",
         "paint",
         "explorer",
+        "finder",
+        "file",
+        "visual",
+        "studio",
     }
     FOLDER_WORDS = {
         "folder",
@@ -111,7 +125,24 @@ class IntentEngine:
         "recycle",
         "bin",
     }
-    SETTING_WORDS = {"wifi", "bluetooth", "airplane", "brightness", "night", "light"}
+    SETTING_WORDS = {
+        "wifi",
+        "bluetooth",
+        "airplane",
+        "brightness",
+        "night",
+        "light",
+        "sound",
+        "volume",
+        "microphone",
+        "mic",
+        "energy",
+        "saver",
+        "vpn",
+        "display",
+        "screen",
+        "screensaver",
+    }
     CONTROL_WORDS = {
         "password",
         "voice",
@@ -154,15 +185,22 @@ class IntentEngine:
         normalized = self._normalize_query_text(original)
         tokens = self._correct_tokens(self._tokenize(normalized))
         action = self._detect_action(original, normalized, tokens)
+        current_context = context or {}
+        previous_application = str(current_context.get("last_application") or "").strip().lower()
+        if action is None and previous_application.startswith("camera") and self._contains_any(
+            tokens,
+            {"picture", "pictures", "photo", "capture", "selfie", "record", "recording", "video"},
+        ):
+            action = "open_application"
 
         if action:
             return {
                 "intent": "system_command",
                 "action": action,
-                "parameters": self._extract_params(original, normalized, tokens, action, context or {}),
+                "parameters": self._extract_params(original, normalized, tokens, action, current_context),
             }
 
-        llm_result = self._llm_intent_fallback(original, context or {})
+        llm_result = self._llm_intent_fallback(original, current_context)
         if llm_result:
             return llm_result
 
@@ -200,6 +238,12 @@ class IntentEngine:
             ("blu tooth", "bluetooth"),
             ("air plane", "airplane"),
             ("flight mode", "airplane mode"),
+            ("enery saver", "energy saver"),
+            ("battery saver", "energy saver"),
+            ("night ligh", "night light"),
+            ("sound level", "volume level"),
+            ("system sound", "volume"),
+            ("vs code", "visual studio code"),
             ("dot pi", "dot py"),
             (" dot py ", ".py "),
             ("c plus plus", "cpp"),
@@ -217,7 +261,13 @@ class IntentEngine:
         return normalized
 
     def _tokenize(self, normalized):
-        return re.findall(r"[a-z0-9@./\\:+_-]+", normalized)
+        raw_tokens = re.findall(r"[a-z0-9@./\\:+_-]+", normalized)
+        cleaned = []
+        for token in raw_tokens:
+            token = token.strip(".,!?;:()[]{}\"'")
+            if token:
+                cleaned.append(token)
+        return cleaned
 
     def _correct_tokens(self, tokens):
         corrected = []
@@ -254,7 +304,11 @@ class IntentEngine:
     def _is_website_context(self, normalized, tokens):
         if self._contains_any(tokens, self.WEBSITE_WORDS | {"channel", "profile", "website", "site"}):
             return True
-        if any(token.startswith("http") or "/" in token or "." in token for token in tokens):
+        if any(token.startswith("http") for token in tokens):
+            return True
+        if any("/" in token and len(token) > 3 for token in tokens):
+            return True
+        if any(re.match(r"^(?:www\.)?[a-z0-9-]+\.[a-z0-9.-]+(?:/.*)?$", token) for token in tokens):
             return True
         if "youtube/" in normalized or "github/" in normalized or "spotify/" in normalized:
             return True
@@ -263,6 +317,43 @@ class IntentEngine:
     def _detect_action(self, text, normalized, tokens):
         scores = defaultdict(int)
         token_set = set(tokens)
+        app_phrase_present = self._contains_phrase(
+            normalized,
+            {"vlc media player", "visual studio code", "file explorer", "camera app"},
+        )
+        explicit_app_request = app_phrase_present or self._contains_any(
+            tokens,
+            {
+                "camera",
+                "blender",
+                "matlab",
+                "explorer",
+                "terminal",
+                "powershell",
+                "cmd",
+                "notepad",
+                "calculator",
+                "paint",
+                "vlc",
+                "vscode",
+                "code",
+                "spotify",
+                "firefox",
+                "chrome",
+                "edge",
+            },
+        )
+
+        if self._contains_any(tokens, {"picture", "pictures", "photo", "capture", "selfie"}) and self._contains_any(tokens, {"click", "take", "capture"}):
+            scores["open_application"] += 15
+        if self._contains_any(tokens, {"record", "recording", "video"}) and self._contains_any(tokens, {"start", "begin", "record"}):
+            scores["open_application"] += 14
+
+        if normalized in {"stop", "stop yourself", "kill yourself", "shut yourself down", "go offline", "turn yourself off"} or self._contains_phrase(
+            normalized,
+            {"stop assistant", "exit assistant", "close assistant", "shutdown assistant", "shut down assistant"},
+        ):
+            scores["stop_assistant"] += 30
 
         if "password" in token_set and self._contains_any(tokens, {"reset", "change", "update", "setup"}):
             scores["reset_password"] += 14
@@ -301,12 +392,40 @@ class IntentEngine:
 
         if "brightness" in token_set and (self._contains_any(tokens, self.ACTION_WORDS["switch"]) or "percent" in token_set):
             scores["set_brightness"] += 13
+        if self._contains_any(tokens, {"status", "state", "check"}) and self._contains_any(
+            tokens,
+            self.SETTING_WORDS | {"vpn", "display", "screen", "screensaver"},
+        ):
+            scores["get_setting_status"] += 14
+        if self._contains_any(tokens, {"settings", "setting", "panel"}) and self._contains_any(
+            tokens,
+            self.SETTING_WORDS | {"vpn", "display", "screen", "screensaver"},
+        ) and self._contains_any(tokens, self.ACTION_WORDS["open"] | {"show"}):
+            scores["open_setting_panel"] += 13
+        if self._contains_any(tokens, {"sound", "volume", "mute", "unmute"}) and (
+            self._contains_any(
+                tokens,
+                self.ACTION_WORDS["switch"] | {"up", "down", "increase", "decrease", "reduce", "raise", "lower", "louder", "quieter", "mute", "unmute"},
+            )
+            or "percent" in token_set
+        ):
+            scores["set_volume"] += 15
+        if self._contains_any(tokens, {"microphone", "mic"}) and (
+            self._contains_any(
+                tokens,
+                self.ACTION_WORDS["switch"] | {"up", "down", "increase", "decrease", "reduce", "raise", "lower", "louder", "quieter", "mute", "unmute"},
+            )
+            or "percent" in token_set
+        ):
+            scores["set_microphone"] += 15
         if "wifi" in token_set and self._contains_any(tokens, self.ACTION_WORDS["switch"] | {"on", "off"}):
             scores["set_wifi"] += 13
         if "bluetooth" in token_set and self._contains_any(tokens, self.ACTION_WORDS["switch"] | {"on", "off"}):
             scores["set_bluetooth"] += 13
         if "airplane" in token_set and "mode" in token_set and self._contains_any(tokens, self.ACTION_WORDS["switch"] | {"on", "off"}):
             scores["set_airplane_mode"] += 13
+        if "energy" in token_set and "saver" in token_set and self._contains_any(tokens, self.ACTION_WORDS["switch"] | {"on", "off"}):
+            scores["set_energy_saver"] += 13
         if "night" in token_set and "light" in token_set and self._contains_any(tokens, self.ACTION_WORDS["switch"] | {"on", "off"}):
             scores["set_night_light"] += 11
 
@@ -336,6 +455,8 @@ class IntentEngine:
 
         if self._contains_any(tokens, self.ACTION_WORDS["play"]) and (self._contains_any(tokens, {"music", "song", "spotify", "youtube"}) or len(tokens) > 1):
             scores["play_music"] += 13
+        if self._contains_any(tokens, {"song", "music"}) and len(tokens) >= 2:
+            scores["play_music"] += 12
         if self._contains_any(tokens, {"tree", "structure"}) and self._contains_any(tokens, {"draw", "show", "system", "directory", "folder", "file"}):
             scores["draw_file_tree"] += 12
 
@@ -343,14 +464,25 @@ class IntentEngine:
             scores["close_application"] += 12
 
         if self._contains_any(tokens, self.ACTION_WORDS["open"]):
-            if self._is_website_context(normalized, tokens):
+            file_open_request = self._is_file_context(normalized, tokens) or self._is_folder_context(tokens)
+            if file_open_request and (explicit_app_request or self._contains_any(tokens, {"using", "with"})):
+                scores["open_path"] += 18
+                scores["open_application"] += 4
+            elif self._is_website_context(normalized, tokens):
                 scores["open_path"] += 15
-            elif self._is_folder_context(tokens) or self._is_file_context(normalized, tokens) or self._refers_to_previous_target(tokens):
+            elif explicit_app_request:
+                scores["open_application"] += 16
+            elif file_open_request or self._refers_to_previous_target(tokens):
                 scores["open_path"] += 13
             else:
                 scores["open_application"] += 12
-            if self._contains_any(tokens, self.APP_WORDS | {"app", "application", "browser"}):
+            if explicit_app_request or self._contains_any(tokens, self.APP_WORDS | {"app", "application", "browser"}):
                 scores["open_application"] += 4
+
+        if not scores and (self._contains_any(tokens, self.APP_WORDS) or app_phrase_present):
+            meaningful = [token for token in tokens if token not in {"open", "run", "launch", "start", "the"}]
+            if 1 <= len(meaningful) <= 5:
+                scores["open_application"] += 11
 
         if not scores:
             return None
@@ -361,11 +493,13 @@ class IntentEngine:
         params = {"raw_text": text}
         lowered = normalized.lower()
 
-        if action in {"set_brightness", "set_humor", "set_voice_auth"}:
+        if action in {"set_brightness", "set_humor", "set_voice_auth", "set_volume", "set_microphone"}:
             match = re.search(r"(\d{1,3})\s*(?:percent)?", lowered)
             if match:
                 value = max(0, min(100, int(match.group(1))))
                 if action == "set_brightness":
+                    params["percent"] = value
+                elif action in {"set_volume", "set_microphone"}:
                     params["percent"] = value
                 elif action == "set_humor":
                     params["level"] = value
@@ -376,8 +510,17 @@ class IntentEngine:
                 params["direction"] = "up"
             elif self._contains_any(tokens, {"decrease", "reduce", "lower", "dim"}):
                 params["direction"] = "down"
+        if action in {"set_volume", "set_microphone"}:
+            if self._contains_any(tokens, {"increase", "raise", "up", "louder"}):
+                params["direction"] = "up"
+            elif self._contains_any(tokens, {"decrease", "reduce", "lower", "down", "quieter"}):
+                params["direction"] = "down"
+            if any(word in lowered for word in ("off", "disable", "deactivate", "mute")):
+                params["on"] = False
+            elif any(word in lowered for word in ("on", "enable", "activate", "unmute")):
+                params["on"] = True
 
-        if action in {"set_wifi", "set_bluetooth", "set_airplane_mode", "set_night_light", "set_autostart"}:
+        if action in {"set_wifi", "set_bluetooth", "set_airplane_mode", "set_energy_saver", "set_night_light", "set_autostart"}:
             params["on"] = not any(word in lowered for word in ("off", "disable", "deactivate"))
         if action == "set_voice_auth":
             if any(word in lowered for word in ("off", "disable", "deactivate")):
@@ -388,6 +531,8 @@ class IntentEngine:
             match = re.search(r"\b(?:to|in)\s+([a-z]+)\b", lowered)
             if match:
                 params["language"] = match.group(1)
+        if action in {"get_setting_status", "open_setting_panel"}:
+            params["setting"] = self._extract_setting_name(lowered)
         if action == "change_voice":
             for preset in VOICE_PRESETS:
                 if preset in tokens:
@@ -399,20 +544,28 @@ class IntentEngine:
                 params["assistant_name"] = name
 
         if action == "play_music":
-            match = re.search(r"\bplay\s+(.+?)(?:\s+on\s+([a-z]+))?$", lowered)
-            if match:
-                params["song"] = match.group(1).strip(" .")
-                if match.group(2):
-                    params["platform"] = match.group(2)
+            song, platform = self._extract_song_request(lowered)
+            if song:
+                params["song"] = song
+            if platform:
+                params["platform"] = platform
 
         if action in {"open_application", "close_application", "run_as_admin"}:
             entity = self._extract_entity_after_verbs(text, ("run", "open", "launch", "start", "close", "quit", "exit", "terminate", "kill"))
-            if entity:
+            previous_camera = str(context.get("last_application") or "").strip().lower().startswith("camera")
+            camera_follow_up = self._contains_any(tokens, {"picture", "pictures", "photo", "capture", "selfie", "record", "recording", "video"})
+            if previous_camera and camera_follow_up:
+                params["application"] = context.get("last_application")
+            elif entity and entity.lower() not in {"recording", "picture", "pictures", "photo", "video"}:
                 params["application"] = entity
             elif self._refers_to_previous_target(tokens):
                 previous = context.get("last_application")
                 if previous:
                     params["application"] = previous
+            elif camera_follow_up:
+                params["application"] = "camera"
+            else:
+                params["application"] = text.strip()
 
         if action in {"open_path", "read_file", "delete_path", "modify_file", "change_directory"}:
             name = self._extract_target_name(text)
@@ -426,8 +579,11 @@ class IntentEngine:
                 params.setdefault("name", context.get("last_name") or "")
 
         if action == "list_directory":
-            directory = self._extract_directory(text) or self._extract_target_name(text)
-            if directory:
+            if self._contains_phrase(lowered, {"current directory", "current folder", "this directory", "this folder", "here"}):
+                directory = ""
+            else:
+                directory = self._extract_directory(text) or self._extract_list_directory_target(text)
+            if directory is not None:
                 params["directory"] = directory
             elif context.get("last_path"):
                 params["directory"] = context["last_path"]
@@ -478,6 +634,10 @@ class IntentEngine:
             browser = self._extract_browser(text)
             if browser:
                 params["browser"] = browser
+            if action == "open_path":
+                application = self._extract_application_target(text)
+                if application:
+                    params["application"] = application
 
         if action == "draw_file_tree":
             directory = self._extract_directory(text)
@@ -498,11 +658,68 @@ class IntentEngine:
         entity = match.group(1).strip(" .")
         entity = re.sub(r"\bas\s+administrator\b", "", entity, flags=re.IGNORECASE).strip(" .")
         entity = re.sub(r"\bin\s+(brave|chrome|edge|firefox)\b.*$", "", entity, flags=re.IGNORECASE).strip(" .")
+        entity = re.sub(
+            r"\b(?:and|to)\s+(?:click|take|capture|record|start)\b.*$",
+            "",
+            entity,
+            flags=re.IGNORECASE,
+        ).strip(" .")
         return entity or None
 
     def _extract_browser(self, text):
         match = re.search(r"\bin\s+(brave|chrome|edge|firefox|brave browser|google chrome)\b", text, flags=re.IGNORECASE)
         return match.group(1).strip().lower() if match else None
+
+    def _extract_application_target(self, text):
+        lowered = self._normalize_query_text(text)
+        aliases = [
+            "vlc media player",
+            "visual studio code",
+            "windows powershell",
+            "file explorer",
+            "brave browser",
+            "google chrome",
+            "microsoft edge",
+            "camera app",
+            "vs code",
+            "powershell",
+            "terminal",
+            "camera",
+            "blender",
+            "matlab",
+            "spotify",
+            "chrome",
+            "firefox",
+            "brave",
+            "edge",
+            "vlc",
+        ]
+        for alias in aliases:
+            if re.search(rf"\b(?:in|using|with)\s+(?:the\s+)?{re.escape(alias)}\b", lowered):
+                return alias
+        return None
+
+    def _extract_setting_name(self, text):
+        phrases = [
+            "airplane mode",
+            "night light",
+            "energy saver",
+            "screen saver",
+            "screensaver",
+            "microphone",
+            "volume",
+            "sound",
+            "brightness",
+            "bluetooth",
+            "wifi",
+            "vpn",
+            "display",
+        ]
+        lowered = str(text or "").lower()
+        for phrase in phrases:
+            if phrase in lowered:
+                return phrase
+        return ""
 
     def _extract_requested_name(self, text):
         patterns = [
@@ -518,34 +735,96 @@ class IntentEngine:
                     return value
         return None
 
+    def _strip_usage_context(self, value):
+        return re.split(
+            r"\s+\b(?:in|using|with|on)\b\s+(?=(?:the\s+)?(?:youtube music|youtube|spotify|vlc media player|visual studio code|vs code|windows powershell|file explorer|brave browser|google chrome|microsoft edge|camera app|camera|blender|matlab|vlc|brave|chrome|edge|firefox|powershell|terminal|browser|app|application)\b)",
+            str(value or "").strip(),
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+
+    def _clean_directory_reference(self, value):
+        cleaned = str(value or "").strip().strip("\"'")
+        if not cleaned:
+            return None
+        lowered = self._normalize_query_text(cleaned)
+        if lowered in {"current directory", "current folder", "this directory", "this folder", "here"}:
+            return ""
+        cleaned = self._strip_usage_context(cleaned)
+        cleaned = re.sub(r"^(?:the|a|an)\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(?:directory|folder|path)\b$", "", cleaned, flags=re.IGNORECASE).strip(" .")
+        return cleaned or None
+
+    def _clean_target_reference(self, value):
+        cleaned = str(value or "").strip().strip("\"'")
+        if not cleaned:
+            return None
+        cleaned = self._strip_usage_context(cleaned)
+        cleaned = re.sub(r"^(?:the|a|an)\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r"^(?:file|folder|directory|app|application|program)\s+(?:named|called)\s+",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"^(?:named|called)\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(?:file|folder|directory|app|application|program)\b$", "", cleaned, flags=re.IGNORECASE).strip(" .")
+        return cleaned or None
+
     def _extract_directory(self, text):
         match = re.search(
-            r"\b(?:in|inside|under|at|from)\s+(?:the\s+)?([A-Za-z0-9_ ./\\:-]+?)(?=\s+\b(?:with|write|and|to|from|called|named)\b|$)",
+            r"\b(?:in|inside|under|at|from)\s+(?:the\s+)?([A-Za-z0-9_ ./\\:-]+?)(?=\s+\b(?:with|write|and|to|from|called|named|using|on|open|launch|run|start|read|delete|create|make|copy|move|rename|duplicate|list|show|display)\b|$)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
+        value = self._clean_directory_reference(match.group(1))
+        if not value:
+            return value
+        if value.lower() in {"text mode", "voice mode"} or value.lower().startswith(("which ", "that ", "where ")):
+            return None
+        if value.lower() in {"which", "that", "where"}:
+            return None
+        return value
+
+    def _extract_list_directory_target(self, text):
+        lowered = str(text or "").lower()
+        if any(phrase in lowered for phrase in {"current directory", "current folder", "this directory", "this folder", "here"}):
+            return ""
+        match = re.search(
+            r"\b(?:list|show|display)\s+(?:the\s+)?(?:contents|files)?(?:\s+of)?\s+(?:the\s+)?([A-Za-z0-9_ ./\\:-]+?)(?=\s*$)",
             text,
             flags=re.IGNORECASE,
         )
         if not match:
             return None
         value = match.group(1).strip(" .")
-        if value.lower() in {"text mode", "voice mode"}:
-            return None
-        return value
+        value = re.sub(r"^(?:contents\s+of|files\s+in)\s+", "", value, flags=re.IGNORECASE)
+        value = self._clean_directory_reference(value)
+        if not value:
+            return ""
+        return value or None
 
     def _extract_target_name(self, text):
         quoted = re.findall(r"[\"']([^\"']+)[\"']", text)
         if quoted:
             return quoted[0].strip()
+        explicit = re.search(
+            r"\b(?:file|folder|directory|app|application|program)\s+(?:named|called)\s+(.+?)(?=\s+\b(?:in|inside|under|from|to|with|using|and|on)\b|$)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if explicit:
+            return self._clean_target_reference(explicit.group(1))
         match = re.search(
-            r"\b(?:open|read|delete|remove|modify|edit|create|make|copy|move|rename|duplicate|list|show|display)\s+(.+?)(?=\s+\b(?:in|inside|under|from|to|with|and|named|called)\b|$)",
+            r"\b(?:open|read|delete|remove|modify|edit|create|make|copy|move|rename|duplicate|list|show|display)\s+(.+?)(?=\s+\b(?:in|inside|under|from|to|with|using|on|and|named|called)\b|$)",
             text,
             flags=re.IGNORECASE,
         )
         if not match:
             return None
-        value = match.group(1).strip(" .")
-        value = re.sub(r"^(?:the|a|an)\s+", "", value, flags=re.IGNORECASE)
-        value = re.sub(r"^(?:file|folder|directory|app|application)\s+", "", value, flags=re.IGNORECASE)
-        return value or None
+        return self._clean_target_reference(match.group(1))
 
     def _extract_filename(self, text, lowered):
         explicit = re.search(r"\b([A-Za-z0-9_\-]+(?:\.[A-Za-z0-9]+)+)\b", lowered) or re.search(
@@ -615,6 +894,7 @@ class IntentEngine:
     def _extract_content_request(self, text):
         patterns = [
             r"\band\s+write\s+(.+)$",
+            r"\bin\s+which\s+write\s+(.+)$",
             r"\bwrite\s+code\s+to\s+(.+)$",
             r"\bwrite\s+(.+)$",
             r"\bcontaining\s+(.+)$",
@@ -627,6 +907,22 @@ class IntentEngine:
                 if request:
                     return request
         return None
+
+    def _extract_song_request(self, lowered):
+        platform = ""
+        if "youtube music" in lowered:
+            platform = "youtube_music"
+        elif "spotify" in lowered:
+            platform = "spotify"
+        elif "youtube" in lowered:
+            platform = "youtube"
+
+        working = lowered.strip(" .")
+        match = re.search(r"\bplay\s+(.+)$", working)
+        song = match.group(1).strip(" .") if match else working
+        song = re.sub(r"\b(?:on|in)\s+(youtube music|youtube|spotify)\b.*$", "", song, flags=re.IGNORECASE).strip(" .")
+        song = re.sub(r"\b(song|music|video)\b", "", song, flags=re.IGNORECASE).strip(" .")
+        return song, platform
 
     def _extract_transfer_params(self, text, context):
         params = {}

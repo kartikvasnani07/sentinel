@@ -37,6 +37,27 @@ def _extract_assistant_name(raw_name):
     return value
 
 
+def _print_voice_presets():
+    print("\nAvailable voice presets:")
+    for index, (name, preset) in enumerate(VOICE_PRESETS.items(), start=1):
+        description = preset.get("description", name).strip()
+        print(f"  {index}. {name} - {description}")
+
+
+def _resolve_voice_choice(choice):
+    cleaned = str(choice or "").strip().lower()
+    ordered = list(VOICE_PRESETS.keys())
+    if not cleaned:
+        return "jarvis"
+    if cleaned.isdigit():
+        index = int(cleaned) - 1
+        if 0 <= index < len(ordered):
+            return ordered[index]
+    if cleaned in VOICE_PRESETS:
+        return cleaned
+    return next((name for name in VOICE_PRESETS if name in cleaned), "")
+
+
 def run_first_time_setup(config, voice_engine=None, tts=None):
     print("\n" + "=" * 50)
     print("  Welcome to your AI Assistant - First Time Setup")
@@ -70,16 +91,25 @@ def run_first_time_setup(config, voice_engine=None, tts=None):
         tts,
         "Choose a voice preset. I can preview each voice before you confirm it.",
     )
+    _print_voice_presets()
     while True:
-        choice = input("Voice preset [jarvis]: ").strip().lower() or "jarvis"
-        match = next((name for name in VOICE_PRESETS if name in choice), None)
+        choice = input("Voice preset [jarvis] (name, number, or 'list'): ").strip().lower()
+        if choice in {"list", "show", "help", "?"}:
+            _print_voice_presets()
+            continue
+        match = _resolve_voice_choice(choice)
         if not match:
             print("Unknown voice preset. Try again.")
+            _print_voice_presets()
             continue
         if tts is not None:
-            tts.apply_voice_preset(match)
+            result = tts.apply_voice_preset(match)
+            print(result)
             preview_name = config.get("assistant_name", assistant_name).title()
-            _tts_prompt(tts, f"Hello. I am {preview_name}. This is the {match} voice. Keep it?")
+            preview_text = f"Hello. I am {preview_name}. This is the {match} voice profile."
+            tts.preview_current_voice(preview_text)
+            tts.wait_until_done(timeout=8.0)
+            print(f"Previewed {match}.")
         keep = input("Keep this voice? (yes/no): ").strip().lower()
         if keep in {"y", "yes"}:
             config.set("voice_preset", match)
