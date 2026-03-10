@@ -13,7 +13,7 @@ except ImportError:
     msvcrt = None
 
 from .bootstrap import run_first_time_setup
-from .config import AssistantConfig
+from .config import AssistantConfig, VOICE_PRESETS
 from .fallback_manager import FallbackManager
 from .intent_engine import IntentEngine
 from .llm_engine import LLMEngine
@@ -23,7 +23,7 @@ from .streaming_pipeline import StreamingPipeline
 from .system_actions import SystemActions
 from .tts_engine import TTSEngine
 from .utils import disable_autostart, enable_autostart, random_greeting, random_wake_response
-from .voice_auth import enroll_voice, verify_voice
+from .voice_auth import enroll_voice
 from .voice_engine import VoiceEngine
 from .wake_word import WakeWordDetector
 
@@ -43,6 +43,21 @@ TEXT_VOICE_DISABLE_PHRASES = {
     "turn off voice mode",
     "mute responses",
     "stop reading responses",
+}
+MEDIA_EXTENSIONS = {
+    ".mp3",
+    ".wav",
+    ".flac",
+    ".m4a",
+    ".aac",
+    ".ogg",
+    ".mp4",
+    ".mkv",
+    ".avi",
+    ".mov",
+    ".webm",
+    ".wmv",
+    ".mpeg",
 }
 
 
@@ -90,11 +105,140 @@ def _extract_media_request_from_text(text):
     return {"platform": platform or "youtube", "query": query}
 
 
+def _format_history(memory):
+    rows = memory.list_conversations()
+    if not rows:
+        return "No conversation history is available."
+    lines = ["Conversation history:"]
+    for row in rows:
+        marker = " <- current" if row.get("is_current") else ""
+        lines.append(
+            f"{row.get('id')} | {row.get('title')} | messages: {row.get('message_count')} | updated: {row.get('updated_at')}{marker}"
+        )
+    lines.append("Use: open conversation <id> to continue a specific chat.")
+    return "\n".join(lines)
+
+
+def _open_new_conversation(memory, system, terminal_state):
+    conversation_id = memory.start_new_conversation()
+    system.clear_context()
+    terminal_state["last_response"] = ""
+    return f"Started new conversation {conversation_id}."
+
+
+def _is_media_extension(path_like):
+    suffix = pathlib.Path(str(path_like or "")).suffix.lower()
+    return suffix in MEDIA_EXTENSIONS
+
+
+def _pick_media_candidate(candidates):
+    if not candidates:
+        return None
+    media_candidates = [item for item in candidates if item.is_file() and _is_media_extension(item.name)]
+    if media_candidates:
+        return media_candidates[0]
+    file_candidates = [item for item in candidates if item.is_file()]
+    if file_candidates:
+        return file_candidates[0]
+    return candidates[0]
+
+
+def _is_local_media_request(query, params):
+    normalized = _normalize_text(query)
+    if any(token in normalized for token in {"youtube", "youtube music", "spotify"}):
+        if not any(key in normalized for key in {"directory", "folder", "file", "current directory", "inside"}):
+            if not params.get("application"):
+                return False
+    if params.get("directory") is not None:
+        return True
+    if params.get("application"):
+        return True
+    if any(token in normalized for token in {"directory", "folder", "file", "current directory", "inside", "documents", "downloads", "desktop"}):
+        return True
+    requested = str(params.get("song") or params.get("name") or "").strip()
+    return _is_media_extension(requested)
+
+
+def _resolve_media_play_request(system, params, query, *, tts, voice, is_text_mode):
+    if not _is_local_media_request(query, params):
+        return None, None, ""
+
+    requested_name = str(params.get("song") or params.get("name") or "").strip()
+    requested_name = re.sub(
+        r"\b(?:in|inside|from)\s+(?:the\s+)?(?:current\s+(?:directory|folder)|[a-z0-9_ ./\\:-]+)\b.*$",
+        "",
+        requested_name,
+        flags=re.IGNORECASE,
+    ).strip(" .")
+    if not requested_name:
+        return None, None, "No local media file name was provided."
+
+    specified_directory = params.get("directory")
+    candidates_in_directory = []
+    if specified_directory is not None:
+        candidates_in_directory = system.find_path_candidates(
+            requested_name,
+            directory=specified_directory,
+            source_hint="file",
+        )
+    global_candidates = system.find_path_candidates(requested_name, source_hint="file")
+
+    selected = None
+    if candidates_in_directory:
+        selected = _pick_media_candidate(candidates_in_directory)
+    elif global_candidates:
+        selected = _pick_media_candidate(global_candidates)
+        if specified_directory:
+            prompt = (
+                f"I could not find {requested_name} in {specified_directory}. "
+                f"I found {selected}. Do you want to continue with that file?"
+            )
+            if not _confirm_prompt(prompt, tts=tts, voice=voice, is_text_mode=is_text_mode):
+                return None, None, "Playback cancelled."
+    else:
+        return None, None, ""
+
+    if selected is None:
+        return None, None, ""
+
+    if len(global_candidates) > 1 and not candidates_in_directory:
+        selected_text = _prompt_choice("Multiple close media files were found. Choose one to open:", [str(item) for item in global_candidates])
+        if selected_text:
+            selected = next(
+                (item for item in global_candidates if str(item) == selected_text or item.name == selected_text),
+                selected,
+            )
+
+    routed = {
+        "raw_text": query,
+        "path": str(selected),
+        "name": selected.name,
+    }
+    if params.get("application"):
+        routed["application"] = params.get("application")
+    return "open_path", routed, ""
+
+
 def _apply_contextual_follow_up(action, params, system):
-    generic_requests = {"that video", "the video", "that song", "that", "it", "play it"}
+    generic_requests = {
+        "that video",
+        "the video",
+        "this video",
+        "that song",
+        "the song",
+        "this song",
+        "that",
+        "it",
+        "play it",
+        "open it",
+        "run it",
+        "play that",
+        "open that",
+        "run that",
+    }
     if action == "play_music":
         song = _normalize_text(params.get("song") or params.get("name") or "")
-        if song in generic_requests or song.endswith("video") or song.endswith("song"):
+        if song in generic_requests:
             media = system.session_context.get("last_media_request") or _extract_media_request_from_text(
                 system.session_context.get("last_suggestion_text", "")
             )
@@ -117,13 +261,22 @@ def _speak_with_barge_in(tts, text, *, wake_detector=None, voice=None, timeout=8
     if wake_detector is None or voice is None:
         tts.wait_until_done(timeout=timeout)
         return ""
-    while tts.queue.unfinished_tasks > 0:
-        if wake_detector.listen_for_wake_word(timeout=0.2):
+    while tts.is_speaking():
+        if wake_detector.listen_for_wake_word(timeout=1.1):
             tts.stop()
-            audio = voice.record_until_silence(max_duration=3.0, silence_duration=0.4, min_duration=0.2, start_timeout=1.5)
+            audio = voice.record_until_silence(
+                max_duration=8.0,
+                silence_duration=0.6,
+                min_duration=0.2,
+                start_timeout=1.8,
+                fast_start=True,
+                prefill_audio=wake_detector.consume_recent_audio(),
+                speaker_reference=wake_detector.get_voice_reference(),
+                speaker_mode=wake_detector.query_speaker_mode(),
+                on_speech_start=tts.stop,
+            )
             transcript = voice.transcribe(audio) if audio is not None else ""
             return transcript or "__INTERRUPTED__"
-        time.sleep(0.05)
     tts.wait_until_done(timeout=timeout)
     return ""
 
@@ -180,6 +333,105 @@ def _prompt_choice(question, options):
     return answer
 
 
+def _print_voice_preset_options():
+    print("\nAvailable voice models:")
+    for index, (name, preset) in enumerate(VOICE_PRESETS.items(), start=1):
+        description = preset.get("description", name).strip()
+        print(f"  {index}. {name} - {description}")
+
+
+def _resolve_voice_preset_choice(choice):
+    cleaned = str(choice or "").strip().lower()
+    ordered = list(VOICE_PRESETS.keys())
+    if not cleaned:
+        return ""
+    if cleaned.isdigit():
+        index = int(cleaned) - 1
+        if 0 <= index < len(ordered):
+            return ordered[index]
+    if cleaned in VOICE_PRESETS:
+        return cleaned
+    return next((name for name in VOICE_PRESETS if name in cleaned), "")
+
+
+def _setup_voice_model_interactively(config, tts):
+    _print_voice_preset_options()
+    while True:
+        choice = input("Voice model (name/number, 'list', blank to cancel): ").strip().lower()
+        if not choice:
+            return False, "Voice model setup cancelled."
+        if choice in {"list", "show", "help", "?"}:
+            _print_voice_preset_options()
+            continue
+        preset = _resolve_voice_preset_choice(choice)
+        if not preset:
+            print("Unknown voice model. Please choose from the list.")
+            continue
+        result = tts.apply_voice_preset(preset)
+        print(result)
+        if "Unknown voice preset" in result:
+            continue
+        preview_line = f"This is the {preset} voice model. Do you want to use this voice?"
+        print(f"Assistant: {preview_line}")
+        tts.speak(preview_line, replace=True, interrupt=True)
+        tts.wait_until_done(timeout=8.0)
+        confirm = input("Use this voice model? (yes/no): ").strip().lower()
+        if confirm in {"yes", "y"}:
+            config.set("voice_preset", preset)
+            _preview_active_voice(config, tts)
+            return True, f"Voice model changed to {preset}."
+        print("Voice model not applied. Choose another model.")
+
+
+def _resolve_transfer_request(system, action, params, *, tts, voice, is_text_mode):
+    resolved = dict(params)
+    source_hint = "directory" if action == "change_directory" else None
+
+    name = str(resolved.get("name") or "").strip()
+    source_dir = resolved.get("source_dir") or resolved.get("directory")
+    if name and not resolved.get("path"):
+        candidates = system.find_path_candidates(name, directory=source_dir, source_hint=source_hint)
+        if not candidates:
+            return None, "No matching source file or folder was found."
+        if len(candidates) == 1:
+            chosen = candidates[0]
+        else:
+            selected = _prompt_choice("Multiple source matches found. Choose the exact source path:", [str(item) for item in candidates])
+            if not selected:
+                return None, "Transfer cancelled."
+            chosen = next((item for item in candidates if str(item) == selected or item.name == selected), None)
+            if chosen is None:
+                return None, "Transfer cancelled."
+        resolved["path"] = str(chosen)
+        resolved["name"] = chosen.name
+
+    if action in {"copy_path", "move_path", "duplicate_path"}:
+        destination = str(resolved.get("destination") or "").strip()
+        if destination:
+            destination_candidates = system.find_path_candidates(destination, source_hint="directory")
+            if len(destination_candidates) == 1:
+                resolved["destination"] = str(destination_candidates[0])
+            elif len(destination_candidates) > 1:
+                selected = _prompt_choice(
+                    "Multiple destination directories matched. Choose the destination path:",
+                    [str(item) for item in destination_candidates],
+                )
+                if not selected:
+                    return None, "Transfer cancelled."
+                chosen = next((item for item in destination_candidates if str(item) == selected or item.name == selected), None)
+                if chosen is None:
+                    return None, "Transfer cancelled."
+                resolved["destination"] = str(chosen)
+            else:
+                override = input(
+                    f"Destination path '{destination}' was not found. Enter a full destination path (blank to keep current): "
+                ).strip()
+                if override:
+                    resolved["destination"] = override
+
+    return resolved, ""
+
+
 def _resolve_delete_request(system, params, *, tts, voice, is_text_mode):
     candidates = system.find_path_candidates(params.get("name", ""), directory=params.get("directory"), source_hint=None)
     if not candidates:
@@ -208,6 +460,27 @@ def _resolve_delete_request(system, params, *, tts, voice, is_text_mode):
 def _resolve_existing_path_request(system, params, *, tts, voice, is_text_mode, source_hint=None, purpose="open"):
     requested_name = str(params.get("name") or "").strip()
     candidates = system.find_path_candidates(requested_name, directory=params.get("directory"), source_hint=source_hint)
+    if not candidates and requested_name and params.get("directory") is not None:
+        fallback_candidates = system.find_path_candidates(requested_name, directory=None, source_hint=source_hint)
+        if fallback_candidates:
+            selected = fallback_candidates[0]
+            if len(fallback_candidates) > 1:
+                picked = _prompt_choice(
+                    "I found this file outside the specified directory. Choose the file to continue:",
+                    [str(item) for item in fallback_candidates],
+                )
+                if picked:
+                    selected = next(
+                        (item for item in fallback_candidates if str(item) == picked or item.name == picked),
+                        selected,
+                    )
+            if _confirm_prompt(
+                f"I found {selected}, but not in {params.get('directory')}. Do you want to continue?",
+                tts=tts,
+                voice=voice,
+                is_text_mode=is_text_mode,
+            ):
+                candidates = [selected]
     if not candidates:
         return None, f"No matching file or folder was found to {purpose}."
 
@@ -317,6 +590,10 @@ def _run_setup_flow(config, voice, tts, llm, system, memory, terminal_state, wak
     memory.clear()
     terminal_state["last_response"] = ""
     wake_detector.update_wake_word(config.get("assistant_name", "friday"), config.get("wake_variants", []))
+    wake_detector.set_voice_reference(
+        config.get("voice_sample_path", ""),
+        config.get("voice_auth_threshold", 0),
+    )
     return "Factory reset complete. Setup restarted." if factory_reset else "Setup complete."
 
 
@@ -349,16 +626,75 @@ def _process_command(
     intent = intent_data.get("intent", "conversation")
     action = intent_data.get("action")
     params = intent_data.get("parameters", {})
+    can_speak = (not is_text_mode) or bool(text_mode_state.get("voice_enabled"))
 
     if action == "enter_text_mode":
         return "ENTER_TEXT_MODE" if not is_text_mode else None
+
+    if action == "new_conversation":
+        result = _open_new_conversation(memory, system, terminal_state)
+        print(result)
+        _record_terminal_response(terminal_state, system, result)
+        if can_speak:
+            _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+        return None
+
+    if action == "list_history":
+        result = _format_history(memory)
+        print(result)
+        _record_terminal_response(terminal_state, system, result)
+        if can_speak:
+            _speak_with_barge_in(tts, "History listed on the terminal.", wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+        return None
+
+    if action == "open_conversation":
+        if str(params.get("target") or "").strip().lower() == "last":
+            conversation_id = memory.open_last_conversation()
+            if conversation_id:
+                system.clear_context()
+                result = f"Opened conversation {conversation_id}."
+            else:
+                result = "No previous conversation was found."
+        else:
+            conversation_id = params.get("conversation_id") or input("Enter conversation id: ").strip()
+            ok, result = memory.switch_to_conversation(conversation_id)
+            if ok:
+                system.clear_context()
+        print(result)
+        _record_terminal_response(terminal_state, system, result)
+        if can_speak:
+            _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+        return None
+
+    if action == "delete_conversation":
+        conversation_id = params.get("conversation_id") or input("Enter conversation id to delete: ").strip()
+        normalized = str(conversation_id or "").strip()
+        if not normalized:
+            result = "No conversation id was provided."
+            print(result)
+            _record_terminal_response(terminal_state, system, result)
+            return None
+        if not _confirm_prompt(f"Delete conversation {normalized}?", tts=tts, voice=voice, is_text_mode=is_text_mode):
+            result = "Conversation deletion cancelled."
+            print(result)
+            _record_terminal_response(terminal_state, system, result)
+            return None
+        ok, result = memory.delete_conversation(normalized)
+        if ok:
+            system.clear_context()
+        print(result)
+        _record_terminal_response(terminal_state, system, result)
+        if can_speak:
+            _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+        return None
 
     if action == "stop_assistant":
         result = "Shutting down the assistant."
         print(result)
         _record_terminal_response(terminal_state, system, result)
-        tts.speak(result, replace=True, interrupt=True)
-        tts.wait_until_done(timeout=4.0)
+        if can_speak:
+            tts.speak(result, replace=True, interrupt=True)
+            tts.wait_until_done(timeout=4.0)
         return "EXIT_ASSISTANT"
 
     if action == "restart_setup":
@@ -373,7 +709,14 @@ def _process_command(
         result = _apply_name_change(config, wake_detector, new_name)
         print(result)
         _record_terminal_response(terminal_state, system, result)
-        follow_up = _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+        follow_up = ""
+        if can_speak:
+            follow_up = _speak_with_barge_in(
+                tts,
+                result,
+                wake_detector=wake_detector if not is_text_mode else None,
+                voice=voice if not is_text_mode else None,
+            )
         return _maybe_process_follow_up(
             follow_up,
             config=config,
@@ -391,13 +734,14 @@ def _process_command(
         )
 
     if action == "clear_history":
+        active_id = memory.current_conversation_id()
         memory.clear()
         system.clear_context()
         terminal_state["last_response"] = ""
-        result = "Conversation history cleared."
+        result = f"Cleared conversation {active_id}."
         print(result)
         _record_terminal_response(terminal_state, system, result)
-        if not is_text_mode or text_mode_state["voice_enabled"]:
+        if can_speak:
             _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
         return None
 
@@ -413,7 +757,8 @@ def _process_command(
             result = "Password has been reset."
             print(result)
             _record_terminal_response(terminal_state, system, result)
-            _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+            if can_speak:
+                _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
         return None
 
     if action == "set_voice_auth":
@@ -428,9 +773,14 @@ def _process_command(
                 result = "Voice fingerprint updated."
             else:
                 result = "Voice authentication setup failed."
+        wake_detector.set_voice_reference(
+            config.get("voice_sample_path", ""),
+            config.get("voice_auth_threshold", 0),
+        )
         print(result)
         _record_terminal_response(terminal_state, system, result)
-        _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+        if can_speak:
+            _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
         return None
 
     if action == "set_humor":
@@ -440,7 +790,8 @@ def _process_command(
         result = f"Humor level set to {level} percent."
         print(result)
         _record_terminal_response(terminal_state, system, result)
-        _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+        if can_speak:
+            _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
         return None
 
     if action == "change_language":
@@ -448,13 +799,14 @@ def _process_command(
         result = "English is active." if requested in {"", "en", "english", "default"} else "English is currently the only supported language in this build."
         print(result)
         _record_terminal_response(terminal_state, system, result)
-        _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+        if can_speak:
+            _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
         return None
 
     if action == "change_voice":
         preset = str(params.get("preset") or "").strip().lower()
         if not preset:
-            result = "Please provide a voice model name."
+            applied, result = _setup_voice_model_interactively(config, tts)
         else:
             result = tts.apply_voice_preset(preset)
             if "Unknown voice preset" not in result:
@@ -462,7 +814,7 @@ def _process_command(
                 _preview_active_voice(config, tts)
         print(result)
         _record_terminal_response(terminal_state, system, result)
-        if "Unknown voice preset" in result or preset:
+        if can_speak:
             _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
         return None
 
@@ -471,12 +823,83 @@ def _process_command(
         config.set("auto_start", bool(params.get("on", True)))
         print(result)
         _record_terminal_response(terminal_state, system, result)
-        _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+        if can_speak:
+            _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+        return None
+
+    if action == "set_wake_response":
+        enabled = bool(params.get("on", True))
+        config.set("wake_response_enabled", enabled)
+        result = "Wake-word response enabled." if enabled else "Wake-word response disabled."
+        print(result)
+        _record_terminal_response(terminal_state, system, result)
+        if can_speak:
+            _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
         return None
 
     if intent == "system_command" and action:
         params.setdefault("raw_text", query)
         params = _apply_contextual_follow_up(action, params, system)
+
+        if action == "play_music":
+            routed_action, routed_params, routed_error = _resolve_media_play_request(
+                system,
+                params,
+                query,
+                tts=tts,
+                voice=voice,
+                is_text_mode=is_text_mode,
+            )
+            if routed_error:
+                print(routed_error)
+                _record_terminal_response(terminal_state, system, routed_error)
+                if can_speak:
+                    _speak_with_barge_in(
+                        tts,
+                        routed_error,
+                        wake_detector=wake_detector if not is_text_mode else None,
+                        voice=voice if not is_text_mode else None,
+                    )
+                return None
+            if routed_action and routed_params:
+                action = routed_action
+                params = routed_params
+
+        if action == "project_code":
+            instruction = str(params.get("instruction") or "").strip()
+            if not instruction:
+                target = system._path_from_fragment(params.get("project_path"))
+                if target is not None and target.is_file():
+                    purpose = input("Describe what this file should do: ").strip()
+                    if not purpose:
+                        result = "Project edit cancelled because no purpose was provided."
+                        print(result)
+                        _record_terminal_response(terminal_state, system, result)
+                        return None
+                    if not _confirm_prompt(
+                        f"Apply corrections to {target.name} for this purpose?",
+                        tts=tts,
+                        voice=voice,
+                        is_text_mode=is_text_mode,
+                    ):
+                        result = "Project edit cancelled."
+                        print(result)
+                        _record_terminal_response(terminal_state, system, result)
+                        return None
+                    params["instruction"] = (
+                        f"Fix this file so it correctly serves the purpose: {purpose}. "
+                        "If needed, rewrite incorrect sections and preserve valid parts."
+                    )
+                elif target is not None and target.is_dir():
+                    follow_instruction = input(
+                        "Describe the project changes to apply (blank to cancel): "
+                    ).strip()
+                    if not follow_instruction:
+                        result = "Project edit cancelled."
+                        print(result)
+                        _record_terminal_response(terminal_state, system, result)
+                        return None
+                    params["instruction"] = follow_instruction
 
         if action in {"open_application", "close_application", "run_as_admin"} or (action == "open_path" and params.get("application")):
             app_match = system.resolve_application_request(params)
@@ -484,7 +907,7 @@ def _process_command(
                 result = f"I could not find an installed application matching {app_match.get('requested') or params.get('application') or 'that request'}."
                 print(result)
                 _record_terminal_response(terminal_state, system, result)
-                if not is_text_mode or text_mode_state["voice_enabled"]:
+                if can_speak:
                     _speak_with_barge_in(
                         tts,
                         result,
@@ -512,16 +935,24 @@ def _process_command(
                 return None
             params = resolved
 
-        if action in {"open_path", "read_file"} and params.get("name") and not params.get("website") and not params.get("application"):
+        if action in {"open_path", "read_file", "modify_file"} and params.get("name") and not params.get("website"):
             resolved, error = _resolve_existing_path_request(
                 system,
                 dict(params),
                 tts=tts,
                 voice=voice,
                 is_text_mode=is_text_mode,
-                source_hint="file" if action == "read_file" else None,
-                purpose="read" if action == "read_file" else "open",
+                source_hint="file" if action in {"read_file", "modify_file"} else None,
+                purpose="read" if action == "read_file" else ("update" if action == "modify_file" else "open"),
             )
+            if not resolved:
+                print(error)
+                _record_terminal_response(terminal_state, system, error)
+                return None
+            params = resolved
+
+        if action in {"copy_path", "move_path", "rename_path", "duplicate_path"}:
+            resolved, error = _resolve_transfer_request(system, action, dict(params), tts=tts, voice=voice, is_text_mode=is_text_mode)
             if not resolved:
                 print(error)
                 _record_terminal_response(terminal_state, system, error)
@@ -548,7 +979,7 @@ def _process_command(
             }
         if action == "open_path" and params.get("website"):
             system.session_context["last_website"] = params["website"]
-        if not is_text_mode or text_mode_state["voice_enabled"]:
+        if can_speak:
             _speak_with_barge_in(
                 tts,
                 system.build_voice_summary(action, params, result),
@@ -565,7 +996,7 @@ def _process_command(
     media = _extract_media_request_from_text(response)
     if media:
         system.session_context["last_media_request"] = media
-    if not is_text_mode or text_mode_state["voice_enabled"]:
+    if can_speak:
         follow_up = _speak_with_barge_in(tts, response, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None, timeout=12.0)
         return _maybe_process_follow_up(
             follow_up,
@@ -598,9 +1029,11 @@ def _run_text_mode(
     text_mode_state,
     text_mode_toggle_event,
     factory_reset_event,
+    new_conversation_event,
 ):
     print("\n" + "=" * 60)
     print("  TEXT MODE - type commands directly. Ctrl+Space exits text mode.")
+    print("  Press Ctrl+Shift+Alt to start a new conversation.")
     print("  Use 'enable voice mode' if you want spoken responses here.")
     print("=" * 60 + "\n")
 
@@ -609,6 +1042,11 @@ def _run_text_mode(
             if factory_reset_event.is_set():
                 factory_reset_event.clear()
                 return "FACTORY_RESET"
+            if new_conversation_event.is_set():
+                new_conversation_event.clear()
+                result = _open_new_conversation(memory, system, terminal_state)
+                print(result)
+                _record_terminal_response(terminal_state, system, result)
             if text_mode_toggle_event.is_set():
                 text_mode_toggle_event.clear()
                 tts.stop()
@@ -660,6 +1098,14 @@ def _run_text_mode(
             tts.stop()
             print()
             return "FACTORY_RESET"
+        if new_conversation_event.is_set():
+            new_conversation_event.clear()
+            tts.stop()
+            result = _open_new_conversation(memory, system, terminal_state)
+            print(f"\n{result}\n")
+            _record_terminal_response(terminal_state, system, result)
+            print("Text > ", end="", flush=True)
+            continue
         if text_mode_toggle_event.is_set():
             text_mode_toggle_event.clear()
             tts.stop()
@@ -738,6 +1184,13 @@ def _run_text_mode(
 def run():
     print("Starting Assistant...\n")
     config = AssistantConfig()
+    first_time_setup = config.is_first_time_setup()
+
+    if (not first_time_setup) and config.get("password_hash"):
+        if not prompt_password_check(config.get("password_hash"), purpose="start the assistant"):
+            print("Authentication failed. Exiting.")
+            sys.exit(1)
+
     fallback = FallbackManager()
     voice = VoiceEngine(online=fallback.online)
     tts = TTSEngine(online=fallback.online)
@@ -747,15 +1200,19 @@ def run():
 
     system = SystemActions(llm=llm)
     memory = Memory(max_turns=12)
+    memory.start_new_conversation()
     terminal_state = {"last_response": ""}
     text_mode_state = {"voice_enabled": False}
 
-    if config.is_first_time_setup():
+    if first_time_setup:
         run_first_time_setup(config, voice_engine=voice, tts=tts)
 
-    if config.get("password_hash") and not prompt_password_check(config.get("password_hash"), purpose="start the assistant"):
-        print("Authentication failed. Exiting.")
-        sys.exit(1)
+    if first_time_setup and config.get("password_hash"):
+        if not prompt_password_check(config.get("password_hash"), purpose="start the assistant"):
+            print("Authentication failed. Exiting.")
+            sys.exit(1)
+
+    voice.warmup_local_model_async()
 
     tts.apply_voice_preset(config.get("voice_preset", "jarvis"))
     intent_engine = IntentEngine(llm)
@@ -771,13 +1228,19 @@ def run():
         wake_word=config.get("assistant_name", "friday"),
         wake_variants=config.get("wake_variants", []),
     )
+    wake_detector.set_voice_reference(
+        config.get("voice_sample_path", ""),
+        config.get("voice_auth_threshold", 0),
+    )
     if sorted(config.get("wake_variants", [])) != sorted(wake_detector.wake_variants):
         config.set("wake_variants", sorted(wake_detector.wake_variants))
 
     text_mode_toggle_event = threading.Event()
     factory_reset_event = threading.Event()
+    new_conversation_event = threading.Event()
     keyboard.add_hotkey("ctrl+space", text_mode_toggle_event.set)
     keyboard.add_hotkey("ctrl+shift+r", factory_reset_event.set)
+    keyboard.add_hotkey("ctrl+shift+alt", new_conversation_event.set)
 
     greeting = random_greeting()
     print(f"\nAssistant: {greeting}\n")
@@ -789,6 +1252,13 @@ def run():
             factory_reset_event.clear()
             tts.stop()
             result = _run_setup_flow(config, voice, tts, llm, system, memory, terminal_state, wake_detector, factory_reset=True)
+            print(result)
+            _record_terminal_response(terminal_state, system, result)
+            continue
+
+        if new_conversation_event.is_set():
+            new_conversation_event.clear()
+            result = _open_new_conversation(memory, system, terminal_state)
             print(result)
             _record_terminal_response(terminal_state, system, result)
             continue
@@ -811,6 +1281,7 @@ def run():
                 text_mode_state,
                 text_mode_toggle_event,
                 factory_reset_event,
+                new_conversation_event,
             )
             if text_mode_result == "FACTORY_RESET":
                 result = _run_setup_flow(config, voice, tts, llm, system, memory, terminal_state, wake_detector, factory_reset=True)
@@ -822,31 +1293,38 @@ def run():
 
         print("Listening for wake word...")
         heard_wake = wake_detector.listen_for_wake_word(
-            stop_events=(factory_reset_event, text_mode_toggle_event),
+            stop_events=(factory_reset_event, text_mode_toggle_event, new_conversation_event),
         )
         if not heard_wake:
             continue
 
         if factory_reset_event.is_set():
             continue
+        if new_conversation_event.is_set():
+            continue
 
-        voice_auth_threshold = config.get("voice_auth_threshold", 0)
-        voice_sample_path = config.get("voice_sample_path", "")
-        if voice_auth_threshold > 0 and voice_sample_path:
-            if not verify_voice(voice, voice_auth_threshold, voice_sample_path):
-                failure = "Voice authentication failed."
-                print(failure)
-                _record_terminal_response(terminal_state, system, failure)
-                _speak_with_barge_in(tts, failure, wake_detector=wake_detector, voice=voice)
-                continue
-
-        wake_response = random_wake_response()
-        print(f"Assistant: {wake_response}")
-        _record_terminal_response(terminal_state, system, wake_response)
-        _speak_with_barge_in(tts, wake_response, wake_detector=wake_detector, voice=voice, timeout=4.0)
+        if config.get("wake_response_enabled", True):
+            wake_response = random_wake_response()
+            print(f"Assistant: {wake_response}")
+            _record_terminal_response(terminal_state, system, wake_response)
+            tts.speak(wake_response, replace=True, interrupt=True)
+        else:
+            wake_response = "Wake word detected."
+            print(wake_response)
+            _record_terminal_response(terminal_state, system, wake_response)
 
         print("Listening for your command...")
-        audio = voice.record_until_silence(max_duration=25.0, silence_duration=1.0, min_duration=0.8, start_timeout=6.0)
+        audio = voice.record_until_silence(
+            max_duration=25.0,
+            silence_duration=1.0,
+            min_duration=0.8,
+            start_timeout=6.0,
+            fast_start=True,
+            prefill_audio=wake_detector.consume_recent_audio(),
+            speaker_reference=wake_detector.get_voice_reference(),
+            speaker_mode=wake_detector.query_speaker_mode(),
+            on_speech_start=tts.stop,
+        )
         if audio is None:
             continue
         query = voice.transcribe(audio)

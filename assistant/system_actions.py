@@ -40,6 +40,8 @@ class ProjectChange:
     after: str
     mode: str
     reason: str = ""
+    before_exists: bool = False
+    after_exists: bool = True
 
 
 @dataclass
@@ -55,6 +57,7 @@ class ApplicationMatch:
 class SystemActions:
     READ_MAX_CHARS = 12000
     LIST_MAX_ITEMS = 200
+    PATH_SCAN_LIMIT = 15000
     PROJECT_MAX_FILES = 80
     PROJECT_MAX_FILE_BYTES = 120_000
     TEXT_EXTENSIONS = {
@@ -102,6 +105,7 @@ class SystemActions:
         "vlc media player": ["vlc.exe", "vlc"],
         "vscode": ["code.exe", "code"],
         "vs code": ["code.exe", "code"],
+        "versus code": ["code.exe", "code"],
         "visual studio code": ["code.exe", "code"],
         "code": ["code.exe", "code"],
         "spotify": ["spotify.exe", "spotify"],
@@ -162,6 +166,10 @@ class SystemActions:
     APP_NAME_REPLACEMENTS = (
         ("vs code", "visual studio code"),
         ("v s code", "visual studio code"),
+        ("versus code", "visual studio code"),
+        ("verses code", "visual studio code"),
+        ("verse code", "visual studio code"),
+        ("vscode", "visual studio code"),
         ("visual studio", "visual studio code"),
         ("vlc media player", "vlc"),
         ("camera app", "camera"),
@@ -171,6 +179,7 @@ class SystemActions:
         "youtube music",
         "vlc media player",
         "visual studio code",
+        "versus code",
         "windows powershell",
         "file explorer",
         "brave browser",
@@ -201,6 +210,7 @@ class SystemActions:
         "brave browser": {"names": {"brave"}, "titles": {"brave"}},
         "visual studio code": {"names": {"code"}, "titles": {"visual studio code", "vs code"}},
         "vs code": {"names": {"code"}, "titles": {"visual studio code", "vs code"}},
+        "versus code": {"names": {"code"}, "titles": {"visual studio code", "vs code"}},
         "vscode": {"names": {"code"}, "titles": {"visual studio code", "vs code"}},
         "vlc": {"names": {"vlc"}, "titles": {"vlc"}},
         "vlc media player": {"names": {"vlc"}, "titles": {"vlc"}},
@@ -226,9 +236,17 @@ class SystemActions:
             alias: (self.home / suffix).resolve() if suffix else self.home.resolve()
             for alias, suffix in self.SPECIAL_FOLDERS.items()
         }
+        one_drive = os.getenv("OneDrive", "").strip()
+        if one_drive:
+            self.standard_paths["onedrive"] = Path(one_drive).resolve()
         self.session_context = {}
         self._start_apps_cache = None
         self._shortcut_apps_cache = None
+        self.undo_stack = []
+        self.redo_stack = []
+        self.undo_limit = 50
+        self.undo_cache_dir = self.home / ".assistant" / "undo_cache"
+        self.undo_cache_dir.mkdir(parents=True, exist_ok=True)
 
     def execute(self, action, parameters):
         action = str(action or "").strip().lower()
@@ -241,6 +259,8 @@ class SystemActions:
             "open_application": self._open_application,
             "open_path": self._open_path,
             "close_application": self._close_application,
+            "undo_command": self._undo_last_action,
+            "redo_command": self._redo_last_action,
             "list_directory": self._list_directory,
             "create_file": self._create_file,
             "create_folder": self._create_folder,
@@ -321,6 +341,12 @@ class SystemActions:
         if lowered in {"current directory", "current folder", "this directory", "this folder", "here"}:
             return ""
         cleaned = self._strip_usage_context(cleaned)
+        cleaned = re.sub(r"\b(?:contents|content)\s+(?:of|inside)\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bfiles\s+(?:of|in|inside)\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\bwhich\s+is\s+inside\b", "inside", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\binside\s+the\s+", "inside ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^(?:inside|in|under|within)\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = cleaned.replace("/folder", "").replace("/directory", "")
         cleaned = re.sub(r"^(?:the|a|an)\s+", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\b(?:folder|directory|path)\b$", "", cleaned, flags=re.IGNORECASE).strip(" .")
         lowered = self._normalize_query(cleaned)
@@ -341,6 +367,8 @@ class SystemActions:
             flags=re.IGNORECASE,
         )
         cleaned = re.sub(r"^(?:named|called)\s+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(?:which|that)\s+is$", "", cleaned, flags=re.IGNORECASE).strip(" .")
+        cleaned = re.sub(r"\b(?:which|that)$", "", cleaned, flags=re.IGNORECASE).strip(" .")
         cleaned = re.sub(
             r"\b(?:file|folder|directory|path|app|application|program|software)\b$",
             "",
@@ -360,6 +388,61 @@ class SystemActions:
         if path.suffix:
             return path.stem
         return path.name or str(path)
+
+    def _split_location_chain(self, value):
+        cleaned = self._clean_directory_reference(value)
+        if not cleaned:
+            return []
+        normalized = self._normalize_query(cleaned)
+        normalized = re.sub(r"\bwhich\s+is\s+inside\b", "inside", normalized, flags=re.IGNORECASE)
+        normalized = re.sub(r"\b(?:inside|under|within)\b", "|", normalized, flags=re.IGNORECASE)
+        parts = [part.strip(" .") for part in normalized.split("|") if part.strip(" .")]
+        result = []
+        for part in parts:
+            part = re.sub(r"^(?:the|a|an)\s+", "", part, flags=re.IGNORECASE)
+            part = re.sub(r"\b(?:folder|directory|path)\b$", "", part, flags=re.IGNORECASE).strip(" .")
+            if part:
+                result.append(part)
+        return result
+
+    def _resolve_directory_segment(self, segment, base=None):
+        normalized = self._normalize_query(segment)
+        if normalized in self.standard_paths:
+            return self.standard_paths[normalized]
+        search_root = Path(base) if base is not None else self.home
+        if search_root.exists():
+            candidate = self._find_closest_path(segment, search_root, source_hint="directory")
+            if candidate is not None:
+                return candidate
+        if base is None:
+            for root in self._default_search_roots():
+                if not root.exists():
+                    continue
+                candidate = self._find_closest_path(segment, root, source_hint="directory")
+                if candidate is not None:
+                    return candidate
+        return None
+
+    def _resolve_nested_directory(self, fragment):
+        segments = self._split_location_chain(fragment)
+        if not segments:
+            return None
+        if len(segments) == 1:
+            return self._resolve_directory_segment(segments[0], base=None)
+
+        base = self._resolve_directory_segment(segments[-1], base=None)
+        if base is None:
+            return None
+        for segment in reversed(segments[:-1]):
+            next_path = self._resolve_directory_segment(segment, base=base)
+            if next_path is None:
+                guessed_name = re.sub(r"\b(?:folder|directory|path)\b$", "", segment, flags=re.IGNORECASE).strip(" .")
+                if not guessed_name:
+                    return None
+                base = (Path(base) / guessed_name).resolve()
+            else:
+                base = next_path
+        return base
 
     def _spoken_directory_label(self, params, result):
         first_line = self._short_error_message(result)
@@ -406,12 +489,18 @@ class SystemActions:
         if action == "read_file":
             return f"Reading {self._spoken_path_label(params)}."
         if action == "play_music":
+            if lowered.startswith("showing youtube music search results for "):
+                query = text[len("Showing YouTube Music search results for ") :].strip().rstrip(".")
+                return f"Showing YouTube Music results for {query}."
+            if lowered.startswith("showing youtube search results for "):
+                query = text[len("Showing YouTube search results for ") :].strip().rstrip(".")
+                return f"Showing YouTube results for {query}."
             platform = str(params.get("platform") or "").strip().lower()
             if platform == "youtube_music":
-                return f"Playing {params.get('song') or spoken_target} on YouTube Music."
+                return f"Showing YouTube Music results for {params.get('song') or spoken_target}."
             if platform == "spotify":
                 return f"Playing {params.get('song') or spoken_target} on Spotify."
-            return f"Playing {params.get('song') or spoken_target} on YouTube."
+            return f"Showing YouTube results for {params.get('song') or spoken_target}."
         if action in {"set_volume", "set_microphone", "set_brightness", "set_wifi", "set_bluetooth", "set_airplane_mode", "set_energy_saver", "set_night_light"}:
             return self._short_error_message(text) if "error" in lowered else text
         if action == "list_directory":
@@ -455,11 +544,27 @@ class SystemActions:
 
         return {"status": "missing", "requested": requested}
 
+    def _default_search_roots(self):
+        roots = [Path.cwd(), *self.standard_paths.values()]
+        cwd = Path.cwd().resolve()
+        if cwd.anchor:
+            roots.append(Path(cwd.anchor))
+        unique = []
+        seen = set()
+        for root in roots:
+            candidate = Path(root)
+            key = str(candidate).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(candidate)
+        return unique
+
     def find_path_candidates(self, name, directory=None, source_hint=None, max_results=10):
         target_name = self._normalize_spoken_filename(name)
         target_lower = target_name.lower()
         target_stem = Path(target_name).stem.lower()
-        roots = [self._path_from_fragment(directory)] if directory else [Path.cwd(), *self.standard_paths.values()]
+        roots = [self._path_from_fragment(directory)] if directory is not None else self._default_search_roots()
         candidates = []
         seen = set()
         for root in roots:
@@ -488,6 +593,14 @@ class SystemActions:
             match = name_map.get(key) or stem_map.get(key)
             if match is not None and match not in matches:
                 matches.append(match)
+        if not matches:
+            partial = [
+                candidate
+                for candidate in candidates
+                if target_lower in candidate.name.lower() or candidate.name.lower() in target_lower
+            ]
+            partial = sorted(partial, key=lambda item: (len(item.name), len(str(item))))
+            matches.extend(partial[:max_results])
         return matches[:max_results]
 
     def _prepare_params(self, params):
@@ -510,9 +623,9 @@ class SystemActions:
             if name:
                 data["name"] = name
 
-        if not data.get("directory") and raw_text:
+        if "directory" not in data and raw_text:
             directory = self._extract_directory_from_text(raw_text)
-            if directory:
+            if directory is not None:
                 data["directory"] = directory
 
         if not data.get("content") and raw_text:
@@ -546,6 +659,9 @@ class SystemActions:
             ("back slash", "\\"),
             (" slash ", "/"),
             (" dot ", "."),
+            (" underscore ", "_"),
+            (" hyphen ", "-"),
+            (" dash ", "-"),
             ("recyclebin", "recycle bin"),
             ("wi fi", "wifi"),
             ("blue tooth", "bluetooth"),
@@ -554,11 +670,22 @@ class SystemActions:
             ("enery saver", "energy saver"),
             ("battery saver", "energy saver"),
             ("night ligh", "night light"),
+            ("one drive", "onedrive"),
             ("vs code", "visual studio code"),
+            ("versus code", "visual studio code"),
+            ("verses code", "visual studio code"),
+            ("verse code", "visual studio code"),
+            ("vscode", "visual studio code"),
             ("c plus plus", "cpp"),
+            ("c v two", "cv2"),
+            ("c v 2", "cv2"),
+            ("cv two", "cv2"),
         )
         for source, target in replacements:
             value = value.replace(source, target)
+        value = re.sub(r"\bunderscore\b", "_", value, flags=re.IGNORECASE)
+        value = re.sub(r"\b(?:hyphen|dash)\b", "-", value, flags=re.IGNORECASE)
+        value = re.sub(r"\s*([_.-])\s*", r"\1", value)
         value = re.sub(r"\s+", " ", value).strip()
         return value
 
@@ -674,6 +801,32 @@ class SystemActions:
             exact=exact,
         )
 
+    def _token_overlap_ratio(self, left, right):
+        left_tokens = set(re.findall(r"[a-z0-9]+", str(left or "")))
+        right_tokens = set(re.findall(r"[a-z0-9]+", str(right or "")))
+        if not left_tokens or not right_tokens:
+            return 0.0
+        return len(left_tokens & right_tokens) / float(len(left_tokens | right_tokens))
+
+    def _best_similarity_key(self, requested, candidates):
+        normalized_requested = str(requested or "").strip()
+        if not normalized_requested:
+            return ""
+        best_key = ""
+        best_score = 0.0
+        for candidate in candidates:
+            key = str(candidate or "").strip()
+            if not key:
+                continue
+            ratio = difflib.SequenceMatcher(None, normalized_requested, key).ratio()
+            overlap = self._token_overlap_ratio(normalized_requested, key)
+            contains = 1.0 if (normalized_requested in key or key in normalized_requested) else 0.0
+            score = (0.65 * ratio) + (0.30 * overlap) + (0.05 * contains)
+            if score > best_score:
+                best_score = score
+                best_key = key
+        return best_key if best_score >= 0.58 else ""
+
     def _find_application_match(self, requested, exact_only=False):
         normalized_requested = self._normalize_app_name(requested)
         if not normalized_requested:
@@ -736,6 +889,26 @@ class SystemActions:
         close_start = get_close_matches(normalized_requested, list(normalized_start_apps.keys()), n=1, cutoff=0.64)
         if close_start:
             display_name, app_id = normalized_start_apps[close_start[0]]
+            return self._start_app_match(display_name, app_id, requested, exact=False)
+
+        best_alias_key = self._best_similarity_key(normalized_requested, alias_lookup.keys())
+        if best_alias_key:
+            alias = alias_lookup.get(best_alias_key)
+            if alias:
+                match = self._resolve_alias_application(alias)
+                if match is not None:
+                    return ApplicationMatch(
+                        requested=requested,
+                        display_name=match.display_name,
+                        kind=match.kind,
+                        command=match.command,
+                        aliases=match.aliases,
+                        exact=False,
+                    )
+
+        best_start_key = self._best_similarity_key(normalized_requested, normalized_start_apps.keys())
+        if best_start_key:
+            display_name, app_id = normalized_start_apps[best_start_key]
             return self._start_app_match(display_name, app_id, requested, exact=False)
         return None
 
@@ -825,10 +998,49 @@ $matches | Stop-Process -Force
         except Exception as exc:
             raise RuntimeError(f"Camera shortcut failed: {exc}") from exc
 
+    def _youtube_oembed_available(self, video_id):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{11}", str(video_id or "").strip()):
+            return False
+        url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
+        try:
+            response = requests.get(
+                url,
+                timeout=4.5,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+                    )
+                },
+            )
+            return response.status_code == 200
+        except Exception:
+            return False
+
+    def _score_youtube_candidate(self, query, title, uploader, url, position):
+        query_tokens = {token for token in re.findall(r"[a-z0-9]+", query.lower()) if len(token) >= 2}
+        title_tokens = {token for token in re.findall(r"[a-z0-9]+", str(title or "").lower()) if len(token) >= 2}
+        uploader_tokens = {token for token in re.findall(r"[a-z0-9]+", str(uploader or "").lower()) if len(token) >= 2}
+        score = float(len(query_tokens & title_tokens)) + (1.35 * float(len(query_tokens & uploader_tokens)))
+        lowered_title = str(title or "").lower()
+        if "official" in lowered_title:
+            score += 1.0
+        if "audio" in lowered_title and "audio" in query.lower():
+            score += 0.45
+        if "lyrics" in lowered_title and "lyrics" not in query.lower():
+            score -= 0.4
+        if "live" in lowered_title and "live" not in query.lower():
+            score -= 0.35
+        if "shorts" in str(url or "").lower():
+            score -= 0.5
+        score += max(0.0, 0.35 - (position * 0.03))
+        return score
+
     def _find_youtube_video_url(self, song, *, music=False):
-        query = str(song or "").strip()
+        query = self._normalize_media_query(song)
         if not query:
             return ""
+        candidates = []
         if YoutubeDL is not None:
             try:
                 ydl = YoutubeDL(
@@ -840,64 +1052,122 @@ $matches | Stop-Process -Force
                         "noplaylist": True,
                     }
                 )
-                payload = ydl.extract_info(f"ytsearch5:{query}", download=False) or {}
+                payload = ydl.extract_info(f"ytsearch8:{query}", download=False) or {}
                 entries = payload.get("entries") or []
-                query_tokens = {token for token in re.findall(r"[a-z0-9]+", query.lower()) if len(token) >= 2}
-                ranked = []
                 for index, entry in enumerate(entries):
-                    video_id = str(entry.get("id") or "").strip()
                     title = str(entry.get("title") or "").strip()
+                    uploader = str(entry.get("uploader") or entry.get("channel") or "").strip()
+                    video_id = str(entry.get("id") or "").strip()
                     if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
                         continue
-                    title_tokens = {token for token in re.findall(r"[a-z0-9]+", title.lower()) if len(token) >= 2}
-                    score = len(query_tokens & title_tokens)
-                    lowered_title = title.lower()
-                    if "official" in lowered_title:
-                        score += 1.0
-                    if "lyrics" in lowered_title and "lyrics" not in query.lower():
-                        score -= 0.3
-                    if "live" in lowered_title and "live" not in query.lower():
-                        score -= 0.2
-                    ranked.append((score, -index, video_id))
-                if ranked:
-                    ranked.sort(reverse=True)
-                    video_id = ranked[0][2]
-                    if music:
-                        return f"https://music.youtube.com/watch?v={video_id}&autoplay=1"
-                    return f"https://www.youtube.com/watch?v={video_id}&autoplay=1"
+                    url = str(entry.get("webpage_url") or "").strip() or f"https://www.youtube.com/watch?v={video_id}"
+                    if "youtube.com" not in url and "youtu.be" not in url:
+                        continue
+                    score = self._score_youtube_candidate(query, title, uploader, url, index)
+                    candidates.append(
+                        {
+                            "score": score,
+                            "url": url,
+                            "video_id": video_id,
+                        }
+                    )
             except Exception:
                 pass
-        headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(
-            "https://www.youtube.com/results",
-            params={"search_query": query},
-            headers=headers,
-            timeout=12,
-        )
-        response.raise_for_status()
-        query_tokens = {token for token in re.findall(r"[a-z0-9]+", query.lower()) if len(token) >= 2}
-        ranked = []
-        for video_id, title in re.findall(
-            r'"videoId":"([A-Za-z0-9_-]{11})".{0,400}?"title":\{"runs":\[\{"text":"([^"]+)"',
-            response.text,
-            flags=re.DOTALL,
-        ):
-            title_tokens = {token for token in re.findall(r"[a-z0-9]+", title.lower()) if len(token) >= 2}
-            score = len(query_tokens & title_tokens)
-            if "official" in title.lower():
-                score += 0.5
-            ranked.append((score, video_id))
-        if ranked:
-            ranked.sort(key=lambda item: item[0], reverse=True)
-            video_id = ranked[0][1]
-        else:
-            matches = re.findall(r'"videoId":"([A-Za-z0-9_-]{11})"', response.text)
-            video_id = next((item for item in matches if item), "")
-        if not video_id:
+
+        if not candidates:
+            search_url = f"https://www.youtube.com/results?search_query={quote_plus(query)}"
+            try:
+                response = requests.get(
+                    search_url,
+                    timeout=5.0,
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+                        )
+                    },
+                )
+                ids = []
+                for match in re.findall(r"watch\?v=([A-Za-z0-9_-]{11})", response.text):
+                    if match not in ids:
+                        ids.append(match)
+                    if len(ids) >= 8:
+                        break
+                for index, video_id in enumerate(ids):
+                    url = f"https://www.youtube.com/watch?v={video_id}"
+                    candidates.append(
+                        {
+                            "score": 2.0 - (index * 0.1),
+                            "url": url,
+                            "video_id": video_id,
+                        }
+                    )
+            except Exception:
+                pass
+
+        if not candidates:
             return ""
-        if music:
-            return f"https://music.youtube.com/watch?v={video_id}&autoplay=1"
-        return f"https://www.youtube.com/watch?v={video_id}&autoplay=1"
+
+        candidates.sort(key=lambda item: item["score"], reverse=True)
+        for candidate in candidates[:10]:
+            video_id = candidate["video_id"]
+            if not self._youtube_oembed_available(video_id):
+                continue
+            if music:
+                return f"https://music.youtube.com/watch?v={video_id}&autoplay=1"
+            return f"https://www.youtube.com/watch?v={video_id}&autoplay=1"
+        return ""
+
+    def _normalize_media_query(self, text):
+        value = self._normalize_query(text)
+        value = value.replace("three blue one brown", "3blue1brown")
+        value = re.sub(r"\b(?:play|open|run|start)\b", " ", value, flags=re.IGNORECASE)
+        value = re.sub(r"\b(?:in|on|using|with)\s+(youtube music|youtube|spotify)\b", " ", value, flags=re.IGNORECASE)
+        value = re.sub(r"\b(?:song|music)\b$", "", value, flags=re.IGNORECASE)
+        value = re.sub(r"\s+", " ", value).strip(" .")
+        return value
+
+    def _extract_media_search_query(self, requested, raw_text):
+        base = str(requested or "").strip()
+        if not base:
+            base = str(raw_text or "").strip()
+        text = self._normalize_query(base)
+        text = text.replace("three blue one brown", "3blue1brown")
+        text = re.sub(r"\b(?:play|open|run|start|search|find)\b", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\b(?:in|on|using|with)\s+(youtube music|youtube|spotify)\b", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\b(?:please|can you|could you|would you|for me|right now|now)\b", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\b(?:show me|help me)\b", " ", text, flags=re.IGNORECASE)
+        tokens = re.findall(r"[a-z0-9@#'+_.-]+", text)
+        stop_tokens = {
+            "the",
+            "a",
+            "an",
+            "song",
+            "music",
+            "video",
+            "clip",
+            "track",
+            "please",
+            "play",
+            "open",
+            "run",
+            "start",
+            "search",
+            "find",
+            "in",
+            "on",
+            "using",
+            "with",
+            "youtube",
+            "youtube_music",
+            "spotify",
+        }
+        filtered = [token for token in tokens if token not in stop_tokens and len(token) >= 2]
+        query = " ".join(filtered[:14]).strip()
+        if query:
+            return query
+        fallback = self._normalize_media_query(requested or raw_text)
+        return fallback or "music"
 
     def _refers_to_previous_target(self, normalized):
         tokens = set(re.findall(r"[a-z0-9_./\\-]+", normalized))
@@ -926,8 +1196,30 @@ $matches | Stop-Process -Force
         return None
 
     def _extract_directory_from_text(self, text):
+        tree_match = re.search(
+            r"\b(?:draw|show|display)\s+(?:the\s+)?(?:file|folder|directory|system)?\s*(?:tree|structure)\s+(?:of|for|inside)\s+(?:the\s+)?(.+)$",
+            text,
+            flags=re.IGNORECASE,
+        ) or re.search(
+            r"\b(?:file|folder|directory|system)\s+(?:tree|structure)\s+(?:of|for|inside)\s+(?:the\s+)?(.+)$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if tree_match:
+            directory = self._clean_directory_reference(tree_match.group(1).strip(" ."))
+            return directory or ""
+
+        list_match = re.search(
+            r"\b(?:list|show|display)\s+(?:the\s+)?(?:contents|files)?(?:\s+(?:of|inside))?\s+(?:the\s+)?(.+)$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if list_match:
+            directory = self._clean_directory_reference(list_match.group(1).strip(" ."))
+            return directory or ""
+
         match = re.search(
-            r"\b(?:in|inside|under|at|from)\s+(.+?)(?=\s+\b(?:named|called|with|and|that|which|into|using|on|open|launch|run|start|read|delete|create|make|copy|move|rename|duplicate|list|show|display)\b|$)",
+            r"\b(?:in|inside|under|at|from)\s+(.+?)(?=\s+\b(?:named|called|with|and|that|which|into|using|on|open|launch|run|start|read|delete|create|make|copy|move|rename|duplicate|list|show|display|update|modify|change|edit|fix|rewrite)\b|$)",
             text,
             flags=re.IGNORECASE,
         )
@@ -937,8 +1229,30 @@ $matches | Stop-Process -Force
         lowered = directory.lower()
         if lowered in {"text mode", "voice mode"} or lowered.startswith(("which ", "that ", "where ")):
             return None
-        if lowered in {"which", "that", "where"}:
+        if lowered in {"which", "that", "where", "file", "folder", "directory", "path"}:
             return None
+        if (" file" in lowered or lowered.endswith("file")) and (
+            re.search(r"\.[a-z0-9]{1,8}\b", lowered) or " dot " in lowered
+        ):
+            return None
+        language_tokens = {
+            "python",
+            "py",
+            "cpp",
+            "c++",
+            "java",
+            "javascript",
+            "typescript",
+            "text",
+            "json",
+            "yaml",
+            "markdown",
+        }
+        if lowered in language_tokens:
+            return None
+        if any(lowered.startswith(f"{token} ") for token in language_tokens):
+            if re.search(r"\bin\s+(?:python|py|cpp|c\+\+|java|javascript|typescript|text|json|yaml|markdown)\b", text, flags=re.IGNORECASE):
+                return None
         return directory
 
     def _extract_target_name(self, text):
@@ -946,13 +1260,35 @@ $matches | Stop-Process -Force
         if quoted:
             return quoted[0].strip()
 
+        inside_named = re.search(
+            r"\binside\s+(?:the\s+)?file\s+(?:named|called)\s+(.+?)(?=\s*(?:,|;|$|\b(?:to|with|that|which|and|where|update|modify|change|edit)\b))",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if inside_named:
+            value = self._clean_target_reference(inside_named.group(1))
+            if value:
+                return value
+
+        inside_file = re.search(
+            r"\b(?:inside|in)\s+(.+?)\s+\bfile\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if inside_file:
+            value = self._clean_target_reference(inside_file.group(1))
+            if value:
+                return value
+
         explicit = re.search(
-            r"\b(?:file|folder|directory|path)\s+(?:named|called)\s+(.+?)(?=\s+\b(?:in|inside|under|at|from|to|with|using|and|on)\b|$)",
+            r"\b(?:file|folder|directory|path)\s+(?:named|called)\s+(.+?)(?=\s*(?:,|;|$|\b(?:in|inside|under|at|from|to|with|using|and|on|update|modify|change|edit)\b))",
             text,
             flags=re.IGNORECASE,
         )
         if explicit:
-            value = self._clean_target_reference(explicit.group(1))
+            raw = explicit.group(1).strip(" .")
+            raw = re.split(r"\s*,\s*", raw, maxsplit=1)[0]
+            value = self._clean_target_reference(raw)
             return value or None
 
         match = re.search(
@@ -991,7 +1327,12 @@ $matches | Stop-Process -Force
             return None
         raw = str(fragment).strip().strip("\"'")
         if not raw:
-            return None
+            return Path.cwd()
+        lowered_raw = self._normalize_query(raw)
+        if re.search(r"\b(?:which\s+is\s+inside|inside|under|within)\b", lowered_raw):
+            nested = self._resolve_nested_directory(raw)
+            if nested is not None:
+                return nested
         raw = self._clean_directory_reference(raw)
         if not raw:
             return Path.cwd()
@@ -1022,6 +1363,16 @@ $matches | Stop-Process -Force
                 return (Path.cwd() / suffix).resolve()
             return Path.cwd()
 
+        if "contents of " in normalized:
+            normalized = normalized.replace("contents of ", "", 1).strip()
+            raw = raw.replace("contents of ", "", 1).strip()
+            if normalized in self.standard_paths:
+                return self.standard_paths[normalized]
+            nested = self._resolve_nested_directory(raw)
+            if nested is not None:
+                return nested
+
+        path = Path(raw).expanduser()
         return (Path.cwd() / path).resolve()
 
     def _resolve_path(self, params, expect_existing=False, source_hint=None):
@@ -1037,7 +1388,7 @@ $matches | Stop-Process -Force
         if name:
             spoken = self._normalize_spoken_filename(name)
             name_path = Path(spoken)
-            parent = self._path_from_fragment(directory) if directory else Path.cwd()
+            parent = self._path_from_fragment(directory) if directory is not None else Path.cwd()
             if name_path.is_absolute():
                 candidate = name_path
             else:
@@ -1049,8 +1400,8 @@ $matches | Stop-Process -Force
             if fuzzy is not None:
                 return fuzzy
 
-            if not directory:
-                for fallback_root in [Path.cwd(), *self.standard_paths.values()]:
+            if directory is None:
+                for fallback_root in self._default_search_roots():
                     fuzzy = self._find_closest_path(name_path.name, start_dir=fallback_root, source_hint=source_hint)
                     if fuzzy is not None:
                         return fuzzy
@@ -1066,6 +1417,9 @@ $matches | Stop-Process -Force
         text = self._clean_target_reference(value)
         if not text:
             return ""
+        text = re.sub(r"\bunderscore\b", "_", text, flags=re.IGNORECASE)
+        text = re.sub(r"\b(?:hyphen|dash)\b", "-", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*([_.-])\s*", r"\1", text)
         lowered = self._normalize_query(text)
         spoken_match = re.search(r"(.+?)\s+dot\s+([a-z0-9]+)$", lowered)
         if spoken_match:
@@ -1081,7 +1435,9 @@ $matches | Stop-Process -Force
             if extension == "pi":
                 extension = "py"
             return f"{stem}.{extension}"
-        return text.replace(" .", ".").replace(". ", ".")
+        compact = text.replace(" .", ".").replace(". ", ".")
+        compact = re.sub(r"\s*([_.-])\s*", r"\1", compact)
+        return compact
 
     def _find_closest_path(self, target_name, start_dir, source_hint=None):
         start = Path(start_dir or Path.cwd())
@@ -1103,9 +1459,9 @@ $matches | Stop-Process -Force
                 if source_hint == "directory" and not entry_path.is_dir():
                     continue
                 candidates.append(entry_path)
-                if len(candidates) >= self.LIST_MAX_ITEMS * 4:
+                if len(candidates) >= self.PATH_SCAN_LIMIT:
                     break
-            if len(candidates) >= self.LIST_MAX_ITEMS * 4:
+            if len(candidates) >= self.PATH_SCAN_LIMIT:
                 break
 
         if not candidates:
@@ -1140,7 +1496,7 @@ $matches | Stop-Process -Force
                 if source_hint == "directory" and not entry_path.is_dir():
                     continue
                 candidates.append(entry_path)
-                if len(candidates) >= self.LIST_MAX_ITEMS * 4:
+                if len(candidates) >= self.PATH_SCAN_LIMIT:
                     return candidates
         return candidates
 
@@ -1207,6 +1563,182 @@ $matches | Stop-Process -Force
             if candidate.exists():
                 return str(candidate)
         return None
+
+    def _is_undoable_action(self, action):
+        return action in {
+            "create_file",
+            "create_folder",
+            "delete_path",
+            "modify_file",
+            "copy_path",
+            "move_path",
+            "rename_path",
+            "duplicate_path",
+            "project_code",
+        }
+
+    def _push_undo_record(self, record):
+        if not record:
+            return
+        self.undo_stack.append(record)
+        if len(self.undo_stack) > self.undo_limit:
+            self.undo_stack.pop(0)
+        self.redo_stack.clear()
+
+    def _delete_path_quiet(self, path):
+        target = Path(path)
+        if not target.exists():
+            return
+        if target.is_dir():
+            shutil.rmtree(target, ignore_errors=True)
+        else:
+            try:
+                target.unlink()
+            except OSError:
+                pass
+
+    def _copy_item(self, source, destination, is_dir):
+        source_path = Path(source)
+        destination_path = Path(destination)
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        if is_dir:
+            if destination_path.exists():
+                shutil.rmtree(destination_path)
+            shutil.copytree(source_path, destination_path)
+        else:
+            shutil.copy2(source_path, destination_path)
+
+    def _restore_file_snapshot(self, path, exists, content_bytes):
+        target = Path(path)
+        if exists:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content_bytes or b"")
+            return
+        self._delete_path_quiet(target)
+
+    def _reserve_undo_backup_path(self, original):
+        target = Path(original)
+        safe_name = target.name.replace(" ", "_")
+        stamp = int(time.time() * 1000)
+        bucket = self.undo_cache_dir / f"{stamp}_{safe_name}"
+        index = 1
+        while bucket.exists():
+            bucket = self.undo_cache_dir / f"{stamp}_{index}_{safe_name}"
+            index += 1
+        return bucket
+
+    def _apply_undo_record(self, record, direction):
+        mode = str(direction or "undo").lower()
+        if mode not in {"undo", "redo"}:
+            raise RuntimeError("Invalid undo direction.")
+
+        kind = str(record.get("kind") or "")
+        if kind == "write_file":
+            if mode == "undo":
+                self._restore_file_snapshot(record["path"], record.get("before_exists", False), record.get("before_bytes", b""))
+            else:
+                self._restore_file_snapshot(record["path"], record.get("after_exists", True), record.get("after_bytes", b""))
+            return
+
+        if kind == "create_folder":
+            target = Path(record["path"])
+            if mode == "undo":
+                if target.exists():
+                    shutil.rmtree(target, ignore_errors=True)
+            else:
+                target.mkdir(parents=True, exist_ok=True)
+            return
+
+        if kind == "delete_move":
+            original = Path(record["original"])
+            backup = Path(record["backup"])
+            if mode == "undo":
+                if original.exists():
+                    self._delete_path_quiet(original)
+                if backup.exists():
+                    original.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(backup), str(original))
+            else:
+                if backup.exists():
+                    self._delete_path_quiet(backup)
+                if original.exists():
+                    backup.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(original), str(backup))
+            return
+
+        if kind == "move_item":
+            source = Path(record["source"])
+            destination = Path(record["destination"])
+            if mode == "undo":
+                if destination.exists():
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    if source.exists():
+                        self._delete_path_quiet(source)
+                    shutil.move(str(destination), str(source))
+            else:
+                if source.exists():
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if destination.exists():
+                        self._delete_path_quiet(destination)
+                    shutil.move(str(source), str(destination))
+            return
+
+        if kind == "copy_item":
+            source = Path(record["source"])
+            destination = Path(record["destination"])
+            is_dir = bool(record.get("is_dir"))
+            if mode == "undo":
+                self._delete_path_quiet(destination)
+            else:
+                if not source.exists():
+                    raise RuntimeError(f"Cannot redo copy; source no longer exists: {source}")
+                self._copy_item(source, destination, is_dir=is_dir)
+            return
+
+        if kind == "project_batch":
+            snapshots = record.get("snapshots") or []
+            ordered = snapshots if mode == "redo" else list(reversed(snapshots))
+            for item in ordered:
+                path = item.get("path")
+                if not path:
+                    continue
+                before_exists = bool(item.get("before_exists"))
+                after_exists = bool(item.get("after_exists"))
+                before_bytes = item.get("before_bytes", b"")
+                after_bytes = item.get("after_bytes", b"")
+                if mode == "undo":
+                    self._restore_file_snapshot(path, before_exists, before_bytes)
+                else:
+                    self._restore_file_snapshot(path, after_exists, after_bytes)
+            return
+
+        raise RuntimeError("This action cannot be undone.")
+
+    def _undo_last_action(self, params):
+        if not self.undo_stack:
+            return "There is no previous reversible command to undo."
+        record = self.undo_stack.pop()
+        try:
+            self._apply_undo_record(record, "undo")
+        except Exception:
+            self.undo_stack.append(record)
+            raise
+        self.redo_stack.append(record)
+        label = str(record.get("label") or "last action")
+        return f"Undid {label}."
+
+    def _redo_last_action(self, params):
+        if not self.redo_stack:
+            return "There is no command to redo."
+        record = self.redo_stack.pop()
+        try:
+            self._apply_undo_record(record, "redo")
+        except Exception:
+            self.redo_stack.append(record)
+            raise
+        self.undo_stack.append(record)
+        label = str(record.get("label") or "last action")
+        return f"Redid {label}."
 
     def _open_path(self, params):
         website = params.get("website")
@@ -1351,12 +1883,26 @@ $matches | Stop-Process -Force
         if target is None:
             return "No file name was provided."
 
+        before_exists = target.exists() and target.is_file()
+        before_bytes = target.read_bytes() if before_exists else b""
         target.parent.mkdir(parents=True, exist_ok=True)
         content = params.get("content")
         if not content and params.get("content_request"):
             content = self._generate_file_content(target, str(params["content_request"]))
         if content is None:
             target.touch(exist_ok=True)
+            after_bytes = target.read_bytes() if target.exists() and target.is_file() else b""
+            self._push_undo_record(
+                {
+                    "kind": "write_file",
+                    "label": f"create file {target.name}",
+                    "path": str(target),
+                    "before_exists": before_exists,
+                    "before_bytes": before_bytes,
+                    "after_exists": target.exists() and target.is_file(),
+                    "after_bytes": after_bytes,
+                }
+            )
             return f"Created file {target}."
 
         mode = "a" if str(params.get("mode", "")).lower() == "append" else "w"
@@ -1364,44 +1910,231 @@ $matches | Stop-Process -Force
             handle.write(str(content))
             if content and not str(content).endswith("\n"):
                 handle.write("\n")
+        after_bytes = target.read_bytes() if target.exists() and target.is_file() else b""
+        self._push_undo_record(
+            {
+                "kind": "write_file",
+                "label": f"create file {target.name}",
+                "path": str(target),
+                "before_exists": before_exists,
+                "before_bytes": before_bytes,
+                "after_exists": target.exists() and target.is_file(),
+                "after_bytes": after_bytes,
+            }
+        )
         return f"Wrote {target}."
 
     def _create_folder(self, params):
         target = self._resolve_path(params, expect_existing=False)
         if target is None:
             return "No folder name was provided."
+        existed_before = target.exists()
         target.mkdir(parents=True, exist_ok=True)
+        if not existed_before:
+            self._push_undo_record(
+                {
+                    "kind": "create_folder",
+                    "label": f"create folder {target.name}",
+                    "path": str(target),
+                }
+            )
         return f"Created folder {target}."
 
     def _delete_path(self, params):
         target = self._resolve_path(params, expect_existing=True)
         if target is None:
             return "No matching file or folder was found to delete."
-        if target.is_dir():
-            shutil.rmtree(target)
-            return f"Deleted folder {target}."
-        target.unlink()
-        return f"Deleted file {target}."
+        was_dir = target.is_dir()
+        backup = self._reserve_undo_backup_path(target)
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(target), str(backup))
+        self._push_undo_record(
+            {
+                "kind": "delete_move",
+                "label": f"delete {target.name}",
+                "original": str(target),
+                "backup": str(backup),
+            }
+        )
+        return f"Deleted {'folder' if was_dir else 'file'} {target}."
 
     def _modify_file(self, params):
         target = self._resolve_path(params, expect_existing=False)
         if target is None:
             return "No file was provided to modify."
 
+        before_exists = target.exists() and target.is_file()
+        before_bytes = target.read_bytes() if before_exists else b""
+        before_text = self._decode_bytes(before_bytes)
+
         content = params.get("content")
         if not content and params.get("content_request"):
-            content = self._generate_file_content(target, str(params["content_request"]))
+            request = str(params["content_request"])
+            requested_mode = str(params.get("mode") or "").lower()
+            if requested_mode == "append":
+                content = self._generate_file_content(target, request)
+            else:
+                content = self._generate_modified_file_content(target, before_text, request)
         if not content:
             return "No new content was provided."
 
         target.parent.mkdir(parents=True, exist_ok=True)
-        mode = str(params.get("mode", "append")).lower()
+        mode = str(params.get("mode") or ("overwrite" if params.get("content_request") else "append")).lower()
         write_mode = "w" if mode in {"overwrite", "replace"} else "a"
         with open(target, write_mode, encoding="utf-8") as handle:
             handle.write(str(content))
             if not str(content).endswith("\n"):
                 handle.write("\n")
-        return f"Updated {target}."
+        after_bytes = target.read_bytes() if target.exists() and target.is_file() else b""
+        after_text = self._decode_bytes(after_bytes)
+        self._push_undo_record(
+            {
+                "kind": "write_file",
+                "label": f"modify file {target.name}",
+                "path": str(target),
+                "before_exists": before_exists,
+                "before_bytes": before_bytes,
+                "after_exists": target.exists() and target.is_file(),
+                "after_bytes": after_bytes,
+            }
+        )
+        lines = [
+            f"File changed: {target}",
+            "Before:",
+            self._with_line_numbers(before_text, max_lines=220) if before_exists else "[missing]",
+            "After:",
+            self._with_line_numbers(after_text, max_lines=220),
+        ]
+        return "\n".join(lines)
+
+    def _decode_bytes(self, payload):
+        data = payload if isinstance(payload, (bytes, bytearray)) else b""
+        if not data:
+            return ""
+        for encoding in ("utf-8", "utf-16", "latin-1"):
+            try:
+                return data.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        return data.decode("utf-8", errors="replace")
+
+    def _generate_modified_file_content(self, target_path, before_text, request):
+        cleaned_request = str(request or "").strip()
+        if not cleaned_request:
+            return before_text
+        lowered_request = cleaned_request.lower()
+        normalized_request = self._normalize_query(cleaned_request)
+        target_name = Path(target_path).name.lower()
+        if "cv2" in normalized_request and any(token in normalized_request for token in {"without", "not use", "remove", "dont use", "do not use"}):
+            if target_name.endswith(".py") and any(token in target_name for token in {"ascii", "video"}):
+                return self._ascii_video_without_cv2_template()
+        if self.llm:
+            prompt = (
+                "You are updating an existing source file for a desktop coding assistant.\n"
+                "Return only the full updated file content with no markdown fences.\n"
+                f"File path: {target_path}\n"
+                f"Update request: {cleaned_request}\n"
+                "Current file content:\n"
+                f"{before_text}\n"
+            )
+            generated = str(self.llm.generate(prompt)).strip()
+            generated = re.sub(r"^```[a-zA-Z0-9_+-]*\s*", "", generated)
+            generated = re.sub(r"\s*```$", "", generated)
+            if generated:
+                return generated
+        fallback = self._generate_file_content(target_path, cleaned_request)
+        if fallback:
+            return fallback
+        return before_text
+
+    def _ascii_video_without_cv2_template(self):
+        return (
+            "import argparse\n"
+            "import math\n"
+            "import shutil\n"
+            "import subprocess\n"
+            "import time\n\n"
+            "ASCII_CHARS = \" .,:;irsXA253hMHGS#9B&@\"\n\n\n"
+            "def _run_ffprobe(video_path):\n"
+            "    command = [\n"
+            "        \"ffprobe\",\n"
+            "        \"-v\",\n"
+            "        \"error\",\n"
+            "        \"-select_streams\",\n"
+            "        \"v:0\",\n"
+            "        \"-show_entries\",\n"
+            "        \"stream=width,height,r_frame_rate\",\n"
+            "        \"-of\",\n"
+            "        \"default=noprint_wrappers=1:nokey=1\",\n"
+            "        video_path,\n"
+            "    ]\n"
+            "    result = subprocess.run(command, capture_output=True, text=True, check=True)\n"
+            "    values = [line.strip() for line in result.stdout.splitlines() if line.strip()]\n"
+            "    if len(values) < 3:\n"
+            "        raise RuntimeError(\"Could not read video metadata from ffprobe.\")\n"
+            "    width = int(values[0])\n"
+            "    height = int(values[1])\n"
+            "    rate = values[2]\n"
+            "    if \"/\" in rate:\n"
+            "        num, den = rate.split(\"/\", 1)\n"
+            "        fps = float(num) / float(den or 1)\n"
+            "    else:\n"
+            "        fps = float(rate)\n"
+            "    return width, height, max(1.0, fps)\n\n\n"
+            "def _pixel_to_ascii(pixel):\n"
+            "    index = min(len(ASCII_CHARS) - 1, int((pixel / 255) * (len(ASCII_CHARS) - 1)))\n"
+            "    return ASCII_CHARS[index]\n\n\n"
+            "def _frame_to_ascii(frame_bytes, width, height):\n"
+            "    rows = []\n"
+            "    for y in range(height):\n"
+            "        start = y * width\n"
+            "        row = frame_bytes[start:start + width]\n"
+            "        rows.append(\"\".join(_pixel_to_ascii(pixel) for pixel in row))\n"
+            "    return \"\\n\".join(rows)\n\n\n"
+            "def play_ascii_video(video_path, out_width=None):\n"
+            "    src_width, src_height, fps = _run_ffprobe(video_path)\n"
+            "    terminal_width = shutil.get_terminal_size((100, 40)).columns - 2\n"
+            "    output_width = max(40, min(out_width or terminal_width, terminal_width))\n"
+            "    aspect = src_height / float(src_width or 1)\n"
+            "    output_height = max(1, int(math.ceil(output_width * aspect * 0.5)))\n"
+            "    frame_size = output_width * output_height\n"
+            "    ffmpeg_command = [\n"
+            "        \"ffmpeg\",\n"
+            "        \"-loglevel\",\n"
+            "        \"error\",\n"
+            "        \"-i\",\n"
+            "        video_path,\n"
+            "        \"-vf\",\n"
+            "        f\"scale={output_width}:{output_height}\",\n"
+            "        \"-f\",\n"
+            "        \"rawvideo\",\n"
+            "        \"-pix_fmt\",\n"
+            "        \"gray\",\n"
+            "        \"-\",\n"
+            "    ]\n"
+            "    process = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE)\n"
+            "    if process.stdout is None:\n"
+            "        raise RuntimeError(\"Failed to stream frames from ffmpeg.\")\n"
+            "    frame_delay = 1.0 / max(1.0, fps)\n"
+            "    try:\n"
+            "        while True:\n"
+            "            frame = process.stdout.read(frame_size)\n"
+            "            if len(frame) < frame_size:\n"
+            "                break\n"
+            "            print(\"\\x1b[2J\\x1b[H\", end=\"\")\n"
+            "            print(_frame_to_ascii(frame, output_width, output_height))\n"
+            "            time.sleep(frame_delay)\n"
+            "    finally:\n"
+            "        process.kill()\n\n\n"
+            "def main():\n"
+            "    parser = argparse.ArgumentParser(description=\"Play a video in terminal as ASCII art frames.\")\n"
+            "    parser.add_argument(\"video_path\", help=\"Path to video file\")\n"
+            "    parser.add_argument(\"--width\", type=int, default=None, help=\"Output ASCII width\")\n"
+            "    args = parser.parse_args()\n"
+            "    play_ascii_video(args.video_path, out_width=args.width)\n\n\n"
+            "if __name__ == \"__main__\":\n"
+            "    main()\n"
+        )
 
     def _read_file(self, params):
         target = self._resolve_path(params, expect_existing=True, source_hint="file")
@@ -1473,6 +2206,15 @@ $matches | Stop-Process -Force
             shutil.copytree(source, destination)
         else:
             shutil.copy2(source, destination)
+        self._push_undo_record(
+            {
+                "kind": "copy_item",
+                "label": f"copy {source.name}",
+                "source": str(source),
+                "destination": str(destination),
+                "is_dir": source.is_dir(),
+            }
+        )
         return f"Copied {source} to {destination}."
 
     def _move_path(self, params):
@@ -1482,6 +2224,14 @@ $matches | Stop-Process -Force
         destination = self._resolve_transfer_destination(params, source)
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(source), str(destination))
+        self._push_undo_record(
+            {
+                "kind": "move_item",
+                "label": f"move {Path(destination).name}",
+                "source": str(source),
+                "destination": str(destination),
+            }
+        )
         return f"Moved {source} to {destination}."
 
     def _rename_path(self, params):
@@ -1493,12 +2243,40 @@ $matches | Stop-Process -Force
             return "No new name was provided."
         destination = target.with_name(new_name)
         target.rename(destination)
+        self._push_undo_record(
+            {
+                "kind": "move_item",
+                "label": f"rename {destination.name}",
+                "source": str(target),
+                "destination": str(destination),
+            }
+        )
         return f"Renamed {target.name} to {destination.name}."
 
     def _duplicate_path(self, params):
         source = self._resolve_transfer_source(params)
         if source is None:
             return "No file or folder matched that duplicate request."
+        destination_input = str(params.get("destination") or "").strip()
+        if destination_input:
+            destination = self._resolve_transfer_destination(params, source)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if source.is_dir():
+                if destination.exists():
+                    shutil.rmtree(destination)
+                shutil.copytree(source, destination)
+            else:
+                shutil.copy2(source, destination)
+            self._push_undo_record(
+                {
+                    "kind": "copy_item",
+                    "label": f"duplicate {source.name}",
+                    "source": str(source),
+                    "destination": str(destination),
+                    "is_dir": source.is_dir(),
+                }
+            )
+            return f"Duplicated {source} to {destination}."
         suffix = source.suffix
         stem = source.stem
         index = 1
@@ -1512,6 +2290,15 @@ $matches | Stop-Process -Force
             shutil.copytree(source, destination)
         else:
             shutil.copy2(source, destination)
+        self._push_undo_record(
+            {
+                "kind": "copy_item",
+                "label": f"duplicate {source.name}",
+                "source": str(source),
+                "destination": str(destination),
+                "is_dir": source.is_dir(),
+            }
+        )
         return f"Duplicated {source} to {destination}."
 
     def _shutdown_system(self, params):
@@ -1530,10 +2317,15 @@ $matches | Stop-Process -Force
 
     def _sleep_system(self, params):
         if self.is_windows:
-            self._powershell(
-                "Add-Type -AssemblyName System.Windows.Forms; "
-                "[System.Windows.Forms.Application]::SetSuspendState('Suspend', $false, $false)"
-            )
+            try:
+                import ctypes
+
+                result = ctypes.windll.powrprof.SetSuspendState(False, True, False)
+                if result == 0:
+                    raise RuntimeError("SetSuspendState returned 0.")
+            except Exception:
+                # Fallback for systems where direct API invocation is blocked.
+                self._run_process(["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"], timeout=20)
         else:
             os.system("systemctl suspend")
         return "Putting the device to sleep."
@@ -2028,9 +2820,9 @@ $devices | ConvertTo-Json -Depth 4 -Compress
 
     def _play_music(self, params):
         raw_text = self._normalize_query(params.get("raw_text") or "")
-        song = str(params.get("song") or params.get("name") or "").strip()
-        if not song:
-            raise RuntimeError("No song title was provided.")
+        requested = str(params.get("song") or params.get("name") or "").strip()
+        if not requested:
+            raise RuntimeError("No song or video request was provided.")
         platform_name = str(params.get("platform") or "").strip().lower()
         if "youtube music" in raw_text:
             platform_name = "youtube_music"
@@ -2039,8 +2831,7 @@ $devices | ConvertTo-Json -Depth 4 -Compress
         elif "youtube" in raw_text or not platform_name:
             platform_name = "youtube"
 
-        song = re.sub(r"\b(song|music|video)\b", "", song, flags=re.IGNORECASE).strip(" .")
-        song = re.sub(r"\b(?:on|in)\s+(youtube music|youtube|spotify)\b.*$", "", song, flags=re.IGNORECASE).strip(" .")
+        song = self._extract_media_search_query(requested, raw_text)
         browser = params.get("browser")
         if platform_name == "spotify":
             if self.is_windows:
@@ -2048,9 +2839,9 @@ $devices | ConvertTo-Json -Depth 4 -Compress
                 return f"Opened Spotify for {song}."
             url = f"https://open.spotify.com/search/{quote_plus(song)}"
         elif platform_name == "youtube_music":
-            url = self._find_youtube_video_url(song, music=True) or f"https://music.youtube.com/search?q={quote_plus(song)}"
+            url = f"https://music.youtube.com/search?q={quote_plus(song)}"
         else:
-            url = self._find_youtube_video_url(song, music=False) or f"https://www.youtube.com/results?search_query={quote_plus(song)}"
+            url = f"https://www.youtube.com/results?search_query={quote_plus(song)}"
         open_params = {"website": url}
         if browser:
             open_params["browser"] = browser
@@ -2058,14 +2849,30 @@ $devices | ConvertTo-Json -Depth 4 -Compress
         if platform_name == "spotify":
             return f"Opened Spotify for {song}."
         if platform_name == "youtube_music":
-            return f"Playing {song} on YouTube Music."
-        return f"Playing {song} on YouTube."
+            return f"Showing YouTube Music search results for {song}."
+        return f"Showing YouTube search results for {song}."
 
     def _draw_file_tree(self, params):
-        directory = self._resolve_directory(params)
+        if params.get("current"):
+            directory = Path.cwd().resolve()
+            if not directory.exists():
+                return f"Path not found: {directory}"
+            return draw_file_tree(directory, max_depth=None, max_items=None)
+        explicit_directory = str(params.get("directory") or params.get("path") or "").strip()
+        if explicit_directory:
+            directory = self._resolve_directory(params)
+            if not directory.exists():
+                fuzzy = self._find_closest_path(directory.name, directory.parent, source_hint="directory")
+                if fuzzy is None and Path.cwd().anchor:
+                    fuzzy = self._find_closest_path(directory.name, Path(Path.cwd().anchor), source_hint="directory")
+                if fuzzy is not None:
+                    directory = fuzzy
+        else:
+            cwd = Path.cwd().resolve()
+            directory = Path(cwd.anchor) if cwd.anchor else cwd
         if not directory.exists():
             return f"Path not found: {directory}"
-        return draw_file_tree(directory)
+        return draw_file_tree(directory, max_depth=None, max_items=None)
 
     def _project_code(self, params):
         project_path = str(params.get("project_path") or "").strip()
@@ -2080,15 +2887,38 @@ $devices | ConvertTo-Json -Depth 4 -Compress
         create_request = any(word in instruction.lower() for word in {"create", "build", "scaffold", "generate"})
         if (not target.exists() or target.name.lower() == "new_project") and create_request:
             changes = self._scaffold_project(target, instruction)
+            self._push_project_undo_record(target, changes)
             return self._format_project_change_report(target, instruction, changes)
 
         if not target.exists():
             raise RuntimeError(f"Project path not found: {target}")
+        if target.is_file():
+            changes = self._apply_single_file_instruction(target, instruction)
+            self._push_project_undo_record(target.parent, changes)
+            return self._format_project_change_report(target.parent, instruction, changes)
         if not target.is_dir():
-            raise RuntimeError(f"Project path is not a directory: {target}")
+            raise RuntimeError(f"Project path is not a directory or file: {target}")
 
         changes = self._apply_project_instruction(target, instruction)
+        self._push_project_undo_record(target, changes)
         return self._format_project_change_report(target, instruction, changes)
+
+    def _push_project_undo_record(self, project_root, changes):
+        if not changes:
+            return
+        snapshots = []
+        for change in changes:
+            absolute_path = (Path(project_root) / change.path).resolve()
+            snapshots.append(
+                {
+                    "path": str(absolute_path),
+                    "before_exists": bool(change.before_exists),
+                    "after_exists": bool(change.after_exists),
+                    "before_bytes": str(change.before or "").encode("utf-8"),
+                    "after_bytes": str(change.after or "").encode("utf-8"),
+                }
+            )
+        self._push_undo_record({"kind": "project_batch", "label": "project changes", "snapshots": snapshots})
 
     def _scaffold_project(self, project_root, instruction):
         if "fastapi" in instruction.lower():
@@ -2283,6 +3113,7 @@ $devices | ConvertTo-Json -Depth 4 -Compress
             reason = str(item.get("reason") or "").strip()
             content = str(item.get("content") or "")
             target = (project_root / relative_path).resolve()
+            before_exists = target.exists() and target.is_file()
             before = target.read_text(encoding="utf-8") if target.exists() and target.is_file() else ""
             if mode == "delete":
                 if target.exists():
@@ -2290,12 +3121,70 @@ $devices | ConvertTo-Json -Depth 4 -Compress
                         shutil.rmtree(target)
                     else:
                         target.unlink()
-                changes.append(ProjectChange(path=relative_path, before=before, after="", mode="delete", reason=reason))
+                changes.append(
+                    ProjectChange(
+                        path=relative_path,
+                        before=before,
+                        after="",
+                        mode="delete",
+                        reason=reason,
+                        before_exists=before_exists,
+                        after_exists=False,
+                    )
+                )
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
-            changes.append(ProjectChange(path=relative_path, before=before, after=content, mode=mode, reason=reason))
+            changes.append(
+                ProjectChange(
+                    path=relative_path,
+                    before=before,
+                    after=content,
+                    mode=mode,
+                    reason=reason,
+                    before_exists=before_exists,
+                    after_exists=True,
+                )
+            )
         return changes
+
+    def _apply_single_file_instruction(self, target_file, instruction):
+        file_path = Path(target_file).resolve()
+        if not file_path.exists() or not file_path.is_file():
+            raise RuntimeError(f"File not found: {file_path}")
+        if not self.llm:
+            raise RuntimeError("No LLM engine is available for single-file updates.")
+
+        before = file_path.read_text(encoding="utf-8")
+        effective_instruction = instruction or (
+            "Correct the code so it is valid, coherent, and aligned with its likely purpose."
+        )
+        prompt = (
+            "You are updating one source file for a desktop coding assistant.\n"
+            "Return only the full updated file content. Do not return markdown fences.\n"
+            f"File path: {file_path}\n"
+            f"User request: {effective_instruction}\n"
+            "Current file content:\n"
+            f"{before}\n"
+        )
+        generated = str(self.llm.generate(prompt)).strip()
+        generated = re.sub(r"^```[a-zA-Z0-9_+-]*\s*", "", generated)
+        generated = re.sub(r"\s*```$", "", generated)
+        if not generated:
+            raise RuntimeError("The model did not return updated file content.")
+
+        file_path.write_text(generated, encoding="utf-8")
+        return [
+            ProjectChange(
+                path=file_path.name,
+                before=before,
+                after=generated,
+                mode="update",
+                reason="single-file update",
+                before_exists=True,
+                after_exists=True,
+            )
+        ]
 
     def _load_project_context(self, project_root):
         sections = []
@@ -2330,7 +3219,8 @@ $devices | ConvertTo-Json -Depth 4 -Compress
 
     def _write_project_file(self, project_root, relative_path, content, mode="create", reason=""):
         target = (project_root / relative_path).resolve()
-        before = target.read_text(encoding="utf-8") if target.exists() and target.is_file() else ""
+        before_exists = target.exists() and target.is_file()
+        before = target.read_text(encoding="utf-8") if before_exists else ""
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         return ProjectChange(
@@ -2339,6 +3229,8 @@ $devices | ConvertTo-Json -Depth 4 -Compress
             after=content,
             mode=mode,
             reason=reason,
+            before_exists=before_exists,
+            after_exists=True,
         )
 
     def _format_project_change_report(self, project_root, instruction, changes):
@@ -2351,18 +3243,36 @@ $devices | ConvertTo-Json -Depth 4 -Compress
             return "\n".join(lines)
 
         for change in changes:
+            absolute_path = (Path(project_root) / change.path).resolve()
             lines.append("")
             lines.append(f"File changed: {change.path}")
+            lines.append(f"Absolute path: {absolute_path}")
             if change.reason:
                 lines.append(f"Reason: {change.reason}")
             lines.append("Before:")
-            lines.append(change.before[:1200] if change.before else ("[deleted]" if change.mode == "delete" else "[missing]"))
+            lines.append(
+                self._with_line_numbers(change.before, max_lines=180)
+                if change.before
+                else ("[deleted]" if change.mode == "delete" else "[missing]")
+            )
             lines.append("After:")
             if change.mode == "delete":
                 lines.append("[deleted]")
             else:
-                lines.append(change.after[:1200] if change.after else "[empty file]")
+                lines.append(self._with_line_numbers(change.after, max_lines=180) if change.after else "[empty file]")
         return "\n".join(lines)
+
+    def _with_line_numbers(self, text, max_lines=180):
+        lines = str(text or "").splitlines()
+        if not lines:
+            return "[empty]"
+        output = []
+        for index, line in enumerate(lines, start=1):
+            if index > max_lines:
+                output.append("... (truncated)")
+                break
+            output.append(f"{index:4d}: {line}")
+        return "\n".join(output)
 
     def _extract_json(self, text):
         raw = str(text or "").strip()
@@ -2377,6 +3287,69 @@ $devices | ConvertTo-Json -Depth 4 -Compress
         suffix = target_path.suffix.lower()
         lowered = request.lower()
 
+        if suffix == ".py" and "palindrome" in lowered:
+            return (
+                "def is_palindrome(value: str) -> bool:\n"
+                "    cleaned = ''.join(ch.lower() for ch in value if ch.isalnum())\n"
+                "    return cleaned == cleaned[::-1]\n\n"
+                "def main() -> None:\n"
+                "    user_input = input('Enter a string: ')\n"
+                "    if is_palindrome(user_input):\n"
+                "        print('The string is a palindrome.')\n"
+                "    else:\n"
+                "        print('The string is not a palindrome.')\n\n"
+                "if __name__ == '__main__':\n"
+                "    main()\n"
+            )
+        if suffix == ".py" and "ascii" in lowered and "video" in lowered:
+            return (
+                "import argparse\n"
+                "import os\n"
+                "import shutil\n"
+                "import time\n\n"
+                "import cv2\n\n"
+                "ASCII_CHARS = ' .,:;irsXA253hMHGS#9B&@'\n\n\n"
+                "def frame_to_ascii(frame, width):\n"
+                "    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)\n"
+                "    height, current_width = gray.shape\n"
+                "    if current_width <= 0:\n"
+                "        return ''\n"
+                "    ratio = height / float(current_width)\n"
+                "    target_height = max(1, int(width * ratio * 0.5))\n"
+                "    resized = cv2.resize(gray, (width, target_height), interpolation=cv2.INTER_AREA)\n"
+                "    rows = []\n"
+                "    for row in resized:\n"
+                "        chars = [ASCII_CHARS[min(len(ASCII_CHARS) - 1, int(pixel / 255 * (len(ASCII_CHARS) - 1)))] for pixel in row]\n"
+                "        rows.append(''.join(chars))\n"
+                "    return '\\n'.join(rows)\n\n\n"
+                "def play_ascii_video(video_path, width=100):\n"
+                "    if not os.path.exists(video_path):\n"
+                "        raise FileNotFoundError(f'Video not found: {video_path}')\n"
+                "    capture = cv2.VideoCapture(video_path)\n"
+                "    if not capture.isOpened():\n"
+                "        raise RuntimeError('Unable to open video file.')\n"
+                "    fps = capture.get(cv2.CAP_PROP_FPS) or 24.0\n"
+                "    frame_delay = 1.0 / max(1.0, fps)\n"
+                "    try:\n"
+                "        while True:\n"
+                "            ok, frame = capture.read()\n"
+                "            if not ok:\n"
+                "                break\n"
+                "            ascii_frame = frame_to_ascii(frame, width)\n"
+                "            os.system('cls' if os.name == 'nt' else 'clear')\n"
+                "            print(ascii_frame)\n"
+                "            time.sleep(frame_delay)\n"
+                "    finally:\n"
+                "        capture.release()\n\n\n"
+                "def main():\n"
+                "    parser = argparse.ArgumentParser(description='Play a video as ASCII art in the terminal.')\n"
+                "    parser.add_argument('video_path', help='Path to the video file')\n"
+                "    parser.add_argument('--width', type=int, default=max(60, shutil.get_terminal_size((100, 40)).columns - 4))\n"
+                "    args = parser.parse_args()\n"
+                "    play_ascii_video(args.video_path, width=max(40, args.width))\n\n\n"
+                "if __name__ == '__main__':\n"
+                "    main()\n"
+            )
         if suffix == ".py" and "add" in lowered and "two number" in lowered:
             return (
                 "def main():\n"

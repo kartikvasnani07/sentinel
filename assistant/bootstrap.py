@@ -87,6 +87,14 @@ def run_first_time_setup(config, voice_engine=None, tts=None):
     )
     _tts_prompt(tts, f"My name is set to {assistant_name}.")
 
+    wake_response_choice = input("Enable wake-word response after summon? [yes/no, default: yes]: ").strip().lower()
+    wake_response_enabled = wake_response_choice not in {"n", "no", "off", "disable", "disabled", "0", "false"}
+    config.set("wake_response_enabled", wake_response_enabled)
+    if wake_response_enabled:
+        _tts_prompt(tts, "Wake response is enabled.")
+    else:
+        _tts_prompt(tts, "Wake response is disabled. I will listen immediately after wake word detection.")
+
     _tts_prompt(
         tts,
         "Choose a voice preset. I can preview each voice before you confirm it.",

@@ -152,6 +152,7 @@ LANGUAGE_FULL_NAMES = {"en": "English"}
 _DEFAULTS = {
     "assistant_name": "friday",
     "wake_variants": [],
+    "wake_response_enabled": True,
     "password_hash": "",
     "voice_auth_threshold": 0,
     "voice_sample_path": "",
@@ -224,6 +225,7 @@ class AssistantConfig:
         if not isinstance(variants, list):
             variants = []
         self._data["wake_variants"] = [str(item).strip().lower() for item in variants if str(item).strip()]
+        self._data["wake_response_enabled"] = bool(self._data.get("wake_response_enabled", True))
 
         self._data["voice_auth_threshold"] = _clamp_percentage(
             self._data.get("voice_auth_threshold"),

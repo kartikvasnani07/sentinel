@@ -1,6 +1,7 @@
 import io
 import os
 import re
+import threading
 import unicodedata
 import wave
 from collections import deque
@@ -10,6 +11,8 @@ import requests
 import sounddevice as sd
 import torch
 from faster_whisper import WhisperModel
+
+from .voice_auth import _cosine_similarity, _extract_features
 
 
 class VoiceEngine:
@@ -32,12 +35,15 @@ class VoiceEngine:
         self.min_transcript_chars = self._parse_int_env("STT_MIN_TRANSCRIPT_CHARS", 2)
         self.min_alnum_chars = self._parse_int_env("STT_MIN_ALNUM_CHARS", 2)
         self.min_avg_logprob = self._parse_float_env("WHISPER_MIN_AVG_LOGPROB", -1.5)
+        self.light_speaker_similarity = self._parse_float_env("SPEAKER_LIGHT_SIMILARITY", 0.36)
+        self.strong_speaker_similarity = self._parse_float_env("SPEAKER_STRONG_SIMILARITY", 0.58)
 
         self.model = None
         self.active_local_model = None
         self._last_local_model_error = None
         self._local_load_attempted = False
-        self._ensure_local_model(allow_download=self.whisper_allow_download)
+        self._model_lock = threading.Lock()
+        self._warmup_thread = None
 
     def _normalize_env(self, key):
         value = os.getenv(key)
@@ -95,45 +101,62 @@ class VoiceEngine:
         return result
 
     def _ensure_local_model(self, allow_download=False):
-        if self.model is not None:
-            return True
-
-        if self._local_load_attempted and not allow_download:
-            return False
-
-        self._local_load_attempted = True
-        errors = []
-        for candidate in self.model_candidates:
-            try:
-                self.model = WhisperModel(
-                    candidate,
-                    device=self.device,
-                    compute_type=self.compute_type,
-                    local_files_only=True,
-                )
-                self.active_local_model = candidate
-                print(f"Loaded local Whisper model: {candidate}")
+        with self._model_lock:
+            if self.model is not None:
                 return True
-            except Exception as exc:
-                errors.append(f"{candidate} (local-only): {exc}")
 
-        if allow_download:
+            if self._local_load_attempted and not allow_download:
+                return False
+
+            self._local_load_attempted = True
+            errors = []
             for candidate in self.model_candidates:
                 try:
                     self.model = WhisperModel(
                         candidate,
                         device=self.device,
                         compute_type=self.compute_type,
-                        local_files_only=False,
+                        local_files_only=True,
                     )
                     self.active_local_model = candidate
-                    print(f"Loaded Whisper model after download: {candidate}")
+                    print(f"Loaded local Whisper model: {candidate}")
                     return True
                 except Exception as exc:
-                    errors.append(f"{candidate} (download): {exc}")
+                    errors.append(f"{candidate} (local-only): {exc}")
 
-        self._last_local_model_error = " | ".join(errors) if errors else "Unknown model load error."
-        return False
+            if allow_download:
+                for candidate in self.model_candidates:
+                    try:
+                        self.model = WhisperModel(
+                            candidate,
+                            device=self.device,
+                            compute_type=self.compute_type,
+                            local_files_only=False,
+                        )
+                        self.active_local_model = candidate
+                        print(f"Loaded Whisper model after download: {candidate}")
+                        return True
+                    except Exception as exc:
+                        errors.append(f"{candidate} (download): {exc}")
+
+            self._last_local_model_error = " | ".join(errors) if errors else "Unknown model load error."
+            return False
+
+    def warmup_local_model_async(self, allow_download=None):
+        if self.model is not None:
+            return False
+
+        if self._warmup_thread is not None and self._warmup_thread.is_alive():
+            return False
+
+        use_download = self.whisper_allow_download if allow_download is None else bool(allow_download)
+
+        def _warmup():
+            self._ensure_local_model(allow_download=use_download)
+
+        self._warmup_thread = threading.Thread(target=_warmup, daemon=True, name="stt-model-warmup")
+        self._warmup_thread.start()
+        return True
 
     def record_audio(self, duration=7):
         audio = sd.rec(
@@ -154,6 +177,11 @@ class VoiceEngine:
         start_timeout=6.0,
         preroll_duration=0.35,
         block_duration=0.08,
+        fast_start=False,
+        prefill_audio=None,
+        speaker_reference=None,
+        speaker_mode="none",
+        on_speech_start=None,
     ):
         block_size = max(512, int(self.sample_rate * block_duration))
         pre_roll = deque(maxlen=max(1, int(preroll_duration / block_duration)))
@@ -164,17 +192,33 @@ class VoiceEngine:
         wait_seconds = 0.0
         energy_samples = []
 
+        normalized_speaker_mode = str(speaker_mode or "none").strip().lower()
+        if normalized_speaker_mode not in {"none", "light", "strong"}:
+            normalized_speaker_mode = "none"
+
+        if prefill_audio is not None:
+            prefill = np.asarray(prefill_audio).flatten()
+            if prefill.dtype != np.int16:
+                prefill = np.clip(prefill, -32768, 32767).astype(np.int16)
+            for index in range(0, len(prefill), block_size):
+                chunk = prefill[index : index + block_size]
+                if len(chunk):
+                    pre_roll.append(chunk.copy())
+                    energy_samples.append(self._chunk_energy(chunk))
+
         with sd.InputStream(
             samplerate=self.sample_rate,
             channels=1,
             dtype="int16",
             blocksize=block_size,
         ) as stream:
-            while wait_seconds < min(0.8, start_timeout):
+            calibration_window = min(0.08 if fast_start else 0.8, start_timeout)
+            while wait_seconds < calibration_window:
                 chunk, _ = stream.read(block_size)
                 audio = chunk.flatten()
                 wait_seconds += len(audio) / self.sample_rate
                 energy_samples.append(self._chunk_energy(audio))
+                pre_roll.append(audio.copy())
 
             ambient = np.median(energy_samples) if energy_samples else 0.003
             start_threshold = max(ambient * 2.2, 0.010)
@@ -190,10 +234,26 @@ class VoiceEngine:
                 if not speech_started:
                     pre_roll.append(audio.copy())
                     if energy >= start_threshold:
-                        speech_started = True
-                        captured.extend(pre_roll)
-                        captured.append(audio.copy())
-                        silence_seconds = 0.0
+                        candidate_chunks = list(pre_roll)
+                        candidate = np.concatenate(candidate_chunks).astype(np.int16) if candidate_chunks else audio.astype(np.int16)
+                        similarity = self._speaker_similarity(candidate, speaker_reference)
+                        speaker_ok = self._speaker_accepts(similarity, normalized_speaker_mode)
+                        if not speaker_ok and normalized_speaker_mode == "light":
+                            # In light mode we eventually allow non-matching voices to avoid hard rejection.
+                            speaker_ok = wait_seconds >= max(0.8, start_timeout * 0.55)
+                        if speaker_ok:
+                            speech_started = True
+                            captured.extend(candidate_chunks)
+                            silence_seconds = 0.0
+                            if callable(on_speech_start):
+                                try:
+                                    on_speech_start()
+                                except Exception:
+                                    pass
+                        else:
+                            wait_seconds += seconds
+                            if wait_seconds >= start_timeout:
+                                break
                     else:
                         wait_seconds += seconds
                         if wait_seconds >= start_timeout:
@@ -214,6 +274,24 @@ class VoiceEngine:
             return None
 
         return np.concatenate(captured).astype(np.int16)
+
+    def _speaker_similarity(self, audio, reference):
+        if reference is None:
+            return None
+        try:
+            current = _extract_features(np.asarray(audio, dtype=np.int16))
+            return float(_cosine_similarity(reference, current))
+        except Exception:
+            return None
+
+    def _speaker_accepts(self, similarity, mode):
+        if mode == "none":
+            return True
+        if similarity is None:
+            return mode == "light"
+        if mode == "strong":
+            return similarity >= self.strong_speaker_similarity
+        return similarity >= self.light_speaker_similarity
 
     @staticmethod
     def _chunk_energy(audio):
@@ -344,7 +422,8 @@ class VoiceEngine:
         return text if self._is_usable_transcript(text) else None
 
     def local_transcribe(self, audio, previous_text="", allow_download=False):
-        if not self._ensure_local_model(allow_download=allow_download):
+        effective_allow_download = bool(allow_download) or self.whisper_allow_download
+        if not self._ensure_local_model(allow_download=effective_allow_download):
             print(f"Local Faster-Whisper unavailable. Last load error: {self._last_local_model_error}")
             return None
 

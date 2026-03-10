@@ -51,6 +51,7 @@ class TTSEngine:
         self.queue = queue.Queue()
         self.running = True
         self.stop_event = threading.Event()
+        self.speaking_event = threading.Event()
         self.coqui_lock = threading.Lock()
 
         self.low_latency_mode = self._parse_bool_env("TTS_LOW_LATENCY_MODE", True)
@@ -62,7 +63,7 @@ class TTSEngine:
         self.edge_pitch = os.getenv("EDGE_TTS_PITCH", "-2Hz").strip() or "-2Hz"
         self.edge_volume = os.getenv("EDGE_TTS_VOLUME", "+0%").strip() or "+0%"
         self.edge_timeout = self._parse_int_env("EDGE_TTS_TIMEOUT_SEC", 12)
-        self.edge_chunk_chars = self._parse_int_env("EDGE_TTS_CHUNK_CHARS", 90)
+        self.edge_chunk_chars = self._parse_int_env("EDGE_TTS_CHUNK_CHARS", 48)
 
         # Piper TTS settings (offline neural fallback)
         self.piper_model_path = os.getenv("PIPER_MODEL_PATH", "").strip() or None
@@ -201,10 +202,13 @@ class TTSEngine:
 
         end_time = time.time() + timeout
         while time.time() < end_time:
-            if self.queue.unfinished_tasks == 0:
+            if self.queue.unfinished_tasks == 0 and not self.speaking_event.is_set():
                 return True
             time.sleep(0.05)
-        return self.queue.unfinished_tasks == 0
+        return self.queue.unfinished_tasks == 0 and not self.speaking_event.is_set()
+
+    def is_speaking(self):
+        return self.speaking_event.is_set() or self.queue.unfinished_tasks > 0
 
     # ------------------------------------------------------------------
     # Edge-TTS  (online, primary voice)
@@ -397,6 +401,7 @@ class TTSEngine:
                 break
 
             self.stop_event.clear()
+            self.speaking_event.set()
             try:
                 self._edge_speak(text)
             except Exception as edge_error:
@@ -417,6 +422,7 @@ class TTSEngine:
                     except Exception as local_error:
                         print(f"  [TTS] All engines failed. Last error: {local_error}")
             finally:
+                self.speaking_event.clear()
                 self.queue.task_done()
 
     # ------------------------------------------------------------------
@@ -439,6 +445,7 @@ class TTSEngine:
 
     def stop(self):
         self.stop_event.set()
+        self._drain_pending_queue()
         try:
             sd.stop()
         except Exception:

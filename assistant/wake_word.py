@@ -3,11 +3,14 @@ import os
 import queue
 import re
 import time
+from collections import deque
 from difflib import SequenceMatcher
 
 import numpy as np
 import sounddevice as sd
 import vosk
+
+from .voice_auth import _cosine_similarity, _extract_features
 
 
 class WakeWordDetector:
@@ -15,10 +18,20 @@ class WakeWordDetector:
         print("Loading Vosk model from:", model_path)
         self.model = vosk.Model(model_path)
         self.sample_rate = 16000
-        self.block_size = int(os.getenv("WAKE_WORD_BLOCK_SIZE", "1024"))
+        self.block_size = int(os.getenv("WAKE_WORD_BLOCK_SIZE", "512"))
         self.mic_gain = float(os.getenv("WAKE_WORD_GAIN", "6.0"))
-        self.match_threshold = float(os.getenv("WAKE_WORD_MATCH_THRESHOLD", "0.55"))
+        self.match_threshold = float(os.getenv("WAKE_WORD_MATCH_THRESHOLD", "0.50"))
+        self.voice_light_threshold = float(os.getenv("WAKE_WORD_LIGHT_VOICE_THRESHOLD", "0.35"))
+        self.voice_strong_base = float(os.getenv("WAKE_WORD_STRONG_BASE", "0.34"))
+        self.voice_strong_span = float(os.getenv("WAKE_WORD_STRONG_SPAN", "0.40"))
+        self.voice_buffer_seconds = float(os.getenv("WAKE_WORD_BUFFER_SECONDS", "2.4"))
         self.q = queue.Queue()
+        self._recent_audio = deque(maxlen=max(6, int(self.voice_buffer_seconds / max(0.04, self.block_size / self.sample_rate))))
+        self.last_wake_audio = None
+        self.voice_reference = None
+        self.voice_reference_path = ""
+        self.voice_auth_threshold = 0
+        self._light_miss_counter = 0
         self.wake_word = self._normalize_name(wake_word)
         self.wake_variants = self._prepare_variants(self.wake_word, wake_variants)
         self._log_variants()
@@ -32,6 +45,34 @@ class WakeWordDetector:
         preview = sorted(self.wake_variants)[:30]
         print(f"Wake variants loaded: {len(self.wake_variants)}")
         print("Wake preview:", ", ".join(preview))
+
+    def set_voice_reference(self, sample_path="", auth_threshold=0):
+        self.voice_reference_path = str(sample_path or "").strip()
+        self.voice_auth_threshold = max(0, min(100, int(auth_threshold or 0)))
+        self.voice_reference = None
+        if not self.voice_reference_path:
+            return
+        try:
+            loaded = np.load(self.voice_reference_path)
+            if isinstance(loaded, np.ndarray) and loaded.size:
+                self.voice_reference = loaded.astype(np.float32)
+        except Exception as exc:
+            print(f"[wake-word] voice reference unavailable: {exc}")
+
+    def get_voice_reference(self):
+        return self.voice_reference
+
+    def query_speaker_mode(self):
+        if self.voice_reference is None:
+            return "none"
+        return "strong" if self.voice_auth_threshold > 0 else "light"
+
+    def consume_recent_audio(self):
+        if self.last_wake_audio is None:
+            return None
+        audio = self.last_wake_audio.copy()
+        self.last_wake_audio = None
+        return audio
 
     @staticmethod
     def _normalize_name(name):
@@ -203,6 +244,7 @@ class WakeWordDetector:
         audio = np.frombuffer(indata, dtype=np.int16).astype(np.float32)
         audio *= self.mic_gain
         audio = np.clip(audio, -32768, 32767).astype(np.int16)
+        self._recent_audio.append(audio.copy())
         self.q.put(audio.tobytes())
 
     def fuzzy_match(self, text):
@@ -258,6 +300,45 @@ class WakeWordDetector:
                 payload = json.loads(recognizer.PartialResult())
                 yield payload.get("partial", "")
 
+    def _recent_audio_window(self):
+        if not self._recent_audio:
+            return np.array([], dtype=np.int16)
+        return np.concatenate(list(self._recent_audio)).astype(np.int16)
+
+    def _required_voice_similarity(self):
+        if self.voice_auth_threshold <= 0:
+            return self.voice_light_threshold
+        level = max(0, min(100, int(self.voice_auth_threshold)))
+        return max(0.20, min(0.92, self.voice_strong_base + (level / 100.0) * self.voice_strong_span))
+
+    def _voice_similarity(self, audio):
+        if self.voice_reference is None or audio is None or len(audio) == 0:
+            return None
+        try:
+            features = _extract_features(np.asarray(audio, dtype=np.int16))
+            return float(_cosine_similarity(self.voice_reference, features))
+        except Exception:
+            return None
+
+    def _voice_reference_accepts(self, audio):
+        if self.voice_reference is None:
+            return True
+        similarity = self._voice_similarity(audio)
+        if similarity is None:
+            return self.voice_auth_threshold <= 0
+        required = self._required_voice_similarity()
+        if self.voice_auth_threshold > 0:
+            return similarity >= required
+        if similarity >= required:
+            self._light_miss_counter = 0
+            return True
+        self._light_miss_counter += 1
+        # Soft gate in light mode: reject one-off low-similarity spikes but allow persistent calls.
+        if self._light_miss_counter >= 2:
+            self._light_miss_counter = 0
+            return True
+        return False
+
     @staticmethod
     def _should_stop(stop_event=None, stop_events=None):
         if stop_event is not None and stop_event.is_set():
@@ -270,6 +351,7 @@ class WakeWordDetector:
     def listen_for_wake_word(self, stop_event=None, timeout=None, stop_events=None):
         self.q = queue.Queue()
         started = time.time()
+        self._light_miss_counter = 0
 
         with sd.RawInputStream(
             samplerate=self.sample_rate,
@@ -284,4 +366,7 @@ class WakeWordDetector:
                 if timeout is not None and (time.time() - started) >= timeout:
                     return False
                 if text and self.fuzzy_match(text):
-                    return True
+                    recent_audio = self._recent_audio_window()
+                    if self._voice_reference_accepts(recent_audio):
+                        self.last_wake_audio = recent_audio if recent_audio.size else None
+                        return True
