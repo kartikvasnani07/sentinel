@@ -121,52 +121,132 @@ pip install -r requirements.txt
   - `models/vosk/vosk-model-small-en-us-0.15`
 - This path is used by default by `assistant.main`.
 
-## Environment Variables / API Keys
+## Model + API Setup (Beginner Guide)
 
-Create a `.env` (or export in shell) for optional cloud features.
+This assistant uses both local and cloud models with fallback chains.
 
-## LLM (Conversation + Coding)
+Important:
+- This project does not auto-load `.env` by itself.
+- You must set environment variables in your shell or OS environment.
 
-- `GROQ_API_KEY` (optional cloud primary)
-- `GROQ_MODEL` (default: `llama-3.1-8b-instant`)
-- `GROQ_CODE_MODEL` (optional coding model override)
-- `OPENROUTER_API_KEY` (optional cloud secondary)
-- `OPENROUTER_MODEL`
-- `OPENROUTER_CODE_MODEL`
-- `OPENROUTER_URL` (default OpenRouter chat endpoint)
-- `OLLAMA_URL` (local fallback, default: `http://localhost:11434/api/generate`)
-- `OLLAMA_MODEL` (default: `llama3.1:latest`)
-- `OLLAMA_CODE_MODEL` (coding fallback model)
+## 1. Install local models/assets first
 
-## STT
+1. Wake-word model (required):
+   - Download `vosk-model-small-en-us-0.15`.
+   - Place it at `models/vosk/vosk-model-small-en-us-0.15`.
 
-- `DEEPGRAM_API_KEY` (optional online STT primary)
-- `DEEPGRAM_MODEL` (default: `nova-2`)
-- `WHISPER_MODEL_SIZE` (local fallback model, default `small`)
-- `WHISPER_MODEL_PATH` (optional custom local model path)
-
-## TTS
-
-- `EDGE_TTS_VOICE`, `EDGE_TTS_RATE`, `EDGE_TTS_PITCH`, `EDGE_TTS_VOLUME` (optional overrides)
-- `PIPER_MODEL_PATH` (optional local neural TTS model path)
-
-## Example: Set env vars
-
-Windows PowerShell:
-
-```powershell
-$env:GROQ_API_KEY="your_key_here"
-$env:DEEPGRAM_API_KEY="your_key_here"
-$env:OLLAMA_URL="http://localhost:11434/api/generate"
-```
-
-Linux:
+2. Local STT fallback model (recommended):
+   - Engine: `faster-whisper`.
+   - Default local model name: `small`.
+   - By default, local model auto-download is disabled (`WHISPER_ALLOW_DOWNLOAD=False`), so pre-download once:
 
 ```bash
-export GROQ_API_KEY="your_key_here"
-export DEEPGRAM_API_KEY="your_key_here"
-export OLLAMA_URL="http://localhost:11434/api/generate"
+python -c "from faster_whisper import WhisperModel; WhisperModel('small', device='cpu', compute_type='int8', local_files_only=False)"
 ```
+
+3. Local LLM fallback via Ollama (strongly recommended):
+   - Install Ollama: `https://ollama.com/download`
+   - Pull at least one chat model and one coding model:
+
+```bash
+ollama pull llama3.1:latest
+ollama pull qwen2.5-coder:7b
+```
+
+4. Optional local neural TTS model (Piper):
+   - Package is already in requirements (`piper-tts`), but you still need a voice model file.
+   - Download a Piper voice model from the Piper voices release pages and set `PIPER_MODEL_PATH` to that `.onnx` file.
+   - If Piper is not configured, TTS falls back to `pyttsx3`.
+
+## 2. Create cloud API keys (optional, but improves quality/speed)
+
+1. Groq:
+   - Create account and key in the Groq Console (`https://console.groq.com/keys`).
+   - Copy your API key.
+
+2. OpenRouter:
+   - Create account and key in OpenRouter (`https://openrouter.ai/keys`).
+   - Add credits/quota if required by your selected model.
+   - Copy your API key.
+
+3. Deepgram:
+   - Create account and key in Deepgram Console (`https://console.deepgram.com/`).
+   - Copy your API key.
+
+## 3. Set API keys in your environment
+
+Windows PowerShell (current terminal session only):
+
+```powershell
+$env:GROQ_API_KEY="your_groq_key"
+$env:OPENROUTER_API_KEY="your_openrouter_key"
+$env:DEEPGRAM_API_KEY="your_deepgram_key"
+$env:GROQ_MODEL="llama-3.1-8b-instant"
+$env:GROQ_CODE_MODEL="llama-3.1-70b-versatile"
+$env:OPENROUTER_MODEL="meta-llama/llama-3.3-8b-instruct:free"
+$env:OPENROUTER_CODE_MODEL="qwen/qwen-2.5-coder-32b-instruct"
+$env:OLLAMA_MODEL="llama3.1:latest"
+$env:OLLAMA_CODE_MODEL="qwen2.5-coder:7b"
+```
+
+Windows persistent (new terminals after restart/login):
+
+```powershell
+setx GROQ_API_KEY "your_groq_key"
+setx OPENROUTER_API_KEY "your_openrouter_key"
+setx DEEPGRAM_API_KEY "your_deepgram_key"
+setx OLLAMA_MODEL "llama3.1:latest"
+setx OLLAMA_CODE_MODEL "qwen2.5-coder:7b"
+```
+
+Linux/macOS (current shell session):
+
+```bash
+export GROQ_API_KEY="your_groq_key"
+export OPENROUTER_API_KEY="your_openrouter_key"
+export DEEPGRAM_API_KEY="your_deepgram_key"
+export GROQ_MODEL="llama-3.1-8b-instant"
+export GROQ_CODE_MODEL="llama-3.1-70b-versatile"
+export OPENROUTER_MODEL="meta-llama/llama-3.3-8b-instruct:free"
+export OPENROUTER_CODE_MODEL="qwen/qwen-2.5-coder-32b-instruct"
+export OLLAMA_MODEL="llama3.1:latest"
+export OLLAMA_CODE_MODEL="qwen2.5-coder:7b"
+```
+
+Linux/macOS persistent:
+- Add the same `export ...` lines to `~/.bashrc` or `~/.zshrc`, then run `source ~/.bashrc` (or reopen terminal).
+
+## 4. Environment variables reference
+
+LLM:
+- `GROQ_API_KEY`
+- `GROQ_MODEL` (default: `llama-3.1-8b-instant`)
+- `GROQ_CODE_MODEL` (coding-specific cloud model)
+- `OPENROUTER_API_KEY`
+- `OPENROUTER_MODEL`
+- `OPENROUTER_CODE_MODEL`
+- `OPENROUTER_URL` (default: `https://openrouter.ai/api/v1/chat/completions`)
+- `OLLAMA_URL` (default: `http://localhost:11434/api/generate`)
+- `OLLAMA_MODEL` (local general fallback)
+- `OLLAMA_CODE_MODEL` (local coding fallback)
+
+STT:
+- `DEEPGRAM_API_KEY`
+- `DEEPGRAM_MODEL` (default: `nova-2`)
+- `WHISPER_MODEL_SIZE` (default: `small`)
+- `WHISPER_MODEL_PATH` (optional custom path)
+- `WHISPER_ALLOW_DOWNLOAD` (default: false; set true only if you want runtime model download)
+
+TTS:
+- `EDGE_TTS_VOICE`, `EDGE_TTS_RATE`, `EDGE_TTS_PITCH`, `EDGE_TTS_VOLUME`
+- `PIPER_MODEL_PATH`
+
+## 5. Provider fallback order used by this project
+
+- LLM (general chat): `Groq -> OpenRouter -> Ollama`
+- LLM (coding requests): `GROQ_CODE_MODEL -> OPENROUTER_CODE_MODEL -> OLLAMA_CODE_MODEL`
+- STT: `Deepgram -> local Faster-Whisper`
+- TTS: `Edge-TTS -> Piper -> pyttsx3`
 
 ## Run
 
@@ -270,6 +350,19 @@ Status queries:
 
 - `@/path/to/project fix auth bug in login flow`
 - `@/new_project create a FastAPI project with auth and sqlite`
+
+### Does `@/project` switch to a coding model?
+
+Yes.
+
+When the action resolves to `project_code`, code generation paths use the coding-model method (`generate_code`) instead of general chat generation.
+
+Actual routing:
+- Cloud coding primary: `GROQ_CODE_MODEL`
+- Cloud coding secondary: `OPENROUTER_CODE_MODEL`
+- Local coding fallback: `OLLAMA_CODE_MODEL`
+
+If no coding model env vars are set, each provider falls back to its general model value.
 
 ## Linux Command Coverage
 
