@@ -10,6 +10,7 @@ setup(
         "sounddevice",
         "torch",
         "requests",
+        "yt-dlp",
         "edge-tts",
         "playsound==1.2.2",
         "pyttsx3",
@@ -20,6 +21,8 @@ setup(
         "pyyaml",
         "scipy",
         "piper-tts",
+        'pycaw; platform_system == "Windows"',
+        'comtypes; platform_system == "Windows"',
         'pywin32; platform_system == "Windows"',
     ],
     entry_points={

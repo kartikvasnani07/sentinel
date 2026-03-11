@@ -1,18 +1,28 @@
+# Core runtime
 faster-whisper
 vosk
 sounddevice
 torch
 requests
-yt-dlp
-edge-tts
-playsound==1.2.2
-pyttsx3
-rich
-textual
 keyboard
 numpy
 pyyaml
 scipy
+
+# Media / web helpers
+yt-dlp
+
+# Text-to-speech stack
+edge-tts
+playsound==1.2.2
+pyttsx3
 piper-tts
+
+# Terminal UI
+rich
+textual
+
+# Windows-only integrations
 pycaw; platform_system == "Windows"
+comtypes; platform_system == "Windows"
 pywin32; platform_system == "Windows"
