@@ -16,6 +16,10 @@ class IntentEngine:
         "open_application",
         "open_path",
         "close_application",
+        "close_all_apps",
+        "list_processes",
+        "kill_process",
+        "run_terminal_command",
         "list_directory",
         "create_file",
         "create_folder",
@@ -56,6 +60,9 @@ class IntentEngine:
         "change_voice",
         "set_autostart",
         "set_wake_response",
+        "set_wake_sensitivity",
+        "set_wave_display",
+        "set_bubble_display",
         "enter_text_mode",
         "project_code",
     }
@@ -151,6 +158,61 @@ class IntentEngine:
         "screen",
         "screensaver",
     }
+    SHELL_COMMAND_HINTS = {
+        "ls",
+        "cd",
+        "pwd",
+        "mkdir",
+        "rm",
+        "cp",
+        "mv",
+        "cat",
+        "grep",
+        "find",
+        "ps",
+        "top",
+        "kill",
+        "killall",
+        "chmod",
+        "chown",
+        "tar",
+        "gzip",
+        "gunzip",
+        "ping",
+        "whois",
+        "dig",
+        "wget",
+        "curl",
+        "ssh",
+        "scp",
+        "rsync",
+        "df",
+        "du",
+        "free",
+        "uname",
+        "uptime",
+        "whoami",
+        "history",
+        "alias",
+        "systemctl",
+        "journalctl",
+        "ip",
+        "ifconfig",
+        "netstat",
+        "ss",
+        "apt",
+        "apt-get",
+        "yum",
+        "dnf",
+        "snap",
+        "flatpak",
+        "sudo",
+        "man",
+        "touch",
+        "head",
+        "tail",
+        "locate",
+    }
     CONTROL_WORDS = {
         "password",
         "voice",
@@ -171,6 +233,16 @@ class IntentEngine:
         "call",
         "response",
         "reply",
+        "sensitivity",
+        "sensitvity",
+        "sensitive",
+        "wave",
+        "waves",
+        "ascii",
+        "bubble",
+        "process",
+        "processes",
+        "background",
     }
 
     def __init__(self, llm_engine):
@@ -204,6 +276,24 @@ class IntentEngine:
         tokens = self._correct_tokens(self._tokenize(normalized))
         action = self._detect_action(original, normalized, tokens)
         current_context = context or {}
+        if action is None and current_context.get("last_project_root"):
+            if self._contains_phrase(
+                normalized,
+                {
+                    "in this project",
+                    "in the project",
+                    "in this codebase",
+                    "in the codebase",
+                    "for this project",
+                },
+            ) or (
+                self._contains_any(tokens, {"project", "codebase"})
+                and self._contains_any(
+                    tokens,
+                    self.ACTION_WORDS["modify"] | self.ACTION_WORDS["create"] | {"fix", "refactor", "rewrite"},
+                )
+            ):
+                action = "project_code"
         previous_application = str(current_context.get("last_application") or "").strip().lower()
         if action is None and previous_application.startswith("camera") and self._contains_any(
             tokens,
@@ -228,9 +318,21 @@ class IntentEngine:
         body = text[1:].strip()
         if not body:
             return {"intent": "conversation", "parameters": {"raw_text": text}}
-        parts = body.split(maxsplit=1)
-        project_path = parts[0].strip().strip("\"'")
-        instruction = parts[1].strip() if len(parts) > 1 else ""
+        if body.startswith(("/", "\\")):
+            body = body[1:].strip()
+        if body.startswith(("'", '"')):
+            quote = body[0]
+            end = body.find(quote, 1)
+            if end > 1:
+                project_path = body[1:end].strip().strip("\"'")
+                instruction = body[end + 1 :].strip()
+            else:
+                project_path = body.strip(quote).strip()
+                instruction = ""
+        else:
+            parts = body.split(maxsplit=1)
+            project_path = parts[0].strip().strip("\"'")
+            instruction = parts[1].strip() if len(parts) > 1 else ""
         return {
             "intent": "system_command",
             "action": "project_code",
@@ -304,6 +406,9 @@ class IntentEngine:
             ("control space", "ctrl space"),
             ("text interface", "text mode"),
             ("humour", "humor"),
+            ("sensitvity", "sensitivity"),
+            ("sensivity", "sensitivity"),
+            ("diable", "disable"),
             ("forward slash", "/"),
             (" slash ", "/"),
             (" dot ", "."),
@@ -379,8 +484,78 @@ class IntentEngine:
         return False
 
     def _detect_action(self, text, normalized, tokens):
+        if re.search(r"\b(?:run|execute)\s+(?:the\s+)?(?:terminal|shell)?\s*command\b", normalized):
+            return "run_terminal_command"
         scores = defaultdict(int)
         token_set = set(tokens)
+        linux_cli_terms = {
+            "uname",
+            "whoami",
+            "uptime",
+            "cal",
+            "date",
+            "finger",
+            "man",
+            "whereis",
+            "which",
+            "ifconfig",
+            "netstat",
+            "ss",
+            "traceroute",
+            "mtr",
+            "whois",
+            "dig",
+            "wget",
+            "scp",
+            "rsync",
+            "locate",
+            "grep",
+            "sed",
+            "awk",
+            "cut",
+            "paste",
+            "tar",
+            "gzip",
+            "gunzip",
+            "zip",
+            "unzip",
+            "chmod",
+            "chown",
+            "ln",
+            "nohup",
+            "jobs",
+            "bg",
+            "fg",
+            "journalctl",
+            "systemctl",
+            "vmstat",
+            "lscpu",
+            "lsblk",
+            "free",
+            "df",
+            "du",
+        }
+        linux_nl_phrases = {
+            "current date and time",
+            "show this month calendar",
+            "who is online",
+            "kernel information",
+            "cpu information",
+            "memory information",
+            "disk usage",
+            "directory space usage",
+            "manual for",
+            "show routing table",
+            "network interfaces",
+            "listening ports",
+            "reverse lookup",
+            "show load averages",
+            "virtual memory statistics",
+            "download file",
+            "continue download",
+            "search recursively",
+            "process tree",
+        }
         app_phrase_present = self._contains_phrase(
             normalized,
             {"vlc media player", "visual studio code", "file explorer", "camera app"},
@@ -412,6 +587,10 @@ class IntentEngine:
             scores["open_application"] += 15
         if self._contains_any(tokens, {"record", "recording", "video"}) and self._contains_any(tokens, {"start", "begin", "record"}):
             scores["open_application"] += 14
+        if self._contains_phrase(normalized, linux_nl_phrases):
+            scores["run_terminal_command"] += 13
+        if self._contains_any(tokens, linux_cli_terms):
+            scores["run_terminal_command"] += 9
 
         if normalized in {
             "stop",
@@ -435,6 +614,7 @@ class IntentEngine:
             self._contains_any(tokens, {"kill", "end", "terminate", "shutdown"})
             and len(token_set) <= 3
             and not self._contains_any(tokens, self.APP_WORDS | {"app", "application", "browser"})
+            and not self._contains_any(tokens, {"process", "processes", "pid"})
         ):
             scores["stop_assistant"] += 20
         if self._contains_any(tokens, {"undo", "revert"}) and (
@@ -488,6 +668,8 @@ class IntentEngine:
                     scores["change_voice"] += 4
         if self._contains_phrase(normalized, {"voice model setup", "voice model settings", "voice model configuration", "voice model cofiguration", "start voice model setup"}):
             scores["change_voice"] += 14
+        if normalized in {"text mode", "open text mode", "switch to text mode", "enable text mode"}:
+            scores["enter_text_mode"] += 18
         if "text" in token_set and "mode" in token_set and self._contains_any(tokens, self.ACTION_WORDS["switch"] | {"open"}):
             scores["enter_text_mode"] += 14
         if self._contains_any(tokens, {"autostart", "startup", "login"}) and self._contains_any(tokens, self.ACTION_WORDS["switch"]):
@@ -497,6 +679,26 @@ class IntentEngine:
             {"response", "reply", "ack", "acknowledgement", "acknowledgment"},
         ) and self._contains_any(tokens, self.ACTION_WORDS["switch"] | {"on", "off"}):
             scores["set_wake_response"] += 14
+        if self._contains_any(tokens, {"wave", "waves", "ascii"}) and self._contains_any(
+            tokens,
+            self.ACTION_WORDS["switch"] | {"on", "off"},
+        ) and not self._contains_any(tokens, {"status", "state", "check", "current", "what"}):
+            scores["set_wave_display"] += 15
+        if "bubble" in token_set and self._contains_any(
+            tokens,
+            self.ACTION_WORDS["switch"] | {"on", "off", "interface"},
+        ) and not self._contains_any(tokens, {"status", "state", "check", "current", "what"}):
+            scores["set_bubble_display"] += 16
+        if self._contains_any(tokens, {"wake", "summon", "call"}) and self._contains_any(
+            tokens,
+            {"sensitivity", "sensitvity", "sensitive"},
+        ) and (
+            self._contains_any(tokens, self.ACTION_WORDS["switch"] | {"increase", "decrease", "reduce"})
+            or "percent" in token_set
+            or bool(re.search(r"\d{1,3}\s*(?:percent|%)", normalized))
+            or "to" in token_set
+        ):
+            scores["set_wake_sensitivity"] += 16
 
         if self._contains_any(tokens, {"shutdown", "power"}) or self._contains_phrase(normalized, {"turn off my computer", "turn off device"}):
             scores["shutdown_system"] += 14
@@ -505,32 +707,79 @@ class IntentEngine:
         if self._contains_any(tokens, {"sleep", "suspend"}):
             scores["sleep_system"] += 14
 
-        if "brightness" in token_set and (self._contains_any(tokens, self.ACTION_WORDS["switch"]) or "percent" in token_set):
-            scores["set_brightness"] += 13
-        if self._contains_any(tokens, {"status", "state", "check"}) and self._contains_any(
-            tokens,
-            self.SETTING_WORDS | {"vpn", "display", "screen", "screensaver"},
+        numeric_or_word_target = self._extract_percentage_value(normalized) is not None
+        brightness_control_words = {"increase", "decrease", "reduce", "raise", "lower", "dim", "brighter", "on", "off"}
+        if "brightness" in token_set and (
+            self._contains_any(tokens, brightness_control_words)
+            or numeric_or_word_target
         ):
+            scores["set_brightness"] += 13
+        setting_tokens = self.SETTING_WORDS | {
+            "vpn",
+            "display",
+            "screen",
+            "screensaver",
+            "wave",
+            "waves",
+            "ascii",
+            "bubble",
+            "wake",
+            "summon",
+            "call",
+            "response",
+            "model",
+            "preset",
+            "sensitivity",
+            "sensitvity",
+            "voice",
+        }
+        status_words = {"status", "state", "check"}
+        question_words = {"what", "whats", "current", "currently", "now", "right", "percentage", "level", "value"}
+        has_numeric_target = bool(re.search(r"\d{1,3}\s*(?:percent|%)", normalized))
+        asks_setting_status = (
+            self._contains_any(tokens, setting_tokens)
+            and (
+                self._contains_any(tokens, status_words)
+                or (
+                    self._contains_any(tokens, question_words)
+                    and not has_numeric_target
+                )
+            )
+        )
+        if asks_setting_status:
             scores["get_setting_status"] += 14
         if self._contains_any(tokens, {"settings", "setting", "panel"}) and self._contains_any(
             tokens,
             self.SETTING_WORDS | {"vpn", "display", "screen", "screensaver"},
         ) and self._contains_any(tokens, self.ACTION_WORDS["open"] | {"show"}):
             scores["open_setting_panel"] += 13
+        volume_control_words = {
+            "up",
+            "down",
+            "increase",
+            "decrease",
+            "reduce",
+            "raise",
+            "lower",
+            "louder",
+            "quieter",
+            "mute",
+            "unmute",
+            "on",
+            "off",
+            "disable",
+            "enable",
+            "activate",
+            "deactivate",
+            "turn",
+        }
         if self._contains_any(tokens, {"sound", "volume", "mute", "unmute"}) and (
-            self._contains_any(
-                tokens,
-                self.ACTION_WORDS["switch"] | {"up", "down", "increase", "decrease", "reduce", "raise", "lower", "louder", "quieter", "mute", "unmute"},
-            )
-            or "percent" in token_set
+            self._contains_any(tokens, volume_control_words) or numeric_or_word_target
         ):
             scores["set_volume"] += 15
+        microphone_control_words = volume_control_words
         if self._contains_any(tokens, {"microphone", "mic"}) and (
-            self._contains_any(
-                tokens,
-                self.ACTION_WORDS["switch"] | {"up", "down", "increase", "decrease", "reduce", "raise", "lower", "louder", "quieter", "mute", "unmute"},
-            )
-            or "percent" in token_set
+            self._contains_any(tokens, microphone_control_words) or numeric_or_word_target
         ):
             scores["set_microphone"] += 15
         if "wifi" in token_set and self._contains_any(tokens, self.ACTION_WORDS["switch"] | {"on", "off"}):
@@ -580,8 +829,16 @@ class IntentEngine:
             scores["project_code"] += 15
 
         media_verbs = {"play", "open", "run", "start"}
-        media_context = {"music", "song", "video", "spotify", "youtube", "channel", "youtube_music"}
-        if self._contains_any(tokens, media_verbs) and self._contains_any(tokens, media_context) and not self._is_file_context(normalized, tokens):
+        media_nouns = {"music", "song", "video", "track", "playlist", "album"}
+        media_platforms = {"spotify", "youtube", "youtube_music"}
+        has_media_noun = self._contains_any(tokens, media_nouns)
+        has_media_platform = self._contains_any(tokens, media_platforms)
+        if (
+            self._contains_any(tokens, media_verbs)
+            and has_media_noun
+            and (has_media_platform or "channel" in token_set)
+            and not self._is_file_context(normalized, tokens)
+        ):
             scores["play_music"] += 16
         if self._contains_any(tokens, self.ACTION_WORDS["play"]) and (self._contains_any(tokens, {"music", "song", "spotify", "youtube"}) or len(tokens) > 1):
             scores["play_music"] += 13
@@ -592,6 +849,28 @@ class IntentEngine:
 
         if self._contains_any(tokens, self.ACTION_WORDS["close"]) and (self._contains_any(tokens, self.APP_WORDS | {"app", "application", "browser"}) or self._refers_to_previous_target(tokens)):
             scores["close_application"] += 12
+        if self._contains_any(tokens, self.ACTION_WORDS["close"] | {"kill", "terminate"}) and self._contains_any(
+            tokens,
+            {"all", "apps", "applications", "windows", "tabs"},
+        ):
+            scores["close_all_apps"] += 18
+        if self._contains_any(tokens, {"process", "processes", "background"}) and self._contains_any(
+            tokens,
+            {"list", "show", "what", "running", "current", "status"},
+        ):
+            scores["list_processes"] += 16
+        if self._contains_any(tokens, {"process", "processes", "background"}) and len(token_set) <= 3:
+            scores["list_processes"] += 14
+        if self._contains_any(tokens, self.ACTION_WORDS["close"] | {"kill", "terminate"}) and (
+            "process" in token_set or bool(re.search(r"\bpid\b", normalized))
+        ):
+            scores["kill_process"] += 24
+        if tokens:
+            first = tokens[0]
+            if first in self.SHELL_COMMAND_HINTS and (
+                len(tokens) > 1 or any(flag in normalized for flag in {" -", " --", "|", ">", "<"})
+            ):
+                scores["run_terminal_command"] += 13
 
         if self._contains_any(tokens, self.ACTION_WORDS["open"]):
             file_open_request = self._is_file_context(normalized, tokens) or self._is_folder_context(tokens)
@@ -628,16 +907,17 @@ class IntentEngine:
         params = {"raw_text": text}
         lowered = normalized.lower()
 
-        if action in {"set_brightness", "set_humor", "set_voice_auth", "set_volume", "set_microphone"}:
-            match = re.search(r"(\d{1,3})\s*(?:percent)?", lowered)
-            if match:
-                value = max(0, min(100, int(match.group(1))))
+        if action in {"set_brightness", "set_humor", "set_voice_auth", "set_volume", "set_microphone", "set_wake_sensitivity"}:
+            value = self._extract_percentage_value(lowered)
+            if value is not None:
                 if action == "set_brightness":
                     params["percent"] = value
                 elif action in {"set_volume", "set_microphone"}:
                     params["percent"] = value
                 elif action == "set_humor":
                     params["level"] = value
+                elif action == "set_wake_sensitivity":
+                    params["percent"] = value
                 else:
                     params["threshold"] = value
         if action == "set_brightness":
@@ -655,19 +935,46 @@ class IntentEngine:
             elif any(word in lowered for word in ("on", "enable", "activate", "unmute")):
                 params["on"] = True
 
-        if action in {"set_wifi", "set_bluetooth", "set_airplane_mode", "set_energy_saver", "set_night_light", "set_autostart", "set_wake_response"}:
+        if action in {"set_wifi", "set_bluetooth", "set_airplane_mode", "set_energy_saver", "set_night_light", "set_autostart", "set_wake_response", "set_wave_display", "set_bubble_display"}:
             params["on"] = not any(word in lowered for word in ("off", "disable", "deactivate"))
         if action == "set_voice_auth":
             if any(word in lowered for word in ("off", "disable", "deactivate")):
                 params["threshold"] = 0
             elif any(word in lowered for word in ("enable", "activate", "on")) and "threshold" not in params:
                 params["threshold"] = 50
+        if action == "set_wake_sensitivity":
+            if "percent" not in params:
+                if self._contains_any(tokens, {"increase", "raise"}):
+                    params["delta"] = +10
+                elif self._contains_any(tokens, {"decrease", "reduce", "lower"}):
+                    params["delta"] = -10
         if action == "change_language":
             match = re.search(r"\b(?:to|in)\s+([a-z]+)\b", lowered)
             if match:
                 params["language"] = match.group(1)
         if action in {"get_setting_status", "open_setting_panel"}:
             params["setting"] = self._extract_setting_name(lowered)
+        if action == "kill_process":
+            pid_match = re.search(r"\b(?:pid\s*)?(\d{2,9})\b", lowered)
+            if pid_match:
+                params["process_id"] = int(pid_match.group(1))
+            else:
+                process_match = re.search(
+                    r"\b(?:kill|close|terminate|stop|end)\s+(?:the\s+)?(?:process\s+)?([a-z0-9_. -]+)$",
+                    lowered,
+                )
+                if process_match:
+                    params["process"] = process_match.group(1).strip(" .")
+        if action == "run_terminal_command":
+            command_match = re.search(
+                r"\b(?:run|execute)\s+(?:the\s+)?(?:terminal|shell)?\s*command\s+(.+)$",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if command_match:
+                params["command"] = command_match.group(1).strip()
+            else:
+                params["command"] = text.strip()
         if action == "change_voice":
             for preset in VOICE_PRESETS:
                 if preset in tokens:
@@ -814,13 +1121,25 @@ class IntentEngine:
                 instruction = str(embedded["parameters"].get("instruction") or "").strip()
             if not project_path:
                 directory = self._extract_directory(text)
+                normalized_directory = self._normalize_query_text(directory or "")
+                if normalized_directory in {"this project", "the project", "this codebase", "the codebase", "project"}:
+                    directory = ""
                 target = self._extract_target_name(text)
+                normalized_target = self._normalize_query_text(target or "")
+                if normalized_target in {"this project", "the project", "this codebase", "the codebase", "project"}:
+                    target = ""
+                elif any(normalized_target.startswith(prefix) for prefix in {"this project ", "the project ", "this codebase ", "the codebase "}):
+                    target = ""
+                elif re.search(r"\b(?:add|update|change|modify|fix|create|build|generate)\b", normalized_target):
+                    target = ""
                 if self._contains_any(tokens, {"folder", "directory", "project"}):
                     project_path = directory or target
                 elif target and directory:
                     project_path = f"{directory}/{target}"
                 elif target:
                     project_path = target
+            if not project_path:
+                project_path = str(context.get("last_project_root") or "").strip()
             if not instruction:
                 update_match = re.search(
                     r"\b(?:to|so that|with)\s+(.+)$",
@@ -892,6 +1211,23 @@ class IntentEngine:
 
     def _extract_setting_name(self, text):
         phrases = [
+            "ascii waves",
+            "bubble interface",
+            "bubble",
+            "wave style",
+            "waves",
+            "wave",
+            "wake word sensitivity",
+            "wake sensitivity",
+            "wake word response",
+            "wake response",
+            "call response",
+            "summon response",
+            "voice model",
+            "voice preset",
+            "voice selection",
+            "voice authentication",
+            "voice auth",
             "airplane mode",
             "night light",
             "energy saver",
@@ -911,6 +1247,87 @@ class IntentEngine:
             if phrase in lowered:
                 return phrase
         return ""
+
+    def _parse_number_words(self, words):
+        units = {
+            "zero": 0,
+            "one": 1,
+            "two": 2,
+            "three": 3,
+            "four": 4,
+            "five": 5,
+            "six": 6,
+            "seven": 7,
+            "eight": 8,
+            "nine": 9,
+            "ten": 10,
+            "eleven": 11,
+            "twelve": 12,
+            "thirteen": 13,
+            "fourteen": 14,
+            "fifteen": 15,
+            "sixteen": 16,
+            "seventeen": 17,
+            "eighteen": 18,
+            "nineteen": 19,
+        }
+        tens = {
+            "twenty": 20,
+            "thirty": 30,
+            "forty": 40,
+            "fifty": 50,
+            "sixty": 60,
+            "seventy": 70,
+            "eighty": 80,
+            "ninety": 90,
+        }
+        if not words:
+            return None
+        total = 0
+        current = 0
+        consumed = False
+        for token in words:
+            if token in units:
+                current += units[token]
+                consumed = True
+            elif token in tens:
+                current += tens[token]
+                consumed = True
+            elif token == "hundred":
+                current = max(1, current) * 100
+                consumed = True
+            elif token in {"and", "-"}:
+                continue
+            else:
+                return None
+        if not consumed:
+            return None
+        total += current
+        return total
+
+    def _extract_percentage_value(self, text):
+        lowered = str(text or "").lower()
+        digit_match = re.search(r"\b(\d{1,3})\s*(?:percent|%)?\b", lowered)
+        if digit_match:
+            return max(0, min(100, int(digit_match.group(1))))
+
+        words_pattern = (
+            r"\b(zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|"
+            r"fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|"
+            r"sixty|seventy|eighty|ninety|hundred)(?:[\s-]+(?:and\s+)?"
+            r"(zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|"
+            r"fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|"
+            r"sixty|seventy|eighty|ninety|hundred))*\b"
+        )
+        match = re.search(words_pattern, lowered)
+        if not match:
+            return None
+        phrase = match.group(0).replace("-", " ")
+        words = [part for part in phrase.split() if part]
+        value = self._parse_number_words(words)
+        if value is None:
+            return None
+        return max(0, min(100, int(value)))
 
     def _extract_requested_name(self, text):
         patterns = [
@@ -972,7 +1389,7 @@ class IntentEngine:
 
     def _extract_directory(self, text):
         match = re.search(
-            r"\b(?:in|inside|under|at|from)\s+(?:the\s+)?([A-Za-z0-9_ ./\\:-]+?)(?=\s+\b(?:with|write|and|to|from|called|named|using|on|open|launch|run|start|read|delete|create|make|copy|move|rename|duplicate|list|show|display|update|modify|change|edit|fix|rewrite)\b|$)",
+            r"\b(?:in|inside|under|at|from)\s+(?:the\s+)?([A-Za-z0-9_ ./\\:-]+?)(?=\s+\b(?:with|write|and|to|from|called|named|using|on|open|launch|run|start|read|delete|create|make|copy|move|rename|duplicate|list|show|display|update|modify|change|edit|fix|rewrite|refactor|implement|add)\b|$)",
             text,
             flags=re.IGNORECASE,
         )

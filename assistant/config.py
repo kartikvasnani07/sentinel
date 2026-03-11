@@ -153,6 +153,9 @@ _DEFAULTS = {
     "assistant_name": "friday",
     "wake_variants": [],
     "wake_response_enabled": True,
+    "waves_enabled": True,
+    "ui_mode": "waves",
+    "wake_sensitivity": 65,
     "password_hash": "",
     "voice_auth_threshold": 0,
     "voice_sample_path": "",
@@ -226,6 +229,15 @@ class AssistantConfig:
             variants = []
         self._data["wake_variants"] = [str(item).strip().lower() for item in variants if str(item).strip()]
         self._data["wake_response_enabled"] = bool(self._data.get("wake_response_enabled", True))
+        self._data["waves_enabled"] = bool(self._data.get("waves_enabled", True))
+        ui_mode = str(self._data.get("ui_mode") or "waves").strip().lower()
+        if ui_mode not in {"waves", "bubble"}:
+            ui_mode = "waves"
+        self._data["ui_mode"] = ui_mode
+        self._data["wake_sensitivity"] = _clamp_percentage(
+            self._data.get("wake_sensitivity"),
+            _DEFAULTS["wake_sensitivity"],
+        )
 
         self._data["voice_auth_threshold"] = _clamp_percentage(
             self._data.get("voice_auth_threshold"),

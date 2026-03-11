@@ -37,6 +37,7 @@ class VoiceEngine:
         self.min_avg_logprob = self._parse_float_env("WHISPER_MIN_AVG_LOGPROB", -1.5)
         self.light_speaker_similarity = self._parse_float_env("SPEAKER_LIGHT_SIMILARITY", 0.36)
         self.strong_speaker_similarity = self._parse_float_env("SPEAKER_STRONG_SIMILARITY", 0.58)
+        self.verbose = self._parse_bool_env("ASSISTANT_VERBOSE_LOGS", False)
 
         self.model = None
         self.active_local_model = None
@@ -119,7 +120,8 @@ class VoiceEngine:
                         local_files_only=True,
                     )
                     self.active_local_model = candidate
-                    print(f"Loaded local Whisper model: {candidate}")
+                    if self.verbose:
+                        print(f"Loaded local Whisper model: {candidate}")
                     return True
                 except Exception as exc:
                     errors.append(f"{candidate} (local-only): {exc}")
@@ -134,7 +136,8 @@ class VoiceEngine:
                             local_files_only=False,
                         )
                         self.active_local_model = candidate
-                        print(f"Loaded Whisper model after download: {candidate}")
+                        if self.verbose:
+                            print(f"Loaded Whisper model after download: {candidate}")
                         return True
                     except Exception as exc:
                         errors.append(f"{candidate} (download): {exc}")
@@ -182,6 +185,7 @@ class VoiceEngine:
         speaker_reference=None,
         speaker_mode="none",
         on_speech_start=None,
+        on_audio_chunk=None,
     ):
         block_size = max(512, int(self.sample_rate * block_duration))
         pre_roll = deque(maxlen=max(1, int(preroll_duration / block_duration)))
@@ -204,7 +208,8 @@ class VoiceEngine:
                 chunk = prefill[index : index + block_size]
                 if len(chunk):
                     pre_roll.append(chunk.copy())
-                    energy_samples.append(self._chunk_energy(chunk))
+                    # Keep wake-word prefill for preroll continuity, but do not use it
+                    # for ambient calibration; otherwise thresholds can become too high.
 
         with sd.InputStream(
             samplerate=self.sample_rate,
@@ -218,6 +223,11 @@ class VoiceEngine:
                 audio = chunk.flatten()
                 wait_seconds += len(audio) / self.sample_rate
                 energy_samples.append(self._chunk_energy(audio))
+                if callable(on_audio_chunk):
+                    try:
+                        on_audio_chunk(energy_samples[-1])
+                    except Exception:
+                        pass
                 pre_roll.append(audio.copy())
 
             ambient = np.median(energy_samples) if energy_samples else 0.003
@@ -229,6 +239,11 @@ class VoiceEngine:
                 audio = chunk.flatten()
                 seconds = len(audio) / self.sample_rate
                 energy = self._chunk_energy(audio)
+                if callable(on_audio_chunk):
+                    try:
+                        on_audio_chunk(energy)
+                    except Exception:
+                        pass
                 total_seconds += seconds
 
                 if not speech_started:
@@ -241,6 +256,10 @@ class VoiceEngine:
                         if not speaker_ok and normalized_speaker_mode == "light":
                             # In light mode we eventually allow non-matching voices to avoid hard rejection.
                             speaker_ok = wait_seconds >= max(0.8, start_timeout * 0.55)
+                        elif not speaker_ok and normalized_speaker_mode == "strong":
+                            # During post-wake command capture, avoid hard lockout if similarity
+                            # remains unstable for too long in noisy conditions.
+                            speaker_ok = wait_seconds >= max(1.4, start_timeout * 0.75)
                         if speaker_ok:
                             speech_started = True
                             captured.extend(candidate_chunks)

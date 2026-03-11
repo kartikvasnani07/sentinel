@@ -5,6 +5,7 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import time
 import webbrowser
 from ctypes import POINTER, cast
@@ -259,6 +260,10 @@ class SystemActions:
             "open_application": self._open_application,
             "open_path": self._open_path,
             "close_application": self._close_application,
+            "close_all_apps": self._close_all_apps,
+            "list_processes": self._list_processes,
+            "kill_process": self._kill_process,
+            "run_terminal_command": self._run_terminal_command,
             "undo_command": self._undo_last_action,
             "redo_command": self._redo_last_action,
             "list_directory": self._list_directory,
@@ -470,6 +475,17 @@ class SystemActions:
             return f"Opened {spoken_target}."
         if action == "close_application":
             return f"Closed {spoken_target}."
+        if action == "close_all_apps":
+            return "Closed all open applications."
+        if action == "list_processes":
+            return "Listing running background processes."
+        if action == "kill_process":
+            process_id = params.get("process_id")
+            process_name = params.get("process")
+            target = process_id if process_id is not None else (process_name or spoken_target)
+            return f"Terminated process {target}."
+        if action == "run_terminal_command":
+            return "Terminal command executed."
         if action == "open_path":
             file_label = self._spoken_path_label(params)
             if params.get("application"):
@@ -1855,6 +1871,368 @@ $matches | Stop-Process -Force
         process_names = ", ".join(sorted(set(result.get("names") or [])))
         return f"Closed {requested}." if not process_names else f"Closed {requested} ({process_names})."
 
+    def _close_all_apps(self, params):
+        if self.is_windows:
+            script = r"""
+$excluded = @('python', 'python3', 'powershell', 'pwsh', 'cmd', 'conhost')
+$closed = @()
+Get-Process -ErrorAction SilentlyContinue | Where-Object {
+    $_.MainWindowHandle -ne 0 -and $_.ProcessName -and ($excluded -notcontains $_.ProcessName.ToLower())
+} | ForEach-Object {
+    try {
+        Stop-Process -Id $_.Id -Force -ErrorAction Stop
+        $closed += $_.ProcessName
+    } catch {}
+}
+$unique = $closed | Sort-Object -Unique
+if ($unique.Count -eq 0) {
+    'No open application windows were found.'
+} else {
+    'Closed applications: ' + ($unique -join ', ')
+}
+""".strip()
+            return self._powershell(script, timeout=30)
+
+        if shutil.which("wmctrl"):
+            output = self._run_process(["wmctrl", "-lp"], timeout=20)
+            pids = []
+            for line in output.splitlines():
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                pid_text = parts[2].strip()
+                if pid_text.isdigit():
+                    pid = int(pid_text)
+                    if pid > 0 and pid not in pids and pid != os.getpid():
+                        pids.append(pid)
+            if not pids:
+                return "No open application windows were found."
+            for pid in pids:
+                subprocess.run(["kill", "-15", str(pid)], capture_output=True, text=True, check=False)
+            return f"Closed {len(pids)} open application window processes."
+
+        # Fallback for Linux desktops without wmctrl: best effort against common GUI apps.
+        common = ["firefox", "chrome", "chromium", "code", "vlc", "spotify", "brave", "edge", "slack", "discord"]
+        closed = []
+        for name in common:
+            result = subprocess.run(["pkill", "-15", "-x", name], capture_output=True, text=True, check=False)
+            if result.returncode == 0:
+                closed.append(name)
+        if not closed:
+            return "No open application windows were found."
+        return "Closed applications: " + ", ".join(sorted(set(closed))) + "."
+
+    def _list_processes(self, params):
+        if self.is_windows:
+            script = r"""
+$rows = Get-Process -ErrorAction SilentlyContinue |
+    Sort-Object -Property CPU -Descending |
+    Select-Object -First 220 -Property Id, ProcessName, CPU, WorkingSet64
+$lines = @('PID`tProcess`tCPU(s)`tMemory(MB)')
+foreach ($row in $rows) {
+    $cpu = if ($row.CPU -eq $null) { 0 } else { [Math]::Round([double]$row.CPU, 2) }
+    $mem = [Math]::Round(([double]$row.WorkingSet64 / 1MB), 1)
+    $lines += ("{0}`t{1}`t{2}`t{3}" -f $row.Id, $row.ProcessName, $cpu, $mem)
+}
+$lines -join [Environment]::NewLine
+""".strip()
+            return self._powershell(script, timeout=25)
+
+        output = self._run_process(["ps", "-eo", "pid,comm,%cpu,%mem", "--sort=-%cpu"], timeout=20)
+        lines = output.splitlines()
+        if not lines:
+            return "No running processes were found."
+        return "\n".join(lines[:221])
+
+    def _kill_process(self, params):
+        process_id = params.get("process_id")
+        process_name = str(params.get("process") or "").strip()
+
+        if process_id is None and not process_name:
+            raise RuntimeError("No process id or process name was provided.")
+
+        if process_id is not None:
+            pid = int(process_id)
+            if self.is_windows:
+                self._run_process(["taskkill", "/PID", str(pid), "/F"], timeout=20)
+            else:
+                self._run_process(["kill", "-9", str(pid)], timeout=20)
+            return f"Terminated process {pid}."
+
+        # process-name termination
+        if self.is_windows:
+            normalized = self._normalize_app_name(process_name)
+            candidates = [process_name, normalized, normalized.replace(" ", "")]
+            tried = []
+            for candidate in candidates:
+                candidate = candidate.strip()
+                if not candidate:
+                    continue
+                image_name = candidate if candidate.lower().endswith(".exe") else f"{candidate}.exe"
+                if image_name.lower() in tried:
+                    continue
+                tried.append(image_name.lower())
+                result = subprocess.run(["taskkill", "/IM", image_name, "/F"], capture_output=True, text=True, check=False)
+                if result.returncode == 0:
+                    return f"Terminated process {process_name}."
+            raise RuntimeError(f"No running process matched {process_name}.")
+
+        if shutil.which("pkill"):
+            result = subprocess.run(["pkill", "-9", "-f", process_name], capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                raise RuntimeError(f"No running process matched {process_name}.")
+            return f"Terminated process {process_name}."
+        self._run_process(["killall", "-9", process_name], timeout=20)
+        return f"Terminated process {process_name}."
+
+    def _looks_like_shell_command(self, command):
+        text = str(command or "").strip()
+        if not text:
+            return False
+        first = text.split()[0].lower()
+        if first in {
+            "ls",
+            "cd",
+            "pwd",
+            "mkdir",
+            "rm",
+            "cp",
+            "mv",
+            "cat",
+            "less",
+            "head",
+            "tail",
+            "touch",
+            "find",
+            "locate",
+            "grep",
+            "sed",
+            "awk",
+            "cut",
+            "paste",
+            "sort",
+            "uniq",
+            "wc",
+            "ps",
+            "top",
+            "htop",
+            "kill",
+            "killall",
+            "jobs",
+            "bg",
+            "fg",
+            "nohup",
+            "uname",
+            "who",
+            "w",
+            "whoami",
+            "date",
+            "cal",
+            "uptime",
+            "lscpu",
+            "lsblk",
+            "free",
+            "df",
+            "du",
+            "ifconfig",
+            "ip",
+            "netstat",
+            "ss",
+            "ping",
+            "traceroute",
+            "mtr",
+            "scp",
+            "rsync",
+            "wget",
+            "curl",
+            "whois",
+            "dig",
+            "tar",
+            "gzip",
+            "gunzip",
+            "zip",
+            "unzip",
+            "chmod",
+            "chown",
+            "ln",
+            "man",
+            "journalctl",
+            "systemctl",
+            "sudo",
+            "apt",
+            "apt-get",
+            "yum",
+            "dnf",
+            "rpm",
+            "dpkg",
+            "./configure",
+            "make",
+            "exit",
+        }:
+            return True
+        return bool(re.search(r"[|><;&`]", text)) or text.startswith(("./", "/"))
+
+    def _extract_url_from_text(self, text):
+        match = re.search(r"(https?://\S+|www\.\S+)", str(text or ""), flags=re.IGNORECASE)
+        return match.group(1) if match else ""
+
+    def _map_natural_terminal_command(self, text):
+        normalized = self._normalize_query(text)
+        if not normalized:
+            return ""
+
+        if self.is_windows:
+            if normalized in {"date", "current date", "current date and time", "show current date and time"}:
+                return "powershell -NoProfile -Command Get-Date"
+            if "calendar" in normalized:
+                return "powershell -NoProfile -Command \"Get-Date -Format 'MMMM yyyy'\""
+            if "uptime" in normalized:
+                return "powershell -NoProfile -Command \"(Get-CimInstance Win32_OperatingSystem).LastBootUpTime\""
+            if "who am i" in normalized or "whoami" in normalized:
+                return "whoami"
+            if "who is online" in normalized:
+                return "query user"
+            if "kernel information" in normalized or "system information" in normalized:
+                return "systeminfo"
+            if "cpu information" in normalized:
+                return "wmic cpu get Name,NumberOfCores,MaxClockSpeed"
+            if "memory information" in normalized or "memory and swap usage" in normalized:
+                return "wmic OS get TotalVisibleMemorySize,FreePhysicalMemory /Value"
+            if "disk usage" in normalized and "directory" not in normalized:
+                return "wmic logicaldisk get size,freespace,caption"
+            if "network interfaces" in normalized:
+                return "ipconfig"
+            if "routing table" in normalized:
+                return "route print"
+            if "listening ports" in normalized:
+                return "netstat -ano"
+            if "reverse lookup" in normalized:
+                host = re.sub(r".*reverse lookup(?: for)?\s+", "", normalized).strip()
+                if host:
+                    return f"nslookup {host}"
+            if "process tree" in normalized or "show all running processes" in normalized:
+                return "powershell -NoProfile -Command \"Get-Process | Sort-Object CPU -Descending | Select-Object -First 120\""
+            if normalized.startswith("where is "):
+                subject = normalized.split("where is ", 1)[1].strip()
+                if subject:
+                    return f"where {subject}"
+            if normalized.startswith("which "):
+                subject = normalized.split("which ", 1)[1].strip()
+                if subject:
+                    return f"where {subject}"
+            return ""
+
+        if normalized in {"date", "current date", "current date and time", "show current date and time"}:
+            return "date"
+        if "calendar" in normalized:
+            return "cal"
+        if "uptime" in normalized:
+            return "uptime"
+        if "who am i" in normalized or "whoami" in normalized:
+            return "whoami"
+        if "who is online" in normalized:
+            return "w"
+        if "kernel information" in normalized or "system information" in normalized:
+            return "uname -a"
+        if "cpu information" in normalized:
+            return "cat /proc/cpuinfo"
+        if "memory information" in normalized:
+            return "cat /proc/meminfo"
+        if "disk usage" in normalized and "directory" not in normalized:
+            return "df -h"
+        if "directory space usage" in normalized or "folder size" in normalized:
+            return "du -h"
+        if "memory and swap usage" in normalized or normalized == "show memory usage":
+            return "free -h"
+        if "routing table" in normalized:
+            return "ip route show"
+        if "network interfaces" in normalized:
+            return "ip addr show"
+        if "listening ports" in normalized:
+            return "ss -tuln"
+        if "reverse lookup" in normalized:
+            host = re.sub(r".*reverse lookup(?: for)?\s+", "", normalized).strip()
+            if host:
+                return f"dig -x {host}"
+        if "load averages" in normalized:
+            return "uptime"
+        if "virtual memory statistics" in normalized:
+            return "vmstat"
+        if normalized.startswith("manual for "):
+            subject = normalized.split("manual for ", 1)[1].strip()
+            if subject:
+                return f"man {subject}"
+        if normalized.startswith("where is "):
+            subject = normalized.split("where is ", 1)[1].strip()
+            if subject:
+                return f"whereis {subject}"
+        if normalized.startswith("which "):
+            subject = normalized.split("which ", 1)[1].strip()
+            if subject:
+                return f"which {subject}"
+        if "download" in normalized:
+            url = self._extract_url_from_text(text)
+            if url:
+                if "continue" in normalized:
+                    return f"wget -c {url}"
+                return f"wget {url}"
+        if "process tree" in normalized:
+            return "ps -ef --forest"
+        if "show all running processes" in normalized:
+            return "ps aux"
+        if normalized in {"active processes", "show active processes"}:
+            return "ps"
+        return ""
+
+    def _run_terminal_command(self, params):
+        command = str(params.get("command") or params.get("raw_text") or "").strip()
+        if not command:
+            raise RuntimeError("No terminal command was provided.")
+
+        command = re.sub(
+            r"^\s*(?:run|execute)\s+(?:the\s+)?(?:terminal|shell)?\s*command\s+",
+            "",
+            command,
+            flags=re.IGNORECASE,
+        ).strip()
+        if not command:
+            raise RuntimeError("No terminal command was provided.")
+        if not self._looks_like_shell_command(command):
+            mapped = self._map_natural_terminal_command(command)
+            if mapped:
+                command = mapped
+
+        cd_match = re.match(r"^cd\s+(.+)$", command, flags=re.IGNORECASE)
+        if cd_match:
+            destination = cd_match.group(1).strip().strip("\"'")
+            target = self._path_from_fragment(destination)
+            if target is None:
+                target = (Path.cwd() / destination).resolve()
+            if not target.exists() or not target.is_dir():
+                raise RuntimeError(f"Directory not found: {destination}")
+            os.chdir(target)
+            self.base_dir = target.resolve()
+            return f"Changed directory to {self.base_dir}."
+
+        completed = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        output = (completed.stdout or "").strip()
+        errors = (completed.stderr or "").strip()
+        body = output or errors
+        if completed.returncode != 0:
+            raise RuntimeError(body or f"Command failed with exit code {completed.returncode}")
+        if not body:
+            return "Command executed successfully with no output."
+        if len(body) > 16000:
+            body = body[:16000] + "\n... (truncated)"
+        return body
+
     def _list_directory(self, params):
         directory = self._resolve_directory(params)
         if not directory.exists():
@@ -2302,17 +2680,33 @@ $matches | Stop-Process -Force
         return f"Duplicated {source} to {destination}."
 
     def _shutdown_system(self, params):
+        try:
+            self._close_all_apps({})
+        except Exception:
+            pass
+        time.sleep(0.6)
         if self.is_windows:
             os.system("shutdown /s /t 0")
         else:
-            os.system("shutdown -h now")
+            if shutil.which("systemctl"):
+                os.system("systemctl poweroff")
+            else:
+                os.system("shutdown -h now")
         return "Shutting down the device."
 
     def _restart_system(self, params):
+        try:
+            self._close_all_apps({})
+        except Exception:
+            pass
+        time.sleep(0.6)
         if self.is_windows:
             os.system("shutdown /r /t 0")
         else:
-            os.system("shutdown -r now")
+            if shutil.which("systemctl"):
+                os.system("systemctl reboot")
+            else:
+                os.system("shutdown -r now")
         return "Restarting the device."
 
     def _sleep_system(self, params):
@@ -2548,6 +2942,20 @@ $finalMuted = [AudioUtil.AudioManager]::GetMute($flow)
                 self._run_process(command)
                 direction_text = "up" if delta > 0 else "down"
                 return f"{label} adjusted {direction_text}."
+        if shutil.which("amixer"):
+            channel = "Capture" if flow else "Master"
+            if mute_action == "mute":
+                self._run_process(["amixer", "set", channel, "mute"], timeout=20)
+                return f"{label} turned off."
+            if mute_action == "unmute":
+                self._run_process(["amixer", "set", channel, "unmute"], timeout=20)
+            if percent is not None:
+                self._run_process(["amixer", "set", channel, f"{percent}%"], timeout=20)
+                return f"{label} set to {percent} percent."
+            if delta is not None:
+                sign = "+" if delta > 0 else "-"
+                self._run_process(["amixer", "set", channel, f"{abs(int(delta * 100))}%{sign}"], timeout=20)
+                return f"{label} adjusted {'up' if delta > 0 else 'down'}."
         raise RuntimeError(f"{label} control is not available on this system.")
 
     def _set_volume(self, params):
@@ -2573,6 +2981,13 @@ $finalMuted = [AudioUtil.AudioManager]::GetMute($flow)
             "display": "display",
             "screen saver": "screen saver",
             "screensaver": "screen saver",
+            "wake word sensitivity": "wake word sensitivity",
+            "wake sensitivity": "wake word sensitivity",
+            "wake response": "wake response",
+            "wave style": "wave style",
+            "ascii waves": "wave style",
+            "voice model": "voice model",
+            "voice preset": "voice model",
         }
         for key, target in aliases.items():
             if key in lowered:
@@ -2613,7 +3028,24 @@ $devices | ConvertTo-Json -Depth 4 -Compress
     def _open_setting_panel(self, params):
         setting = self._normalize_setting_name(params.get("setting") or params.get("raw_text") or "")
         if not self.is_windows:
-            raise RuntimeError("Settings panels are only implemented on Windows in this build.")
+            if shutil.which("gnome-control-center"):
+                panel_map = {
+                    "wifi": "wifi",
+                    "bluetooth": "bluetooth",
+                    "airplane mode": "network",
+                    "brightness": "display",
+                    "volume": "sound",
+                    "microphone": "sound",
+                    "energy saver": "power",
+                    "night light": "display",
+                    "vpn": "network",
+                    "display": "display",
+                    "screen saver": "privacy",
+                }
+                panel = panel_map.get(setting) or "privacy"
+                subprocess.Popen(["gnome-control-center", panel])
+                return f"Opened {setting or panel} settings."
+            raise RuntimeError("Settings panel integration is not available on this Linux desktop.")
         uri_map = {
             "wifi": "ms-settings:network-wifi",
             "bluetooth": "ms-settings:bluetooth",
@@ -2638,55 +3070,154 @@ $devices | ConvertTo-Json -Depth 4 -Compress
     def _get_setting_status(self, params):
         setting = self._normalize_setting_name(params.get("setting") or params.get("raw_text") or "")
         if setting == "wifi":
-            output = self._run_process(["netsh", "interface", "show", "interface"], timeout=20)
-            for line in output.splitlines():
-                if "Wi-Fi" in line or "Wireless" in line:
-                    return f"Wi-Fi status: {'enabled' if 'Enabled' in line else 'disabled'}."
+            if self.is_windows:
+                output = self._run_process(["netsh", "interface", "show", "interface"], timeout=20)
+                for line in output.splitlines():
+                    if "Wi-Fi" in line or "Wireless" in line:
+                        return f"Wi-Fi status: {'enabled' if 'Enabled' in line else 'disabled'}."
+                return "Wi-Fi status is unavailable."
+            if shutil.which("nmcli"):
+                output = self._run_process(["nmcli", "radio", "wifi"], timeout=20).strip().lower()
+                return f"Wi-Fi status: {'enabled' if output == 'enabled' else 'disabled'}."
             return "Wi-Fi status is unavailable."
         if setting == "bluetooth":
-            adapters = self._windows_bluetooth_adapters()
-            if not adapters:
-                return "Bluetooth status is unavailable."
-            active = next((item for item in adapters if str(item.get("Status") or "").strip().lower() == "ok"), None)
-            if active:
-                return f"Bluetooth is on ({active.get('FriendlyName')})."
-            name = str(adapters[0].get("FriendlyName") or "adapter").strip()
-            return f"Bluetooth is off ({name})."
+            if self.is_windows:
+                adapters = self._windows_bluetooth_adapters()
+                if not adapters:
+                    return "Bluetooth status is unavailable."
+                active = next((item for item in adapters if str(item.get("Status") or "").strip().lower() == "ok"), None)
+                if active:
+                    return f"Bluetooth is on ({active.get('FriendlyName')})."
+                name = str(adapters[0].get("FriendlyName") or "adapter").strip()
+                return f"Bluetooth is off ({name})."
+            if shutil.which("nmcli"):
+                output = self._run_process(["nmcli", "radio", "bluetooth"], timeout=20).strip().lower()
+                return f"Bluetooth status: {'enabled' if output == 'enabled' else 'disabled'}."
+            if shutil.which("rfkill"):
+                output = self._run_process(["rfkill", "list", "bluetooth"], timeout=20).lower()
+                blocked = "soft blocked: yes" in output or "hard blocked: yes" in output
+                return f"Bluetooth status: {'disabled' if blocked else 'enabled'}."
+            return "Bluetooth status is unavailable."
         if setting == "airplane mode":
-            output = self._run_process(["netsh", "interface", "show", "interface"], timeout=20)
-            enabled_count = sum(1 for line in output.splitlines() if "Enabled" in line and ("Wi-Fi" in line or "Bluetooth" in line or "Wireless" in line))
-            return "Airplane mode appears to be on." if enabled_count == 0 else "Airplane mode appears to be off."
+            if self.is_windows:
+                output = self._run_process(["netsh", "interface", "show", "interface"], timeout=20)
+                enabled_count = sum(1 for line in output.splitlines() if "Enabled" in line and ("Wi-Fi" in line or "Bluetooth" in line or "Wireless" in line))
+                return "Airplane mode appears to be on." if enabled_count == 0 else "Airplane mode appears to be off."
+            if shutil.which("nmcli"):
+                output = self._run_process(["nmcli", "radio", "all"], timeout=20).lower()
+                enabled = sum(1 for line in output.splitlines() if "enabled" in line)
+                return "Airplane mode appears to be off." if enabled > 0 else "Airplane mode appears to be on."
+            return "Airplane mode status is unavailable."
         if setting == "brightness":
-            script = "(Get-WmiObject -Namespace root\\wmi -Class WmiMonitorBrightness | Select-Object -First 1 -ExpandProperty CurrentBrightness)"
-            value = self._powershell(script)
-            return f"Brightness is at {value.strip()} percent."
+            if self.is_windows:
+                script = "(Get-WmiObject -Namespace root\\wmi -Class WmiMonitorBrightness | Select-Object -First 1 -ExpandProperty CurrentBrightness)"
+                value = self._powershell(script)
+                return f"Brightness is at {value.strip()} percent."
+            if shutil.which("brightnessctl"):
+                try:
+                    value = int(float(self._run_process(["brightnessctl", "g"], timeout=20).strip()))
+                    maximum = int(float(self._run_process(["brightnessctl", "m"], timeout=20).strip()))
+                    percent = int(round((value / max(1, maximum)) * 100))
+                    return f"Brightness is at {percent} percent."
+                except Exception:
+                    pass
+            if shutil.which("xbacklight"):
+                value = self._run_process(["xbacklight", "-get"], timeout=20).strip()
+                return f"Brightness is at {int(float(value))} percent."
+            return "Brightness status is unavailable."
         if setting == "volume":
-            return self._windows_audio_status(0, "System sound")
+            if self.is_windows:
+                return self._windows_audio_status(0, "System sound")
+            if shutil.which("pactl"):
+                mute_state = self._run_process(["pactl", "get-sink-mute", "@DEFAULT_SINK@"], timeout=20).lower()
+                if "yes" in mute_state:
+                    return "System sound is off."
+                vol = self._run_process(["pactl", "get-sink-volume", "@DEFAULT_SINK@"], timeout=20)
+                match = re.search(r"(\d+)%", vol)
+                return f"System sound is at {match.group(1)} percent." if match else "System sound status is unavailable."
+            if shutil.which("amixer"):
+                output = self._run_process(["amixer", "get", "Master"], timeout=20)
+                match = re.search(r"\[(\d{1,3})%\]", output)
+                muted = "[off]" in output.lower()
+                if muted:
+                    return "System sound is off."
+                return f"System sound is at {match.group(1)} percent." if match else "System sound status is unavailable."
+            return "System sound status is unavailable."
         if setting == "microphone":
-            return self._windows_audio_status(1, "Microphone")
+            if self.is_windows:
+                return self._windows_audio_status(1, "Microphone")
+            if shutil.which("pactl"):
+                mute_state = self._run_process(["pactl", "get-source-mute", "@DEFAULT_SOURCE@"], timeout=20).lower()
+                if "yes" in mute_state:
+                    return "Microphone is off."
+                vol = self._run_process(["pactl", "get-source-volume", "@DEFAULT_SOURCE@"], timeout=20)
+                match = re.search(r"(\d+)%", vol)
+                return f"Microphone is at {match.group(1)} percent." if match else "Microphone status is unavailable."
+            if shutil.which("amixer"):
+                output = self._run_process(["amixer", "get", "Capture"], timeout=20)
+                match = re.search(r"\[(\d{1,3})%\]", output)
+                muted = "[off]" in output.lower()
+                if muted:
+                    return "Microphone is off."
+                return f"Microphone is at {match.group(1)} percent." if match else "Microphone status is unavailable."
+            return "Microphone status is unavailable."
         if setting == "energy saver":
-            output = self._run_process(["powercfg", "/getactivescheme"], timeout=20)
-            return "Energy saver is on." if self.POWER_SAVER_GUID.lower() in output.lower() else "Energy saver is off."
+            if self.is_windows:
+                output = self._run_process(["powercfg", "/getactivescheme"], timeout=20)
+                return "Energy saver is on." if self.POWER_SAVER_GUID.lower() in output.lower() else "Energy saver is off."
+            if shutil.which("powerprofilesctl"):
+                profile = self._run_process(["powerprofilesctl", "get"], timeout=20).strip().lower()
+                return "Energy saver is on." if profile == "power-saver" else "Energy saver is off."
+            return "Energy saver status is unavailable."
         if setting == "night light":
-            return "Night Light status is not directly available in this build."
+            if self.is_windows:
+                return "Night Light status is not directly available in this build."
+            if shutil.which("gsettings"):
+                value = self._run_process(
+                    ["gsettings", "get", "org.gnome.settings-daemon.plugins.color", "night-light-enabled"],
+                    timeout=20,
+                ).strip().lower()
+                return "Night light is on." if value == "true" else "Night light is off."
+            return "Night light status is unavailable."
         if setting == "vpn":
-            script = (
-                "$vpn = Get-VpnConnection -ErrorAction SilentlyContinue | Where-Object { $_.ConnectionStatus -eq 'Connected' } | "
-                "Select-Object -First 1 -ExpandProperty Name; "
-                "if ($vpn) { \"VPN is connected: $vpn.\" } else { 'VPN is not connected.' }"
-            )
-            return self._powershell(script)
+            if self.is_windows:
+                script = (
+                    "$vpn = Get-VpnConnection -ErrorAction SilentlyContinue | Where-Object { $_.ConnectionStatus -eq 'Connected' } | "
+                    "Select-Object -First 1 -ExpandProperty Name; "
+                    "if ($vpn) { \"VPN is connected: $vpn.\" } else { 'VPN is not connected.' }"
+                )
+                return self._powershell(script)
+            if shutil.which("nmcli"):
+                output = self._run_process(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show", "--active"], timeout=20)
+                vpn_lines = [line.split(":", 1)[0] for line in output.splitlines() if line.endswith(":vpn")]
+                if vpn_lines:
+                    return f"VPN is connected: {vpn_lines[0]}."
+                return "VPN is not connected."
+            return "VPN status is unavailable."
         if setting == "display":
-            script = (
-                "Add-Type -AssemblyName System.Windows.Forms; "
-                "$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; "
-                "\"Display resolution is $($bounds.Width) by $($bounds.Height).\""
-            )
-            return self._powershell(script)
+            if self.is_windows:
+                script = (
+                    "Add-Type -AssemblyName System.Windows.Forms; "
+                    "$bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; "
+                    "\"Display resolution is $($bounds.Width) by $($bounds.Height).\""
+                )
+                return self._powershell(script)
+            if shutil.which("xrandr"):
+                output = self._run_process(["xrandr"], timeout=20)
+                current = next((line for line in output.splitlines() if "*" in line), "")
+                if current:
+                    resolution = current.strip().split()[0]
+                    return f"Display resolution is {resolution}."
+            return "Display status is unavailable."
         if setting == "screen saver":
-            script = "(Get-ItemProperty -Path 'HKCU:\\Control Panel\\Desktop' -Name ScreenSaveActive).ScreenSaveActive"
-            value = self._powershell(script).strip()
-            return "Screen saver is on." if value == "1" else "Screen saver is off."
+            if self.is_windows:
+                script = "(Get-ItemProperty -Path 'HKCU:\\Control Panel\\Desktop' -Name ScreenSaveActive).ScreenSaveActive"
+                value = self._powershell(script).strip()
+                return "Screen saver is on." if value == "1" else "Screen saver is off."
+            if shutil.which("gsettings"):
+                value = self._run_process(["gsettings", "get", "org.gnome.desktop.screensaver", "lock-enabled"], timeout=20).strip().lower()
+                return "Screen saver is on." if value == "true" else "Screen saver is off."
+            return "Screen saver status is unavailable."
         raise RuntimeError(f"Status is not available for {setting or 'that setting'}.")
 
     def _wireless_interface_names(self):
@@ -2747,6 +3278,9 @@ $devices | ConvertTo-Json -Depth 4 -Compress
                     f"Opened Bluetooth settings. Details: {joined}"
                 )
             return f"Bluetooth turned {'on' if turn_on else 'off'}."
+        if shutil.which("nmcli"):
+            self._run_process(["nmcli", "radio", "bluetooth", "on" if turn_on else "off"], timeout=20)
+            return f"Bluetooth turned {'on' if turn_on else 'off'}."
         if shutil.which("rfkill"):
             self._run_process(["rfkill", "unblock" if turn_on else "block", "bluetooth"])
             return f"Bluetooth turned {'on' if turn_on else 'off'}."
@@ -2783,6 +3317,9 @@ $devices | ConvertTo-Json -Depth 4 -Compress
                 timeout=20,
             )
             return f"Energy saver turned {'on' if turn_on else 'off'}."
+        if shutil.which("powerprofilesctl"):
+            self._run_process(["powerprofilesctl", "set", "power-saver" if turn_on else "balanced"], timeout=20)
+            return f"Energy saver turned {'on' if turn_on else 'off'}."
         raise RuntimeError("Energy saver control is not available on this system.")
 
     def _set_night_light(self, params):
@@ -2790,6 +3327,18 @@ $devices | ConvertTo-Json -Depth 4 -Compress
         if self.is_windows:
             os.startfile("ms-settings:nightlight")
             return f"Opened Night Light settings to turn it {'on' if turn_on else 'off'}."
+        if shutil.which("gsettings"):
+            self._run_process(
+                [
+                    "gsettings",
+                    "set",
+                    "org.gnome.settings-daemon.plugins.color",
+                    "night-light-enabled",
+                    "true" if turn_on else "false",
+                ],
+                timeout=20,
+            )
+            return f"Night light turned {'on' if turn_on else 'off'}."
         raise RuntimeError("Night light control is not available on this system.")
 
     def _eject_drive(self, params):
@@ -2881,27 +3430,68 @@ $devices | ConvertTo-Json -Depth 4 -Compress
             raise RuntimeError("No project path was provided.")
 
         target = self._path_from_fragment(project_path)
+        if target is None and project_path:
+            target = (Path.cwd().resolve() / project_path.lstrip("/\\")).resolve()
         if target is None:
             raise RuntimeError("Could not resolve the project path.")
 
         create_request = any(word in instruction.lower() for word in {"create", "build", "scaffold", "generate"})
-        if (not target.exists() or target.name.lower() == "new_project") and create_request:
-            changes = self._scaffold_project(target, instruction)
-            self._push_project_undo_record(target, changes)
-            return self._format_project_change_report(target, instruction, changes)
+        if create_request:
+            project_root = self._resolve_project_creation_root(target, instruction, project_path)
+            changes = self._scaffold_project(project_root, instruction)
+            self._push_project_undo_record(project_root, changes)
+            self.session_context["last_project_root"] = str(project_root)
+            smoke_result = self._run_project_smoke_test(project_root)
+            return self._format_project_change_report(project_root, instruction, changes, smoke_result=smoke_result)
 
         if not target.exists():
             raise RuntimeError(f"Project path not found: {target}")
         if target.is_file():
             changes = self._apply_single_file_instruction(target, instruction)
             self._push_project_undo_record(target.parent, changes)
+            self.session_context["last_project_root"] = str(target.parent)
             return self._format_project_change_report(target.parent, instruction, changes)
         if not target.is_dir():
             raise RuntimeError(f"Project path is not a directory or file: {target}")
 
         changes = self._apply_project_instruction(target, instruction)
         self._push_project_undo_record(target, changes)
+        self.session_context["last_project_root"] = str(target)
         return self._format_project_change_report(target, instruction, changes)
+
+    def _resolve_project_creation_root(self, target, instruction, project_path):
+        target_path = Path(target).resolve()
+        path_token = str(project_path or "").strip().strip("\"'")
+        stripped_token = path_token.strip("/\\")
+        lowered_token = stripped_token.lower()
+
+        placeholder_tokens = {"new_project", "newproject", "project", "new-project"}
+        if lowered_token in placeholder_tokens:
+            base = target_path if target_path.exists() and target_path.is_dir() else Path.cwd().resolve()
+            if target_path.exists() and target_path.is_dir() and target_path.name.lower() in placeholder_tokens:
+                base = target_path
+            folder_name = self._derive_project_folder_name(instruction)
+            return (base / folder_name).resolve()
+
+        if target_path.exists() and target_path.is_dir():
+            return target_path
+        if target_path.suffix:
+            return target_path.parent
+        return target_path
+
+    def _derive_project_folder_name(self, instruction):
+        text = str(instruction or "").strip()
+        named_match = re.search(r"\b(?:named|called)\s+([a-z0-9 _-]{2,80})", text, flags=re.IGNORECASE)
+        if named_match:
+            value = named_match.group(1).strip(" .")
+        elif "fastapi" in text.lower():
+            value = "fastapi_auth_sqlite"
+        else:
+            words = re.findall(r"[a-z0-9]+", text.lower())
+            value = "_".join(words[:5]) if words else "project"
+        value = re.sub(r"[^a-zA-Z0-9_-]+", "_", value)
+        value = re.sub(r"_+", "_", value).strip("_")
+        return value or "project"
 
     def _push_project_undo_record(self, project_root, changes):
         if not changes:
@@ -2923,6 +3513,9 @@ $devices | ConvertTo-Json -Depth 4 -Compress
     def _scaffold_project(self, project_root, instruction):
         if "fastapi" in instruction.lower():
             return self._create_fastapi_project(project_root)
+        llm_changes = self._scaffold_project_with_llm(project_root, instruction)
+        if llm_changes:
+            return llm_changes
         return self._create_generic_project(project_root, instruction)
 
     def _create_generic_project(self, project_root, instruction):
@@ -3086,6 +3679,40 @@ $devices | ConvertTo-Json -Depth 4 -Compress
             changes.append(self._write_project_file(project_root, relative_path, content, mode="create", reason="FastAPI scaffold"))
         return changes
 
+    def _scaffold_project_with_llm(self, project_root, instruction):
+        if not self.llm:
+            return []
+        prompt = (
+            "Create a complete project scaffold from the user request.\n"
+            "Return only JSON with this exact format:\n"
+            '{"summary":"short summary","changes":[{"path":"relative/path.ext","mode":"create","reason":"why","content":"full file content"}]}\n'
+            "Rules:\n"
+            "- Include all folders/files required for a runnable scaffold.\n"
+            "- Use relative file paths.\n"
+            "- Do not include markdown fences.\n"
+            f"Project root: {project_root}\n"
+            f"User request: {instruction}\n"
+        )
+        try:
+            raw = self._generate_code_text(prompt)
+            payload = self._extract_json(raw)
+        except Exception:
+            return []
+        changes = []
+        for item in payload.get("changes", []):
+            relative_path = str(item.get("path") or "").strip().replace("\\", "/")
+            mode = str(item.get("mode") or "create").strip().lower()
+            if not relative_path or mode == "delete":
+                continue
+            content = str(item.get("content") or "")
+            reason = str(item.get("reason") or "project scaffold").strip()
+            if not content:
+                continue
+            changes.append(
+                self._write_project_file(project_root, relative_path, content, mode="create", reason=reason)
+            )
+        return changes
+
     def _apply_project_instruction(self, project_root, instruction):
         context = self._load_project_context(project_root)
         if not self.llm:
@@ -3102,7 +3729,7 @@ $devices | ConvertTo-Json -Depth 4 -Compress
             "Project files:\n"
             f"{context}\n"
         )
-        raw = self.llm.generate(prompt)
+        raw = self._generate_code_text(prompt)
         payload = self._extract_json(raw)
         changes = []
         for item in payload.get("changes", []):
@@ -3167,7 +3794,7 @@ $devices | ConvertTo-Json -Depth 4 -Compress
             "Current file content:\n"
             f"{before}\n"
         )
-        generated = str(self.llm.generate(prompt)).strip()
+        generated = str(self._generate_code_text(prompt)).strip()
         generated = re.sub(r"^```[a-zA-Z0-9_+-]*\s*", "", generated)
         generated = re.sub(r"\s*```$", "", generated)
         if not generated:
@@ -3233,14 +3860,19 @@ $devices | ConvertTo-Json -Depth 4 -Compress
             after_exists=True,
         )
 
-    def _format_project_change_report(self, project_root, instruction, changes):
+    def _format_project_change_report(self, project_root, instruction, changes, smoke_result=""):
         lines = [
             f"Project: {project_root}",
             f"Instruction: {instruction or 'No instruction provided.'}",
         ]
         if not changes:
             lines.append("No files were changed.")
+            if smoke_result:
+                lines.append(f"Validation: {smoke_result}")
             return "\n".join(lines)
+
+        if smoke_result:
+            lines.append(f"Validation: {smoke_result}")
 
         for change in changes:
             absolute_path = (Path(project_root) / change.path).resolve()
@@ -3276,11 +3908,58 @@ $devices | ConvertTo-Json -Depth 4 -Compress
 
     def _extract_json(self, text):
         raw = str(text or "").strip()
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start < 0 or end <= start:
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw)
+        if not raw:
             raise RuntimeError("The LLM did not return valid JSON.")
-        return json.loads(raw[start : end + 1])
+
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+        start = raw.find("{")
+        if start < 0:
+            raise RuntimeError("The LLM did not return valid JSON.")
+        for end in range(len(raw), start, -1):
+            if raw[end - 1] != "}":
+                continue
+            candidate = raw[start:end]
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                continue
+        raise RuntimeError("The LLM did not return valid JSON.")
+
+    def _run_project_smoke_test(self, project_root):
+        root = Path(project_root).resolve()
+        python_files = [path for path in root.rglob("*.py") if path.is_file()]
+        if not python_files:
+            return "skipped (no Python files found)."
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "compileall", str(root)],
+                capture_output=True,
+                text=True,
+                timeout=45,
+                check=False,
+            )
+        except Exception as exc:
+            return f"skipped ({exc})"
+        if result.returncode == 0:
+            return "ok (compileall passed)."
+        return "failed (compileall reported errors)."
+
+    def _generate_code_text(self, prompt):
+        if not self.llm:
+            raise RuntimeError("No LLM engine is available.")
+        if hasattr(self.llm, "generate_code"):
+            return str(self.llm.generate_code(prompt))
+        return str(self.llm.generate(prompt))
 
     def _generate_file_content(self, target_path, request):
         request = str(request or "").strip()
@@ -3383,7 +4062,7 @@ $devices | ConvertTo-Json -Depth 4 -Compress
                 "Do not include markdown fences or explanations. "
                 f"File name: {target_path.name}. Request: {request}"
             )
-            generated = str(self.llm.generate(prompt)).strip()
+            generated = str(self._generate_code_text(prompt)).strip()
             generated = re.sub(r"^```[a-zA-Z0-9_+-]*\s*", "", generated)
             generated = re.sub(r"\s*```$", "", generated)
             if generated:
@@ -3393,11 +4072,20 @@ $devices | ConvertTo-Json -Depth 4 -Compress
     def _resolve_website_url(self, params):
         website = str(params.get("website") or "").strip()
         lowered = self._normalize_query(website)
+        lowered = re.sub(r"^(?:open|launch|show|start|run|visit|go to)\s+", "", lowered).strip()
+        lowered = re.sub(r"\b(?:website|site|homepage|home page)\b", "", lowered).strip()
+        lowered = " ".join(lowered.split())
 
         if re.match(r"^https?://", lowered):
             return lowered
         if re.match(r"^(?:www\.)?[a-z0-9-]+\.[a-z0-9.-]+(?:/.*)?$", lowered):
             return f"https://{lowered}"
+        if lowered in {"youtube", "youtube.com", "www.youtube.com"}:
+            return "https://www.youtube.com"
+        if lowered in {"github", "github.com", "www.github.com"}:
+            return "https://github.com"
+        if lowered in {"spotify", "spotify.com", "open.spotify.com"}:
+            return "https://open.spotify.com"
         if "github" in lowered:
             user = self._extract_site_path(lowered, "github")
             return f"https://github.com/{user}" if user else "https://github.com"
@@ -3407,9 +4095,13 @@ $devices | ConvertTo-Json -Depth 4 -Compress
                 if handle:
                     return f"https://www.youtube.com/@{handle.lstrip('@')}"
             path = self._extract_site_path(lowered, "youtube")
+            if path in {"website", "site", "homepage", "home", "page", "app", "application"}:
+                path = ""
             return f"https://www.youtube.com/{path}" if path else "https://www.youtube.com"
         if "spotify" in lowered:
             path = self._extract_site_path(lowered, "spotify")
+            if path in {"website", "site", "homepage", "home", "page", "app", "application"}:
+                path = ""
             return f"https://open.spotify.com/{path}" if path else "https://open.spotify.com"
         return f"https://{quote_plus(website)}"
 
@@ -3418,10 +4110,16 @@ $devices | ConvertTo-Json -Depth 4 -Compress
         lowered = lowered.replace(f"{site_name}/", f"{site_name} /")
         if f"{site_name} /" in lowered:
             after = lowered.split(f"{site_name} /", 1)[1]
-            return after.strip().replace(" ", "")
+            candidate = after.strip().replace(" ", "")
+            if candidate in {"website", "site", "homepage", "home", "page", "app", "application"}:
+                return ""
+            return candidate
         match = re.search(rf"{site_name}\s+([a-z0-9_./@-]+)$", lowered)
         if match:
-            return match.group(1).strip().lstrip("/")
+            candidate = match.group(1).strip().lstrip("/")
+            if candidate in {"website", "site", "homepage", "home", "page", "app", "application"}:
+                return ""
+            return candidate
         if site_name == "github":
             match = re.search(r"\bgithub(?:\s+slash)?\s+([a-z0-9_.-]+)", lowered)
             if match:

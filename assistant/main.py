@@ -21,6 +21,7 @@ from .memory import Memory
 from .security import prompt_password_check, prompt_password_reset
 from .streaming_pipeline import StreamingPipeline
 from .system_actions import SystemActions
+from .terminal_wave import TerminalWaveRenderer
 from .tts_engine import TTSEngine
 from .utils import disable_autostart, enable_autostart, random_greeting, random_wake_response
 from .voice_auth import enroll_voice
@@ -65,6 +66,28 @@ def _normalize_text(text):
     return " ".join(str(text or "").lower().replace("'", "").split())
 
 
+def _clear_terminal_screen():
+    os.system("cls" if os.name == "nt" else "clear")
+
+
+def _prepare_terminal_for_text(wave_renderer=None):
+    if wave_renderer is not None and getattr(wave_renderer, "enabled", False):
+        wave_renderer.pause_and_clear()
+    _clear_terminal_screen()
+
+
+def _is_complex_terminal_response(text):
+    data = str(text or "")
+    if not data.strip():
+        return False
+    if len(data) >= 200:
+        return True
+    if "\n" in data:
+        return True
+    lowered = data.lower()
+    return any(marker in lowered for marker in {"(yes/no)", "choose", "multiple", "enter "})
+
+
 def _sanitize_assistant_name(raw_name):
     value = str(raw_name or "").strip().lower()
     patterns = [
@@ -85,6 +108,57 @@ def _record_terminal_response(terminal_state, system, response):
     terminal_state["last_response"] = text
     system.session_context["last_terminal_response"] = text
     system.session_context["last_suggestion_text"] = text
+
+
+def _resolve_local_setting_status(query, params, config):
+    raw = _normalize_text(query or params.get("raw_text") or "")
+    setting = _normalize_text(params.get("setting") or "")
+    combined = f"{setting} {raw}".strip()
+    if not combined:
+        return None
+
+    if any(token in combined for token in {"wake", "summon", "call"}) and any(
+        token in combined for token in {"sensitivity", "sensitvity", "sensitive"}
+    ):
+        return f"Wake-word sensitivity is set to {int(config.get('wake_sensitivity', 65))} percent."
+
+    if any(token in combined for token in {"wake", "summon", "call"}) and any(
+        token in combined for token in {"response", "reply", "ack", "acknowledgement", "acknowledgment"}
+    ):
+        enabled = bool(config.get("wake_response_enabled", True))
+        return f"Wake-word response is {'enabled' if enabled else 'disabled'}."
+
+    if any(token in combined for token in {"wave", "waves", "ascii"}):
+        enabled = bool(config.get("waves_enabled", True))
+        mode = str(config.get("ui_mode", "waves") or "waves").strip().lower()
+        if not enabled:
+            return "Visual interface is disabled. Text-only interface is active."
+        if mode == "bubble":
+            return "Bubble interface is enabled."
+        return "ASCII wave interface is enabled."
+
+    if "bubble" in combined:
+        enabled = bool(config.get("waves_enabled", True))
+        mode = str(config.get("ui_mode", "waves") or "waves").strip().lower()
+        return "Bubble interface is enabled." if enabled and mode == "bubble" else "Bubble interface is disabled."
+
+    if "voice model" in combined or "voice preset" in combined or "voice selection" in combined:
+        preset = str(config.get("voice_preset", "jarvis")).strip() or "jarvis"
+        return f"Current voice model is {preset}."
+
+    if "voice authentication" in combined or "voice auth" in combined or "voice verification" in combined:
+        threshold = int(config.get("voice_auth_threshold", 0))
+        if threshold <= 0:
+            return "Voice authentication is disabled."
+        return f"Voice authentication is enabled at {threshold} percent strictness."
+
+    if "humor" in combined:
+        return f"Humor level is set to {int(config.get('humor_level', 50))} percent."
+
+    if "language" in combined:
+        return "English is the active language."
+
+    return None
 
 
 def _extract_media_request_from_text(text):
@@ -254,15 +328,37 @@ def _apply_contextual_follow_up(action, params, system):
     return params
 
 
-def _speak_with_barge_in(tts, text, *, wake_detector=None, voice=None, timeout=8.0):
+def _speak_with_barge_in(
+    tts,
+    text,
+    *,
+    wake_detector=None,
+    voice=None,
+    timeout=8.0,
+    wave_renderer=None,
+    hide_waves_during_speech=False,
+):
     if not text:
         return ""
+    has_live_voice_loop = wake_detector is not None and voice is not None
+    should_hide_waves = bool(hide_waves_during_speech or _is_complex_terminal_response(text))
+    if wave_renderer is not None and has_live_voice_loop:
+        if should_hide_waves:
+            wave_renderer.clear_for_response()
+            wave_renderer.set_mode("paused")
+        else:
+            wave_renderer.set_mode("speaking")
     tts.speak(text, replace=True, interrupt=True)
-    if wake_detector is None or voice is None:
+    if not has_live_voice_loop:
         tts.wait_until_done(timeout=timeout)
         return ""
     while tts.is_speaking():
-        if wake_detector.listen_for_wake_word(timeout=1.1):
+        if wake_detector.listen_for_wake_word(
+            timeout=1.1,
+            on_audio_level=(wave_renderer.set_audio_level if (wave_renderer is not None and not should_hide_waves) else None),
+        ):
+            if wave_renderer is not None:
+                wave_renderer.set_mode("recording")
             tts.stop()
             audio = voice.record_until_silence(
                 max_duration=8.0,
@@ -274,16 +370,53 @@ def _speak_with_barge_in(tts, text, *, wake_detector=None, voice=None, timeout=8
                 speaker_reference=wake_detector.get_voice_reference(),
                 speaker_mode=wake_detector.query_speaker_mode(),
                 on_speech_start=tts.stop,
+                on_audio_chunk=(wave_renderer.set_audio_level if wave_renderer is not None else None),
             )
             transcript = voice.transcribe(audio) if audio is not None else ""
+            if wave_renderer is not None:
+                wave_renderer.set_mode("processing")
             return transcript or "__INTERRUPTED__"
     tts.wait_until_done(timeout=timeout)
+    if wave_renderer is not None:
+        wave_renderer.set_mode("idle")
+        if should_hide_waves:
+            wave_renderer.pulse(0.3)
     return ""
 
 
-def _prompt_yes_no(question):
+def _capture_voice_text(voice, *, max_duration=4.0, silence_duration=0.6, min_duration=0.2, start_timeout=2.6):
+    if voice is None:
+        return ""
+    audio = voice.record_until_silence(
+        max_duration=max_duration,
+        silence_duration=silence_duration,
+        min_duration=min_duration,
+        start_timeout=start_timeout,
+        fast_start=True,
+    )
+    if audio is None:
+        return ""
+    return (voice.transcribe(audio) or "").strip()
+
+
+def _prompt_yes_no(question, *, tts=None, voice=None, default=False):
     answer = input(question).strip().lower()
-    return answer in {"yes", "y"}
+    interpreted = _interpret_yes_no(answer)
+    if interpreted is not None:
+        return interpreted
+    if voice is None:
+        return bool(default)
+
+    voice_prompt = "Please say yes or no."
+    print(f"Assistant: {voice_prompt}")
+    if tts is not None:
+        tts.speak(voice_prompt, replace=True, interrupt=True)
+        tts.wait_until_done(timeout=3.0)
+    transcript = _capture_voice_text(voice)
+    interpreted = _interpret_yes_no(transcript)
+    if interpreted is not None:
+        return interpreted
+    return bool(default)
 
 
 def _interpret_yes_no(text):
@@ -298,24 +431,52 @@ def _interpret_yes_no(text):
 
 
 def _confirm_prompt(prompt, *, tts, voice, is_text_mode):
-    if is_text_mode or voice is None:
-        return _prompt_yes_no(f"{prompt} (yes/no): ")
+    if not is_text_mode:
+        if tts is not None:
+            tts.speak(prompt, replace=True, interrupt=True)
+            tts.wait_until_done(timeout=6.0)
+        if voice is None:
+            return _prompt_yes_no(f"{prompt} (yes/no): ", tts=tts, voice=None, default=False)
+        for _ in range(2):
+            transcript = _capture_voice_text(
+                voice,
+                max_duration=4.0,
+                silence_duration=0.6,
+                min_duration=0.2,
+                start_timeout=3.0,
+            )
+            interpreted = _interpret_yes_no(transcript)
+            if interpreted is not None:
+                return interpreted
+            retry_prompt = "Please say yes or no."
+            if tts is not None:
+                tts.speak(retry_prompt, replace=True, interrupt=True)
+                tts.wait_until_done(timeout=4.0)
+        return False
 
     print(f"Assistant: {prompt}")
-    tts.speak(prompt, replace=True, interrupt=True)
-    tts.wait_until_done(timeout=6.0)
+    typed = input(f"{prompt} (yes/no, press Enter to answer by voice): ").strip().lower()
+    interpreted = _interpret_yes_no(typed)
+    if interpreted is not None:
+        return interpreted
+    if voice is None:
+        return False
     for _ in range(2):
-        audio = voice.record_until_silence(max_duration=4.0, silence_duration=0.6, min_duration=0.2, start_timeout=3.0)
-        transcript = voice.transcribe(audio) if audio is not None else ""
-        if transcript:
-            print(f"User: {transcript}")
+        transcript = _capture_voice_text(
+            voice,
+            max_duration=4.0,
+            silence_duration=0.6,
+            min_duration=0.2,
+            start_timeout=3.0,
+        )
         interpreted = _interpret_yes_no(transcript)
         if interpreted is not None:
             return interpreted
         retry_prompt = "Please say yes or no."
         print(f"Assistant: {retry_prompt}")
-        tts.speak(retry_prompt, replace=True, interrupt=True)
-        tts.wait_until_done(timeout=4.0)
+        if tts is not None:
+            tts.speak(retry_prompt, replace=True, interrupt=True)
+            tts.wait_until_done(timeout=4.0)
     return False
 
 
@@ -354,10 +515,16 @@ def _resolve_voice_preset_choice(choice):
     return next((name for name in VOICE_PRESETS if name in cleaned), "")
 
 
-def _setup_voice_model_interactively(config, tts):
+def _setup_voice_model_interactively(config, tts, *, voice=None):
     _print_voice_preset_options()
     while True:
-        choice = input("Voice model (name/number, 'list', blank to cancel): ").strip().lower()
+        choice = input("Voice model (name/number, 'list', blank to use voice/cancel): ").strip().lower()
+        if not choice and voice is not None:
+            prompt = "Please say the voice model name."
+            print(f"Assistant: {prompt}")
+            tts.speak(prompt, replace=True, interrupt=True)
+            tts.wait_until_done(timeout=4.0)
+            choice = _normalize_text(_capture_voice_text(voice, max_duration=5.0, silence_duration=0.7, min_duration=0.3, start_timeout=2.8))
         if not choice:
             return False, "Voice model setup cancelled."
         if choice in {"list", "show", "help", "?"}:
@@ -375,8 +542,7 @@ def _setup_voice_model_interactively(config, tts):
         print(f"Assistant: {preview_line}")
         tts.speak(preview_line, replace=True, interrupt=True)
         tts.wait_until_done(timeout=8.0)
-        confirm = input("Use this voice model? (yes/no): ").strip().lower()
-        if confirm in {"yes", "y"}:
+        if _confirm_prompt("Use this voice model?", tts=tts, voice=voice, is_text_mode=False):
             config.set("voice_preset", preset)
             _preview_active_voice(config, tts)
             return True, f"Voice model changed to {preset}."
@@ -516,7 +682,7 @@ def _resolve_existing_path_request(system, params, *, tts, voice, is_text_mode, 
     return resolved, ""
 
 
-def _resolve_create_request(system, params):
+def _resolve_create_request(system, params, *, tts=None, voice=None):
     requested_name = str(params.get("name") or "notes.txt").strip()
     directory = params.get("directory")
     if not directory:
@@ -540,24 +706,24 @@ def _resolve_create_request(system, params):
             params["name"] = replacement
 
     target_name = params.get("name", requested_name)
-    if not _prompt_yes_no(f"Create {target_name}? (yes/no): "):
+    if not _prompt_yes_no(f"Create {target_name}? (yes/no): ", tts=tts, voice=voice, default=False):
         return None, f"Creation cancelled for {target_name}."
     return params, ""
 
 
 def _prompt_for_name(tts, voice, is_text_mode):
-    if not is_text_mode and voice is not None:
+    typed = input("Enter the new assistant name (or press Enter to speak it): ").strip()
+    if typed:
+        return _sanitize_assistant_name(typed)
+    if voice is not None:
         prompt = "What should I call myself?"
         print(f"Assistant: {prompt}")
         tts.speak(prompt, replace=True, interrupt=True)
         tts.wait_until_done(timeout=3.0)
-        audio = voice.record_until_silence(max_duration=5.0, silence_duration=0.8, min_duration=0.5, start_timeout=3.0)
-        if audio is not None:
-            transcript = voice.transcribe(audio) or ""
-            name = _sanitize_assistant_name(transcript)
-            if name:
-                return name
-    typed = input("Enter the new assistant name: ").strip()
+        transcript = _capture_voice_text(voice, max_duration=5.0, silence_duration=0.8, min_duration=0.3, start_timeout=2.8)
+        name = _sanitize_assistant_name(transcript)
+        if name:
+            return name
     return _sanitize_assistant_name(typed)
 
 
@@ -579,7 +745,23 @@ def _preview_active_voice(config, tts):
     return preview
 
 
-def _run_setup_flow(config, voice, tts, llm, system, memory, terminal_state, wake_detector, *, factory_reset=False):
+def _run_setup_flow(
+    config,
+    voice,
+    tts,
+    llm,
+    system,
+    memory,
+    terminal_state,
+    wake_detector,
+    *,
+    factory_reset=False,
+    wave_renderer=None,
+):
+    if wave_renderer is not None:
+        wave_renderer.set_enabled(False)
+    _prepare_terminal_for_text(wave_renderer=None)
+
     if factory_reset:
         config.reset_factory_state(delete_voice_sample=True)
     run_first_time_setup(config, voice_engine=voice, tts=tts)
@@ -594,6 +776,14 @@ def _run_setup_flow(config, voice, tts, llm, system, memory, terminal_state, wak
         config.get("voice_sample_path", ""),
         config.get("voice_auth_threshold", 0),
     )
+    wake_detector.set_sensitivity(config.get("wake_sensitivity", 65))
+
+    if wave_renderer is not None:
+        wave_renderer.set_style(config.get("ui_mode", "waves"))
+        wave_renderer.set_enabled(bool(config.get("waves_enabled", True)))
+        if wave_renderer.enabled:
+            wave_renderer.set_mode("idle")
+
     return "Factory reset complete. Setup restarted." if factory_reset else "Setup complete."
 
 
@@ -620,6 +810,7 @@ def _process_command(
     terminal_state,
     text_mode_state,
     is_text_mode=False,
+    wave_renderer=None,
 ):
     context = dict(system.session_context)
     intent_data = intent_engine.detect(query, context=context)
@@ -628,23 +819,52 @@ def _process_command(
     params = intent_data.get("parameters", {})
     can_speak = (not is_text_mode) or bool(text_mode_state.get("voice_enabled"))
 
+    def _show_terminal_output(message, force=False):
+        text = str(message or "")
+        show = (
+            bool(force)
+            or is_text_mode
+            or _is_complex_terminal_response(text)
+            or (wave_renderer is not None and not wave_renderer.enabled)
+        )
+        if show:
+            if wave_renderer is not None and not is_text_mode and wave_renderer.enabled:
+                _prepare_terminal_for_text(wave_renderer=wave_renderer)
+            elif wave_renderer is not None and not is_text_mode and _is_complex_terminal_response(text):
+                wave_renderer.clear_for_response()
+                wave_renderer.set_mode("responding")
+            print(text)
+        return show
+
     if action == "enter_text_mode":
         return "ENTER_TEXT_MODE" if not is_text_mode else None
 
     if action == "new_conversation":
         result = _open_new_conversation(memory, system, terminal_state)
-        print(result)
+        _show_terminal_output(result)
         _record_terminal_response(terminal_state, system, result)
         if can_speak:
-            _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+            _speak_with_barge_in(
+                tts,
+                result,
+                wake_detector=wake_detector if not is_text_mode else None,
+                voice=voice if not is_text_mode else None,
+                wave_renderer=wave_renderer,
+            )
         return None
 
     if action == "list_history":
         result = _format_history(memory)
-        print(result)
+        _show_terminal_output(result)
         _record_terminal_response(terminal_state, system, result)
         if can_speak:
-            _speak_with_barge_in(tts, "History listed on the terminal.", wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+            _speak_with_barge_in(
+                tts,
+                "History listed on the terminal.",
+                wake_detector=wake_detector if not is_text_mode else None,
+                voice=voice if not is_text_mode else None,
+                wave_renderer=wave_renderer,
+            )
         return None
 
     if action == "open_conversation":
@@ -660,10 +880,16 @@ def _process_command(
             ok, result = memory.switch_to_conversation(conversation_id)
             if ok:
                 system.clear_context()
-        print(result)
+        _show_terminal_output(result)
         _record_terminal_response(terminal_state, system, result)
         if can_speak:
-            _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+            _speak_with_barge_in(
+                tts,
+                result,
+                wake_detector=wake_detector if not is_text_mode else None,
+                voice=voice if not is_text_mode else None,
+                wave_renderer=wave_renderer,
+            )
         return None
 
     if action == "delete_conversation":
@@ -671,26 +897,32 @@ def _process_command(
         normalized = str(conversation_id or "").strip()
         if not normalized:
             result = "No conversation id was provided."
-            print(result)
+            _show_terminal_output(result)
             _record_terminal_response(terminal_state, system, result)
             return None
         if not _confirm_prompt(f"Delete conversation {normalized}?", tts=tts, voice=voice, is_text_mode=is_text_mode):
             result = "Conversation deletion cancelled."
-            print(result)
+            _show_terminal_output(result)
             _record_terminal_response(terminal_state, system, result)
             return None
         ok, result = memory.delete_conversation(normalized)
         if ok:
             system.clear_context()
-        print(result)
+        _show_terminal_output(result)
         _record_terminal_response(terminal_state, system, result)
         if can_speak:
-            _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+            _speak_with_barge_in(
+                tts,
+                result,
+                wake_detector=wake_detector if not is_text_mode else None,
+                voice=voice if not is_text_mode else None,
+                wave_renderer=wave_renderer,
+            )
         return None
 
     if action == "stop_assistant":
         result = "Shutting down the assistant."
-        print(result)
+        _show_terminal_output(result, force=True)
         _record_terminal_response(terminal_state, system, result)
         if can_speak:
             tts.speak(result, replace=True, interrupt=True)
@@ -698,8 +930,19 @@ def _process_command(
         return "EXIT_ASSISTANT"
 
     if action == "restart_setup":
-        result = _run_setup_flow(config, voice, tts, llm, system, memory, terminal_state, wake_detector, factory_reset=False)
-        print(result)
+        result = _run_setup_flow(
+            config,
+            voice,
+            tts,
+            llm,
+            system,
+            memory,
+            terminal_state,
+            wake_detector,
+            factory_reset=False,
+            wave_renderer=wave_renderer,
+        )
+        _show_terminal_output(result, force=True)
         _record_terminal_response(terminal_state, system, result)
         _preview_active_voice(config, tts)
         return None
@@ -707,7 +950,7 @@ def _process_command(
     if action == "change_assistant_name":
         new_name = params.get("assistant_name") or _prompt_for_name(tts, voice, is_text_mode)
         result = _apply_name_change(config, wake_detector, new_name)
-        print(result)
+        _show_terminal_output(result)
         _record_terminal_response(terminal_state, system, result)
         follow_up = ""
         if can_speak:
@@ -716,6 +959,7 @@ def _process_command(
                 result,
                 wake_detector=wake_detector if not is_text_mode else None,
                 voice=voice if not is_text_mode else None,
+                wave_renderer=wave_renderer,
             )
         return _maybe_process_follow_up(
             follow_up,
@@ -731,6 +975,7 @@ def _process_command(
             terminal_state=terminal_state,
             text_mode_state=text_mode_state,
             is_text_mode=is_text_mode,
+            wave_renderer=wave_renderer,
         )
 
     if action == "clear_history":
@@ -739,26 +984,45 @@ def _process_command(
         system.clear_context()
         terminal_state["last_response"] = ""
         result = f"Cleared conversation {active_id}."
-        print(result)
+        _show_terminal_output(result)
         _record_terminal_response(terminal_state, system, result)
         if can_speak:
-            _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+            _speak_with_barge_in(
+                tts,
+                result,
+                wake_detector=wake_detector if not is_text_mode else None,
+                voice=voice if not is_text_mode else None,
+                wave_renderer=wave_renderer,
+            )
         return None
 
     if action == "read_terminal":
         text = terminal_state.get("last_response") or "There is nothing on the terminal to read."
-        print(text)
+        _show_terminal_output(text, force=True)
         _record_terminal_response(terminal_state, system, text)
-        _speak_with_barge_in(tts, text, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None, timeout=15.0)
+        _speak_with_barge_in(
+            tts,
+            text,
+            wake_detector=wake_detector if not is_text_mode else None,
+            voice=voice if not is_text_mode else None,
+            timeout=15.0,
+            wave_renderer=wave_renderer,
+        )
         return None
 
     if action == "reset_password":
         if prompt_password_reset(config):
             result = "Password has been reset."
-            print(result)
+            _show_terminal_output(result)
             _record_terminal_response(terminal_state, system, result)
             if can_speak:
-                _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+                _speak_with_barge_in(
+                    tts,
+                    result,
+                    wake_detector=wake_detector if not is_text_mode else None,
+                    voice=voice if not is_text_mode else None,
+                    wave_renderer=wave_renderer,
+                )
         return None
 
     if action == "set_voice_auth":
@@ -777,10 +1041,16 @@ def _process_command(
             config.get("voice_sample_path", ""),
             config.get("voice_auth_threshold", 0),
         )
-        print(result)
+        _show_terminal_output(result)
         _record_terminal_response(terminal_state, system, result)
         if can_speak:
-            _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+            _speak_with_barge_in(
+                tts,
+                result,
+                wake_detector=wake_detector if not is_text_mode else None,
+                voice=voice if not is_text_mode else None,
+                wave_renderer=wave_renderer,
+            )
         return None
 
     if action == "set_humor":
@@ -788,53 +1058,160 @@ def _process_command(
         config.set("humor_level", level)
         llm.humor_level = level
         result = f"Humor level set to {level} percent."
-        print(result)
+        _show_terminal_output(result)
         _record_terminal_response(terminal_state, system, result)
         if can_speak:
-            _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+            _speak_with_barge_in(
+                tts,
+                result,
+                wake_detector=wake_detector if not is_text_mode else None,
+                voice=voice if not is_text_mode else None,
+                wave_renderer=wave_renderer,
+            )
         return None
 
     if action == "change_language":
         requested = str(params.get("language") or "english").strip().lower()
         result = "English is active." if requested in {"", "en", "english", "default"} else "English is currently the only supported language in this build."
-        print(result)
+        _show_terminal_output(result)
         _record_terminal_response(terminal_state, system, result)
         if can_speak:
-            _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+            _speak_with_barge_in(
+                tts,
+                result,
+                wake_detector=wake_detector if not is_text_mode else None,
+                voice=voice if not is_text_mode else None,
+                wave_renderer=wave_renderer,
+            )
         return None
 
     if action == "change_voice":
         preset = str(params.get("preset") or "").strip().lower()
         if not preset:
-            applied, result = _setup_voice_model_interactively(config, tts)
+            applied, result = _setup_voice_model_interactively(config, tts, voice=voice)
         else:
             result = tts.apply_voice_preset(preset)
             if "Unknown voice preset" not in result:
                 config.set("voice_preset", preset)
                 _preview_active_voice(config, tts)
-        print(result)
+        _show_terminal_output(result)
         _record_terminal_response(terminal_state, system, result)
         if can_speak:
-            _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+            _speak_with_barge_in(
+                tts,
+                result,
+                wake_detector=wake_detector if not is_text_mode else None,
+                voice=voice if not is_text_mode else None,
+                wave_renderer=wave_renderer,
+            )
         return None
 
     if action == "set_autostart":
         result = enable_autostart() if params.get("on", True) else disable_autostart()
         config.set("auto_start", bool(params.get("on", True)))
-        print(result)
+        _show_terminal_output(result)
         _record_terminal_response(terminal_state, system, result)
         if can_speak:
-            _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+            _speak_with_barge_in(
+                tts,
+                result,
+                wake_detector=wake_detector if not is_text_mode else None,
+                voice=voice if not is_text_mode else None,
+                wave_renderer=wave_renderer,
+            )
         return None
 
     if action == "set_wake_response":
         enabled = bool(params.get("on", True))
         config.set("wake_response_enabled", enabled)
         result = "Wake-word response enabled." if enabled else "Wake-word response disabled."
-        print(result)
+        _show_terminal_output(result)
         _record_terminal_response(terminal_state, system, result)
         if can_speak:
-            _speak_with_barge_in(tts, result, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None)
+            _speak_with_barge_in(
+                tts,
+                result,
+                wake_detector=wake_detector if not is_text_mode else None,
+                voice=voice if not is_text_mode else None,
+                wave_renderer=wave_renderer,
+            )
+        return None
+
+    if action == "set_wave_display":
+        enabled = bool(params.get("on", True))
+        if enabled:
+            config.update({"waves_enabled": True, "ui_mode": "waves"})
+        else:
+            config.set("waves_enabled", False)
+        if wave_renderer is not None:
+            if enabled:
+                wave_renderer.set_style("waves")
+                wave_renderer.set_enabled(True)
+                wave_renderer.set_mode("idle")
+                wave_renderer.pulse(0.4)
+            else:
+                wave_renderer.set_enabled(False)
+                _prepare_terminal_for_text(wave_renderer=None)
+        result = "ASCII waves enabled." if enabled else "ASCII waves disabled. Using text status interface."
+        _show_terminal_output(result, force=True)
+        _record_terminal_response(terminal_state, system, result)
+        if can_speak:
+            _speak_with_barge_in(
+                tts,
+                result,
+                wake_detector=wake_detector if not is_text_mode else None,
+                voice=voice if not is_text_mode else None,
+                wave_renderer=wave_renderer,
+            )
+        return None
+
+    if action == "set_bubble_display":
+        enabled = bool(params.get("on", True))
+        if enabled:
+            config.update({"waves_enabled": True, "ui_mode": "bubble"})
+        else:
+            config.set("waves_enabled", False)
+        if wave_renderer is not None:
+            if enabled:
+                wave_renderer.set_style("bubble")
+                wave_renderer.set_enabled(True)
+                wave_renderer.set_mode("idle")
+                wave_renderer.pulse(0.5)
+            else:
+                wave_renderer.set_enabled(False)
+                _prepare_terminal_for_text(wave_renderer=None)
+        result = "Bubble interface enabled." if enabled else "Bubble interface disabled. Using text status interface."
+        _show_terminal_output(result, force=True)
+        _record_terminal_response(terminal_state, system, result)
+        if can_speak:
+            _speak_with_barge_in(
+                tts,
+                result,
+                wake_detector=wake_detector if not is_text_mode else None,
+                voice=voice if not is_text_mode else None,
+                wave_renderer=wave_renderer,
+            )
+        return None
+
+    if action == "set_wake_sensitivity":
+        configured = params.get("percent")
+        if configured is None:
+            base = config.get("wake_sensitivity", 65)
+            delta = int(params.get("delta") or 0)
+            configured = max(0, min(100, int(base) + delta))
+        config.set("wake_sensitivity", configured)
+        wake_detector.set_sensitivity(configured)
+        result = f"Wake-word sensitivity set to {configured} percent."
+        _show_terminal_output(result)
+        _record_terminal_response(terminal_state, system, result)
+        if can_speak:
+            _speak_with_barge_in(
+                tts,
+                result,
+                wake_detector=wake_detector if not is_text_mode else None,
+                voice=voice if not is_text_mode else None,
+                wave_renderer=wave_renderer,
+            )
         return None
 
     if intent == "system_command" and action:
@@ -851,7 +1228,7 @@ def _process_command(
                 is_text_mode=is_text_mode,
             )
             if routed_error:
-                print(routed_error)
+                _show_terminal_output(routed_error, force=True)
                 _record_terminal_response(terminal_state, system, routed_error)
                 if can_speak:
                     _speak_with_barge_in(
@@ -859,6 +1236,7 @@ def _process_command(
                         routed_error,
                         wake_detector=wake_detector if not is_text_mode else None,
                         voice=voice if not is_text_mode else None,
+                        wave_renderer=wave_renderer,
                     )
                 return None
             if routed_action and routed_params:
@@ -873,7 +1251,7 @@ def _process_command(
                     purpose = input("Describe what this file should do: ").strip()
                     if not purpose:
                         result = "Project edit cancelled because no purpose was provided."
-                        print(result)
+                        _show_terminal_output(result, force=True)
                         _record_terminal_response(terminal_state, system, result)
                         return None
                     if not _confirm_prompt(
@@ -883,7 +1261,7 @@ def _process_command(
                         is_text_mode=is_text_mode,
                     ):
                         result = "Project edit cancelled."
-                        print(result)
+                        _show_terminal_output(result, force=True)
                         _record_terminal_response(terminal_state, system, result)
                         return None
                     params["instruction"] = (
@@ -896,7 +1274,7 @@ def _process_command(
                     ).strip()
                     if not follow_instruction:
                         result = "Project edit cancelled."
-                        print(result)
+                        _show_terminal_output(result, force=True)
                         _record_terminal_response(terminal_state, system, result)
                         return None
                     params["instruction"] = follow_instruction
@@ -905,7 +1283,7 @@ def _process_command(
             app_match = system.resolve_application_request(params)
             if app_match.get("status") == "missing":
                 result = f"I could not find an installed application matching {app_match.get('requested') or params.get('application') or 'that request'}."
-                print(result)
+                _show_terminal_output(result, force=True)
                 _record_terminal_response(terminal_state, system, result)
                 if can_speak:
                     _speak_with_barge_in(
@@ -913,6 +1291,7 @@ def _process_command(
                         result,
                         wake_detector=wake_detector if not is_text_mode else None,
                         voice=voice if not is_text_mode else None,
+                        wave_renderer=wave_renderer,
                     )
                 return None
             if app_match.get("status") == "needs_confirmation":
@@ -922,15 +1301,15 @@ def _process_command(
                 )
                 if not _confirm_prompt(prompt, tts=tts, voice=voice, is_text_mode=is_text_mode):
                     result = "Application action cancelled."
-                    print(result)
+                    _show_terminal_output(result, force=True)
                     _record_terminal_response(terminal_state, system, result)
                     return None
             params["resolved_application"] = app_match
 
         if action == "create_file":
-            resolved, error = _resolve_create_request(system, dict(params))
+            resolved, error = _resolve_create_request(system, dict(params), tts=tts, voice=voice)
             if not resolved:
-                print(error)
+                _show_terminal_output(error, force=True)
                 _record_terminal_response(terminal_state, system, error)
                 return None
             params = resolved
@@ -946,7 +1325,7 @@ def _process_command(
                 purpose="read" if action == "read_file" else ("update" if action == "modify_file" else "open"),
             )
             if not resolved:
-                print(error)
+                _show_terminal_output(error, force=True)
                 _record_terminal_response(terminal_state, system, error)
                 return None
             params = resolved
@@ -954,7 +1333,7 @@ def _process_command(
         if action in {"copy_path", "move_path", "rename_path", "duplicate_path"}:
             resolved, error = _resolve_transfer_request(system, action, dict(params), tts=tts, voice=voice, is_text_mode=is_text_mode)
             if not resolved:
-                print(error)
+                _show_terminal_output(error, force=True)
                 _record_terminal_response(terminal_state, system, error)
                 return None
             params = resolved
@@ -962,13 +1341,16 @@ def _process_command(
         if action == "delete_path":
             resolved, error = _resolve_delete_request(system, dict(params), tts=tts, voice=voice, is_text_mode=is_text_mode)
             if not resolved:
-                print(error)
+                _show_terminal_output(error, force=True)
                 _record_terminal_response(terminal_state, system, error)
                 return None
             params = resolved
 
-        result = system.execute(action, params)
-        print(result)
+        if wave_renderer is not None:
+            wave_renderer.set_mode("processing")
+        local_status = _resolve_local_setting_status(query, params, config) if action == "get_setting_status" else None
+        result = local_status if local_status is not None else system.execute(action, params)
+        _show_terminal_output(result)
         memory.add("user", query)
         memory.add("assistant", result)
         _record_terminal_response(terminal_state, system, result)
@@ -985,19 +1367,35 @@ def _process_command(
                 system.build_voice_summary(action, params, result),
                 wake_detector=wake_detector if not is_text_mode else None,
                 voice=voice if not is_text_mode else None,
+                wave_renderer=wave_renderer,
             )
         return None
 
     memory.add("user", query)
     prompt = f"Conversation so far:\n{memory.get_context()}\n\nUser: {query}"
-    response = pipeline.run(prompt, speak=False)
+    if wave_renderer is not None:
+        wave_renderer.set_mode("processing")
+    response = pipeline.run(prompt, speak=False, display=is_text_mode)
+    if wave_renderer is not None:
+        if not is_text_mode:
+            wave_renderer.clear_for_response()
+            _show_terminal_output(response, force=True)
+        wave_renderer.set_mode("responding")
     memory.add("assistant", response)
     _record_terminal_response(terminal_state, system, response)
     media = _extract_media_request_from_text(response)
     if media:
         system.session_context["last_media_request"] = media
     if can_speak:
-        follow_up = _speak_with_barge_in(tts, response, wake_detector=wake_detector if not is_text_mode else None, voice=voice if not is_text_mode else None, timeout=12.0)
+        follow_up = _speak_with_barge_in(
+            tts,
+            response,
+            wake_detector=wake_detector if not is_text_mode else None,
+            voice=voice if not is_text_mode else None,
+            timeout=12.0,
+            wave_renderer=wave_renderer,
+            hide_waves_during_speech=not is_text_mode,
+        )
         return _maybe_process_follow_up(
             follow_up,
             config=config,
@@ -1012,7 +1410,10 @@ def _process_command(
             terminal_state=terminal_state,
             text_mode_state=text_mode_state,
             is_text_mode=is_text_mode,
+            wave_renderer=wave_renderer,
         )
+    if wave_renderer is not None:
+        wave_renderer.set_mode("idle")
     return None
 
 
@@ -1030,7 +1431,10 @@ def _run_text_mode(
     text_mode_toggle_event,
     factory_reset_event,
     new_conversation_event,
+    voice,
+    wave_renderer=None,
 ):
+    _clear_terminal_screen()
     print("\n" + "=" * 60)
     print("  TEXT MODE - type commands directly. Ctrl+Space exits text mode.")
     print("  Press Ctrl+Shift+Alt to start a new conversation.")
@@ -1062,7 +1466,7 @@ def _run_text_mode(
                 response = "Text mode voice responses enabled."
                 print(response)
                 _record_terminal_response(terminal_state, system, response)
-                _speak_with_barge_in(tts, response, timeout=6.0)
+                _speak_with_barge_in(tts, response, timeout=6.0, wave_renderer=wave_renderer)
                 continue
             if normalized in TEXT_VOICE_DISABLE_PHRASES:
                 text_mode_state["voice_enabled"] = False
@@ -1079,12 +1483,13 @@ def _run_text_mode(
                 llm=llm,
                 tts=tts,
                 pipeline=pipeline,
-                voice=None,
+                voice=voice,
                 memory=memory,
                 wake_detector=wake_detector,
                 terminal_state=terminal_state,
                 text_mode_state=text_mode_state,
                 is_text_mode=True,
+                wave_renderer=wave_renderer,
             )
             if result == "EXIT_ASSISTANT":
                 return "EXIT_ASSISTANT"
@@ -1134,7 +1539,7 @@ def _run_text_mode(
                 response = "Text mode voice responses enabled."
                 print(response)
                 _record_terminal_response(terminal_state, system, response)
-                _speak_with_barge_in(tts, response, timeout=6.0)
+                _speak_with_barge_in(tts, response, timeout=6.0, wave_renderer=wave_renderer)
                 print("\nText > ", end="", flush=True)
                 continue
             if normalized in TEXT_VOICE_DISABLE_PHRASES:
@@ -1154,12 +1559,13 @@ def _run_text_mode(
                 llm=llm,
                 tts=tts,
                 pipeline=pipeline,
-                voice=None,
+                voice=voice,
                 memory=memory,
                 wake_detector=wake_detector,
                 terminal_state=terminal_state,
                 text_mode_state=text_mode_state,
                 is_text_mode=True,
+                wave_renderer=wave_renderer,
             )
             if result == "EXIT_ASSISTANT":
                 print("Stopping assistant.\n")
@@ -1227,11 +1633,13 @@ def run():
         model_path=str(model_path),
         wake_word=config.get("assistant_name", "friday"),
         wake_variants=config.get("wake_variants", []),
+        sensitivity=config.get("wake_sensitivity", 65),
     )
     wake_detector.set_voice_reference(
         config.get("voice_sample_path", ""),
         config.get("voice_auth_threshold", 0),
     )
+    wake_detector.set_sensitivity(config.get("wake_sensitivity", 65))
     if sorted(config.get("wake_variants", [])) != sorted(wake_detector.wake_variants):
         config.set("wake_variants", sorted(wake_detector.wake_variants))
 
@@ -1241,115 +1649,233 @@ def run():
     keyboard.add_hotkey("ctrl+space", text_mode_toggle_event.set)
     keyboard.add_hotkey("ctrl+shift+r", factory_reset_event.set)
     keyboard.add_hotkey("ctrl+shift+alt", new_conversation_event.set)
+    wave_renderer = TerminalWaveRenderer(
+        enabled=bool(config.get("waves_enabled", True)),
+        fps=20,
+        style=config.get("ui_mode", "waves"),
+    )
+    wave_renderer.start()
+    if wave_renderer.enabled:
+        wave_renderer.set_style(config.get("ui_mode", "waves"))
+        wave_renderer.set_mode("idle")
 
     greeting = random_greeting()
+    if wave_renderer.enabled:
+        _prepare_terminal_for_text(wave_renderer=wave_renderer)
     print(f"\nAssistant: {greeting}\n")
     _record_terminal_response(terminal_state, system, greeting)
-    _speak_with_barge_in(tts, greeting, wake_detector=wake_detector, voice=voice)
+    _speak_with_barge_in(tts, greeting, wake_detector=wake_detector, voice=voice, wave_renderer=wave_renderer)
 
-    while True:
-        if factory_reset_event.is_set():
-            factory_reset_event.clear()
-            tts.stop()
-            result = _run_setup_flow(config, voice, tts, llm, system, memory, terminal_state, wake_detector, factory_reset=True)
-            print(result)
-            _record_terminal_response(terminal_state, system, result)
-            continue
-
-        if new_conversation_event.is_set():
-            new_conversation_event.clear()
-            result = _open_new_conversation(memory, system, terminal_state)
-            print(result)
-            _record_terminal_response(terminal_state, system, result)
-            continue
-
-        if text_mode_toggle_event.is_set():
-            text_mode_toggle_event.clear()
-            if config.get("password_hash") and not prompt_password_check(config.get("password_hash"), purpose="enter text mode"):
-                print("Access denied for text mode.")
-                continue
-            text_mode_result = _run_text_mode(
-                config,
-                intent_engine,
-                system,
-                llm,
-                tts,
-                pipeline,
-                memory,
-                wake_detector,
-                terminal_state,
-                text_mode_state,
-                text_mode_toggle_event,
-                factory_reset_event,
-                new_conversation_event,
-            )
-            if text_mode_result == "FACTORY_RESET":
-                result = _run_setup_flow(config, voice, tts, llm, system, memory, terminal_state, wake_detector, factory_reset=True)
+    try:
+        while True:
+            if factory_reset_event.is_set():
+                factory_reset_event.clear()
+                tts.stop()
+                wave_renderer.set_mode("processing")
+                result = _run_setup_flow(
+                    config,
+                    voice,
+                    tts,
+                    llm,
+                    system,
+                    memory,
+                    terminal_state,
+                    wake_detector,
+                    factory_reset=True,
+                    wave_renderer=wave_renderer,
+                )
+                if wave_renderer.enabled:
+                    _prepare_terminal_for_text(wave_renderer=wave_renderer)
                 print(result)
                 _record_terminal_response(terminal_state, system, result)
-            elif text_mode_result == "EXIT_ASSISTANT":
+                wave_renderer.set_mode("idle")
+                continue
+
+            if new_conversation_event.is_set():
+                new_conversation_event.clear()
+                result = _open_new_conversation(memory, system, terminal_state)
+                print(result)
+                _record_terminal_response(terminal_state, system, result)
+                continue
+
+            if text_mode_toggle_event.is_set():
+                text_mode_toggle_event.clear()
+                wave_renderer.pause_and_clear()
+                _clear_terminal_screen()
+                if config.get("password_hash") and not prompt_password_check(config.get("password_hash"), purpose="enter text mode"):
+                    print("Access denied for text mode.")
+                    if wave_renderer.enabled:
+                        wave_renderer.set_mode("idle")
+                    continue
+                _clear_terminal_screen()
+                text_mode_result = _run_text_mode(
+                    config,
+                    intent_engine,
+                    system,
+                    llm,
+                    tts,
+                    pipeline,
+                    memory,
+                    wake_detector,
+                    terminal_state,
+                    text_mode_state,
+                    text_mode_toggle_event,
+                    factory_reset_event,
+                    new_conversation_event,
+                    voice,
+                    wave_renderer=wave_renderer,
+                )
+                wave_renderer.set_mode("idle")
+                if text_mode_result == "FACTORY_RESET":
+                    result = _run_setup_flow(
+                        config,
+                        voice,
+                        tts,
+                        llm,
+                        system,
+                        memory,
+                        terminal_state,
+                        wake_detector,
+                        factory_reset=True,
+                        wave_renderer=wave_renderer,
+                    )
+                    if wave_renderer.enabled:
+                        _prepare_terminal_for_text(wave_renderer=wave_renderer)
+                    print(result)
+                    _record_terminal_response(terminal_state, system, result)
+                elif text_mode_result == "EXIT_ASSISTANT":
+                    break
+                continue
+
+            if wave_renderer.enabled:
+                wave_renderer.set_mode("idle")
+            else:
+                print("Listening for wake word...")
+            heard_wake = wake_detector.listen_for_wake_word(
+                stop_events=(factory_reset_event, text_mode_toggle_event, new_conversation_event),
+                on_audio_level=wave_renderer.set_audio_level if wave_renderer.enabled else None,
+            )
+            if not heard_wake:
+                continue
+
+            if factory_reset_event.is_set():
+                continue
+            if new_conversation_event.is_set():
+                continue
+
+            if wave_renderer.enabled:
+                wave_renderer.set_mode("wake")
+                wave_renderer.pulse(1.0)
+            if config.get("wake_response_enabled", True):
+                wake_response = random_wake_response()
+                _record_terminal_response(terminal_state, system, wake_response)
+                tts.speak(wake_response, replace=True, interrupt=True)
+                if not wave_renderer.enabled:
+                    print(f"Assistant: {wake_response}")
+            else:
+                wake_response = "Wake word detected."
+                _record_terminal_response(terminal_state, system, wake_response)
+                if not wave_renderer.enabled:
+                    print("Wake word detected.")
+
+            if wave_renderer.enabled:
+                wave_renderer.set_mode("recording")
+            else:
+                print("Listening for your command...")
+            query_speaker_mode = wake_detector.query_speaker_mode()
+            audio = voice.record_until_silence(
+                max_duration=25.0,
+                silence_duration=0.9,
+                min_duration=0.45,
+                start_timeout=4.8,
+                fast_start=True,
+                prefill_audio=wake_detector.consume_recent_audio(),
+                speaker_reference=wake_detector.get_voice_reference(),
+                speaker_mode=query_speaker_mode,
+                on_speech_start=tts.stop,
+                on_audio_chunk=wave_renderer.set_audio_level if wave_renderer.enabled else None,
+            )
+            if audio is None:
+                # Fallback pass with looser speaker gate to avoid dropping the command.
+                fallback_mode = "light" if query_speaker_mode == "strong" else query_speaker_mode
+                audio = voice.record_until_silence(
+                    max_duration=18.0,
+                    silence_duration=0.85,
+                    min_duration=0.35,
+                    start_timeout=5.2,
+                    fast_start=True,
+                    speaker_reference=wake_detector.get_voice_reference(),
+                    speaker_mode=fallback_mode,
+                    on_speech_start=tts.stop,
+                    on_audio_chunk=wave_renderer.set_audio_level if wave_renderer.enabled else None,
+                )
+                if audio is None:
+                    if wave_renderer.enabled:
+                        wave_renderer.set_mode("idle")
+                    continue
+            if wave_renderer.enabled:
+                wave_renderer.set_mode("processing")
+            else:
+                print("Processing request...")
+            query = (voice.transcribe(audio) or "").strip()
+            if not query:
+                retry_prompt = "I did not catch that. Please repeat."
+                if config.get("wake_response_enabled", True):
+                    tts.speak(retry_prompt, replace=True, interrupt=True)
+                fallback_mode = "light" if query_speaker_mode == "strong" else query_speaker_mode
+                audio_retry = voice.record_until_silence(
+                    max_duration=18.0,
+                    silence_duration=0.8,
+                    min_duration=0.35,
+                    start_timeout=5.0,
+                    fast_start=True,
+                    speaker_reference=wake_detector.get_voice_reference(),
+                    speaker_mode=fallback_mode,
+                    on_speech_start=tts.stop,
+                    on_audio_chunk=wave_renderer.set_audio_level if wave_renderer.enabled else None,
+                )
+                query = (voice.transcribe(audio_retry) or "").strip() if audio_retry is not None else ""
+            if not query and query_speaker_mode != "none":
+                # Final pass without speaker gating; wake-word auth has already been checked.
+                audio_retry = voice.record_until_silence(
+                    max_duration=14.0,
+                    silence_duration=0.75,
+                    min_duration=0.28,
+                    start_timeout=4.0,
+                    fast_start=True,
+                    speaker_mode="none",
+                    on_speech_start=tts.stop,
+                    on_audio_chunk=wave_renderer.set_audio_level if wave_renderer.enabled else None,
+                )
+                query = (voice.transcribe(audio_retry) or "").strip() if audio_retry is not None else ""
+            if not query:
+                if wave_renderer.enabled:
+                    wave_renderer.set_mode("idle")
+                continue
+
+            result = _process_command(
+                query,
+                config=config,
+                intent_engine=intent_engine,
+                system=system,
+                llm=llm,
+                tts=tts,
+                pipeline=pipeline,
+                voice=voice,
+                memory=memory,
+                wake_detector=wake_detector,
+                terminal_state=terminal_state,
+                text_mode_state=text_mode_state,
+                wave_renderer=wave_renderer,
+            )
+            if result == "ENTER_TEXT_MODE":
+                text_mode_toggle_event.set()
+            elif result == "EXIT_ASSISTANT":
                 break
-            continue
-
-        print("Listening for wake word...")
-        heard_wake = wake_detector.listen_for_wake_word(
-            stop_events=(factory_reset_event, text_mode_toggle_event, new_conversation_event),
-        )
-        if not heard_wake:
-            continue
-
-        if factory_reset_event.is_set():
-            continue
-        if new_conversation_event.is_set():
-            continue
-
-        if config.get("wake_response_enabled", True):
-            wake_response = random_wake_response()
-            print(f"Assistant: {wake_response}")
-            _record_terminal_response(terminal_state, system, wake_response)
-            tts.speak(wake_response, replace=True, interrupt=True)
-        else:
-            wake_response = "Wake word detected."
-            print(wake_response)
-            _record_terminal_response(terminal_state, system, wake_response)
-
-        print("Listening for your command...")
-        audio = voice.record_until_silence(
-            max_duration=25.0,
-            silence_duration=1.0,
-            min_duration=0.8,
-            start_timeout=6.0,
-            fast_start=True,
-            prefill_audio=wake_detector.consume_recent_audio(),
-            speaker_reference=wake_detector.get_voice_reference(),
-            speaker_mode=wake_detector.query_speaker_mode(),
-            on_speech_start=tts.stop,
-        )
-        if audio is None:
-            continue
-        query = voice.transcribe(audio)
-        if not query:
-            continue
-
-        print(f"\nUser: {query}")
-        result = _process_command(
-            query,
-            config=config,
-            intent_engine=intent_engine,
-            system=system,
-            llm=llm,
-            tts=tts,
-            pipeline=pipeline,
-            voice=voice,
-            memory=memory,
-            wake_detector=wake_detector,
-            terminal_state=terminal_state,
-            text_mode_state=text_mode_state,
-        )
-        if result == "ENTER_TEXT_MODE":
-            text_mode_toggle_event.set()
-        elif result == "EXIT_ASSISTANT":
-            break
+            if wave_renderer.enabled:
+                wave_renderer.set_mode("idle")
+    finally:
+        wave_renderer.close()
 
 
 if __name__ == "__main__":

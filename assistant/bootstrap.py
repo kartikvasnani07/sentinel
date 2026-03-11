@@ -2,6 +2,7 @@
 First-time setup wizard for the desktop assistant.
 """
 
+import re
 import time
 
 from .config import VOICE_PRESETS
@@ -11,11 +12,68 @@ from .voice_auth import enroll_voice
 from .wake_word import WakeWordDetector
 
 
-def _tts_prompt(tts, text, wait_seconds=0.5):
+YES_WORDS = {"yes", "y", "yeah", "yep", "sure", "ok", "okay", "confirm", "proceed", "do it"}
+NO_WORDS = {"no", "n", "nope", "cancel", "stop", "dont", "do not", "negative"}
+
+
+def _tts_prompt(tts, text, wait_seconds=3.0):
     print(f"\nAssistant: {text}")
     if tts is not None:
         tts.speak(text, replace=True, interrupt=True)
         tts.wait_until_done(timeout=wait_seconds)
+
+
+def _normalize_text(text):
+    return " ".join(str(text or "").strip().lower().replace("'", "").split())
+
+
+def _interpret_yes_no(text):
+    normalized = _normalize_text(text)
+    if not normalized:
+        return None
+    if normalized in YES_WORDS or any(item in normalized for item in YES_WORDS):
+        return True
+    if normalized in NO_WORDS or any(item in normalized for item in NO_WORDS):
+        return False
+    return None
+
+
+def _ask_text_or_voice(prompt, *, voice_engine=None, tts=None, default=""):
+    typed = input(prompt).strip()
+    if typed:
+        return typed
+    if voice_engine is None:
+        return default
+
+    reminder = "You can say your answer now."
+    print(f"Assistant: {reminder}")
+    if tts is not None:
+        tts.speak(reminder, replace=True, interrupt=True)
+        tts.wait_until_done(timeout=2.4)
+    audio = voice_engine.record_until_silence(
+        max_duration=5.5,
+        silence_duration=0.8,
+        min_duration=0.3,
+        start_timeout=2.5,
+        fast_start=True,
+    )
+    if audio is None:
+        return default
+    transcript = (voice_engine.transcribe(audio) or "").strip()
+    return transcript or default
+
+
+def _confirm_text_or_voice(question, *, default=True, voice_engine=None, tts=None):
+    for _ in range(2):
+        answer = _ask_text_or_voice(f"{question} [yes/no]: ", voice_engine=voice_engine, tts=tts, default="")
+        interpreted = _interpret_yes_no(answer)
+        if interpreted is not None:
+            return interpreted
+        print("Please answer yes or no.")
+        if tts is not None:
+            tts.speak("Please answer yes or no.", replace=True, interrupt=True)
+            tts.wait_until_done(timeout=2.6)
+    return bool(default)
 
 
 def _extract_assistant_name(raw_name):
@@ -28,7 +86,7 @@ def _extract_assistant_name(raw_name):
         r"^([a-z][a-z0-9 _-]+)$",
     ]
     for pattern in patterns:
-        match = __import__("re").search(pattern, value, flags=__import__("re").IGNORECASE)
+        match = re.search(pattern, value, flags=re.IGNORECASE)
         if match:
             candidate = match.group(1).strip(" .!?")
             candidate = " ".join(candidate.split())
@@ -58,24 +116,43 @@ def _resolve_voice_choice(choice):
     return next((name for name in VOICE_PRESETS if name in cleaned), "")
 
 
+def _resolve_interface_choice(choice):
+    normalized = _normalize_text(choice)
+    if not normalized:
+        return True, "waves", "waves"
+    if "bubble" in normalized:
+        return True, "bubble", "bubble"
+    if "text" in normalized or "textual" in normalized or "plain" in normalized:
+        return False, "waves", "text"
+    if "off" in normalized or "disable" in normalized:
+        return False, "waves", "text"
+    return True, "waves", "waves"
+
+
 def run_first_time_setup(config, voice_engine=None, tts=None):
     print("\n" + "=" * 50)
     print("  Welcome to your AI Assistant - First Time Setup")
     print("=" * 50)
 
     _tts_prompt(tts, "Welcome. Let's configure your assistant.")
-    time.sleep(0.4)
+    time.sleep(0.3)
 
-    _tts_prompt(tts, "What would you like to call me?")
-    assistant_name = ""
-    if voice_engine is not None:
-        audio = voice_engine.record_until_silence(max_duration=5.0, silence_duration=0.9, min_duration=0.8)
-        if audio is not None:
-            assistant_name = _extract_assistant_name(voice_engine.transcribe(audio))
-
-    if not assistant_name:
-        typed = input("Type your assistant name (default: friday): ").strip()
-        assistant_name = _extract_assistant_name(typed) or "friday"
+    while True:
+        _tts_prompt(tts, "What would you like to call me? You can type it or say it.")
+        raw_name = _ask_text_or_voice(
+            "Assistant name (default: friday): ",
+            voice_engine=voice_engine,
+            tts=tts,
+            default="friday",
+        )
+        assistant_name = _extract_assistant_name(raw_name) or "friday"
+        if _confirm_text_or_voice(
+            f"Use {assistant_name} as my name?",
+            default=True,
+            voice_engine=voice_engine,
+            tts=tts,
+        ):
+            break
 
     wake_variants = sorted(WakeWordDetector.build_wake_variants(assistant_name))
     config.update(
@@ -87,13 +164,31 @@ def run_first_time_setup(config, voice_engine=None, tts=None):
     )
     _tts_prompt(tts, f"My name is set to {assistant_name}.")
 
-    wake_response_choice = input("Enable wake-word response after summon? [yes/no, default: yes]: ").strip().lower()
-    wake_response_enabled = wake_response_choice not in {"n", "no", "off", "disable", "disabled", "0", "false"}
+    wake_response_enabled = _confirm_text_or_voice(
+        "Enable wake-word response after summon?",
+        default=True,
+        voice_engine=voice_engine,
+        tts=tts,
+    )
     config.set("wake_response_enabled", wake_response_enabled)
     if wake_response_enabled:
         _tts_prompt(tts, "Wake response is enabled.")
     else:
         _tts_prompt(tts, "Wake response is disabled. I will listen immediately after wake word detection.")
+
+    _tts_prompt(tts, "Choose your interface mode: waves, bubble, or text-only.")
+    interface_choice = _ask_text_or_voice(
+        "Interface mode [waves/bubble/text, default: waves]: ",
+        voice_engine=voice_engine,
+        tts=tts,
+        default="waves",
+    )
+    visuals_enabled, ui_mode, label = _resolve_interface_choice(interface_choice)
+    config.update({"waves_enabled": visuals_enabled, "ui_mode": ui_mode})
+    if visuals_enabled:
+        _tts_prompt(tts, f"{label.title()} interface selected.")
+    else:
+        _tts_prompt(tts, "Text-only interface selected.")
 
     _tts_prompt(
         tts,
@@ -101,7 +196,12 @@ def run_first_time_setup(config, voice_engine=None, tts=None):
     )
     _print_voice_presets()
     while True:
-        choice = input("Voice preset [jarvis] (name, number, or 'list'): ").strip().lower()
+        choice = _ask_text_or_voice(
+            "Voice preset [jarvis] (name, number, or 'list'): ",
+            voice_engine=voice_engine,
+            tts=tts,
+            default="jarvis",
+        ).strip().lower()
         if choice in {"list", "show", "help", "?"}:
             _print_voice_presets()
             continue
@@ -118,8 +218,12 @@ def run_first_time_setup(config, voice_engine=None, tts=None):
             tts.preview_current_voice(preview_text)
             tts.wait_until_done(timeout=8.0)
             print(f"Previewed {match}.")
-        keep = input("Keep this voice? (yes/no): ").strip().lower()
-        if keep in {"y", "yes"}:
+        if _confirm_text_or_voice(
+            "Keep this voice profile?",
+            default=True,
+            voice_engine=voice_engine,
+            tts=tts,
+        ):
             config.set("voice_preset", match)
             break
 
@@ -136,7 +240,12 @@ def run_first_time_setup(config, voice_engine=None, tts=None):
         )
         sample_path = enroll_voice(voice_engine, strict=True)
         if sample_path:
-            threshold_text = input("Voice authentication strictness [80]: ").strip() or "80"
+            threshold_text = _ask_text_or_voice(
+                "Voice authentication strictness [80]: ",
+                voice_engine=voice_engine,
+                tts=tts,
+                default="80",
+            ).strip() or "80"
             try:
                 threshold = max(0, min(100, int(threshold_text)))
             except ValueError:

@@ -14,13 +14,17 @@ from .voice_auth import _cosine_similarity, _extract_features
 
 
 class WakeWordDetector:
-    def __init__(self, model_path, wake_word, wake_variants=None):
-        print("Loading Vosk model from:", model_path)
+    def __init__(self, model_path, wake_word, wake_variants=None, sensitivity=65):
+        self.verbose = str(os.getenv("ASSISTANT_VERBOSE_LOGS", "0")).strip().lower() in {"1", "true", "yes", "on"}
+        if self.verbose:
+            print("Loading Vosk model from:", model_path)
         self.model = vosk.Model(model_path)
         self.sample_rate = 16000
         self.block_size = int(os.getenv("WAKE_WORD_BLOCK_SIZE", "512"))
-        self.mic_gain = float(os.getenv("WAKE_WORD_GAIN", "6.0"))
-        self.match_threshold = float(os.getenv("WAKE_WORD_MATCH_THRESHOLD", "0.50"))
+        self.base_mic_gain = float(os.getenv("WAKE_WORD_GAIN", "6.0"))
+        self.base_match_threshold = float(os.getenv("WAKE_WORD_MATCH_THRESHOLD", "0.50"))
+        self.mic_gain = self.base_mic_gain
+        self.match_threshold = self.base_match_threshold
         self.voice_light_threshold = float(os.getenv("WAKE_WORD_LIGHT_VOICE_THRESHOLD", "0.35"))
         self.voice_strong_base = float(os.getenv("WAKE_WORD_STRONG_BASE", "0.34"))
         self.voice_strong_span = float(os.getenv("WAKE_WORD_STRONG_SPAN", "0.40"))
@@ -32,8 +36,12 @@ class WakeWordDetector:
         self.voice_reference_path = ""
         self.voice_auth_threshold = 0
         self._light_miss_counter = 0
+        self._audio_level_callback = None
+        self._last_audio_energy = 0.0
+        self.sensitivity = 65
         self.wake_word = self._normalize_name(wake_word)
         self.wake_variants = self._prepare_variants(self.wake_word, wake_variants)
+        self.set_sensitivity(sensitivity)
         self._log_variants()
 
     def update_wake_word(self, wake_word, wake_variants=None):
@@ -42,6 +50,8 @@ class WakeWordDetector:
         self._log_variants()
 
     def _log_variants(self):
+        if not self.verbose:
+            return
         preview = sorted(self.wake_variants)[:30]
         print(f"Wake variants loaded: {len(self.wake_variants)}")
         print("Wake preview:", ", ".join(preview))
@@ -57,10 +67,29 @@ class WakeWordDetector:
             if isinstance(loaded, np.ndarray) and loaded.size:
                 self.voice_reference = loaded.astype(np.float32)
         except Exception as exc:
-            print(f"[wake-word] voice reference unavailable: {exc}")
+            if self.verbose:
+                print(f"[wake-word] voice reference unavailable: {exc}")
 
     def get_voice_reference(self):
         return self.voice_reference
+
+    def set_sensitivity(self, percent):
+        try:
+            value = max(0, min(100, int(percent)))
+        except (TypeError, ValueError):
+            value = 65
+        self.sensitivity = value
+        ratio = value / 100.0
+
+        # Higher sensitivity lowers the fuzzy match bar and increases mic gain.
+        tuned_threshold = self.base_match_threshold + (0.65 - ratio) * 0.28
+        self.match_threshold = max(0.24, min(0.90, tuned_threshold))
+        tuned_gain = self.base_mic_gain * (0.72 + ratio * 0.95)
+        self.mic_gain = max(1.2, min(16.0, tuned_gain))
+        return self.sensitivity
+
+    def get_recent_audio_energy(self):
+        return self._last_audio_energy
 
     def query_speaker_mode(self):
         if self.voice_reference is None:
@@ -238,12 +267,21 @@ class WakeWordDetector:
 
     def audio_callback(self, indata, frames, time_info, status):
         _ = frames, time_info
-        if status:
+        if status and self.verbose:
             print(f"[wake-word] audio status: {status}")
 
         audio = np.frombuffer(indata, dtype=np.int16).astype(np.float32)
         audio *= self.mic_gain
         audio = np.clip(audio, -32768, 32767).astype(np.int16)
+        normalized = audio.astype(np.float32) / 32768.0
+        if normalized.size:
+            self._last_audio_energy = float(np.sqrt(np.mean(np.square(normalized))))
+            callback = self._audio_level_callback
+            if callback is not None:
+                try:
+                    callback(self._last_audio_energy)
+                except Exception:
+                    pass
         self._recent_audio.append(audio.copy())
         self.q.put(audio.tobytes())
 
@@ -348,25 +386,29 @@ class WakeWordDetector:
                 return True
         return False
 
-    def listen_for_wake_word(self, stop_event=None, timeout=None, stop_events=None):
+    def listen_for_wake_word(self, stop_event=None, timeout=None, stop_events=None, on_audio_level=None):
         self.q = queue.Queue()
         started = time.time()
         self._light_miss_counter = 0
+        self._audio_level_callback = on_audio_level
 
-        with sd.RawInputStream(
-            samplerate=self.sample_rate,
-            blocksize=self.block_size,
-            dtype="int16",
-            channels=1,
-            callback=self.audio_callback,
-        ):
-            for text in self._iter_result_texts():
-                if self._should_stop(stop_event=stop_event, stop_events=stop_events):
-                    return False
-                if timeout is not None and (time.time() - started) >= timeout:
-                    return False
-                if text and self.fuzzy_match(text):
-                    recent_audio = self._recent_audio_window()
-                    if self._voice_reference_accepts(recent_audio):
-                        self.last_wake_audio = recent_audio if recent_audio.size else None
-                        return True
+        try:
+            with sd.RawInputStream(
+                samplerate=self.sample_rate,
+                blocksize=self.block_size,
+                dtype="int16",
+                channels=1,
+                callback=self.audio_callback,
+            ):
+                for text in self._iter_result_texts():
+                    if self._should_stop(stop_event=stop_event, stop_events=stop_events):
+                        return False
+                    if timeout is not None and (time.time() - started) >= timeout:
+                        return False
+                    if text and self.fuzzy_match(text):
+                        recent_audio = self._recent_audio_window()
+                        if self._voice_reference_accepts(recent_audio):
+                            self.last_wake_audio = recent_audio if recent_audio.size else None
+                            return True
+        finally:
+            self._audio_level_callback = None

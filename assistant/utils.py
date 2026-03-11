@@ -22,12 +22,14 @@ GREETING_MESSAGES = [
 
 WAKE_RESPONSES = [
     "Yes?",
-    "I'm listening.",
-    "Go ahead.",
-    "What can I do for you?",
-    "How can I help?",
+    "Hmm?",
+    "Tell me.",
+    "You called?",
     "Ready.",
-    "Listening.",
+    "Go on.",
+    "Yeah?",
+    "Speak.",
+    "Huh?",
     "Proceed.",
 ]
 
@@ -223,16 +225,20 @@ def enable_autostart():
         return f"Could not enable auto-start: {exc}"
 
     registry_enabled, registry_error = _set_registry_autostart(f'"{launcher}"')
+    if registry_enabled:
+        try:
+            shortcut = _shortcut_path()
+            if shortcut.exists():
+                shortcut.unlink()
+        except Exception:
+            pass
+        return "Auto-start enabled for immediate launch on login."
 
     shortcut_enabled, shortcut_error = _ensure_startup_shortcut(
         target_path=str(launcher),
         working_directory=str(launcher.parent),
     )
 
-    if registry_enabled and shortcut_enabled:
-        return "Auto-start enabled for immediate launch on login (registry + startup fallback)."
-    if registry_enabled:
-        return "Auto-start enabled for immediate launch on login."
     if shortcut_enabled:
         detail = f" Registry hook unavailable: {registry_error}" if registry_error else ""
         return f"Auto-start enabled with startup folder shortcut.{detail}"
