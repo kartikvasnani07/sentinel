@@ -14,6 +14,10 @@ setup(
         "edge-tts",
         "playsound==1.2.2",
         "pyttsx3",
+        "TTS",
+        "soundfile",
+        "pydub",
+        "transformers>=4.41.0",
         "rich",
         "textual",
         "keyboard",
@@ -27,7 +31,8 @@ setup(
     ],
     entry_points={
         "console_scripts": [
-            "assistant=assistant.main:run"
+            "assistant=assistant.main:run",
+            "assistant-install=assistant.installer:main",
         ]
     },
 )

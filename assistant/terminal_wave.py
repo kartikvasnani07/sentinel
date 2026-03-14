@@ -1,4 +1,5 @@
 import math
+import random
 import shutil
 import sys
 import threading
@@ -21,10 +22,16 @@ class TerminalWaveRenderer:
         self._thread = None
         self._mode = "idle"
         self._style = "waves" if str(style or "").strip().lower() not in self.STYLES else str(style or "").strip().lower()
+        self._style_aliases = {
+            "wave": "waves",
+            "ocean": "waves",
+            "sphere": "bubble",
+        }
         self._audio_level = 0.0
         self._pulse = 0.0
         self._drawn_lines = 0
         self._drawn_width = 0
+        self._style_axis = {}
 
     def start(self):
         if not self.enabled or self._running:
@@ -50,6 +57,7 @@ class TerminalWaveRenderer:
 
     def set_style(self, style):
         candidate = str(style or "").strip().lower()
+        candidate = self._style_aliases.get(candidate, candidate)
         if candidate not in self.STYLES:
             return
         with self._lock:
@@ -121,16 +129,21 @@ class TerminalWaveRenderer:
             frame_time = time.time() - t0
             cols, rows = shutil.get_terminal_size((120, 30))
             width = max(1, cols)
-            if style == "bubble":
-                # Bubble mode uses the full terminal canvas so the sphere stays centered.
+            if style in {"bubble", "cube", "donut", "pyramid", "ellipsoid", "rhombus", "waterball"}:
+                # Shape styles use the full terminal canvas so they stay centered.
                 height = max(10, rows - 2)
             else:
                 height = max(3, min(self.min_height, rows - 6))
             try:
-                if style == "bubble":
-                    lines = self._build_bubble_frame(width=width, height=height, t=frame_time, mode=mode, audio=audio_level, pulse=pulse)
-                else:
-                    lines = self._build_ocean_frame(width=width, height=height, t=frame_time, mode=mode, audio=audio_level, pulse=pulse)
+                lines = self._build_style_frame(
+                    style=style,
+                    width=width,
+                    height=height,
+                    t=frame_time,
+                    mode=mode,
+                    audio=audio_level,
+                    pulse=pulse,
+                )
             except Exception:
                 # Keep renderer alive even if a frame calculation fails.
                 lines = self._build_fallback_frame(width=width, height=height, t=frame_time)
@@ -201,6 +214,258 @@ class TerminalWaveRenderer:
             "speaking": {"amp": 1.8, "speed": 1.6, "foam": 0.30, "splash": 0.24},
         }
         return profiles.get(mode, profiles["idle"])
+
+    def _build_style_frame(self, *, style, width, height, t, mode, audio, pulse):
+        if style == "waves":
+            return self._build_ocean_frame(width, height, t, mode, audio, pulse)
+        if style == "bubble":
+            return self._build_bubble_frame(width, height, t, mode, audio, pulse)
+        return self._build_ocean_frame(width, height, t, mode, audio, pulse)
+
+    def _rotation_axis(self, style):
+        axis = self._style_axis.get(style)
+        if axis is not None:
+            return axis
+        seed = sum(ord(ch) for ch in str(style))
+        rng = random.Random(seed)
+        theta = rng.uniform(0.25, 1.35)
+        phi = rng.uniform(0.25, 1.35)
+        axis = (
+            math.cos(theta) * math.sin(phi),
+            math.sin(theta) * math.sin(phi),
+            math.cos(phi),
+        )
+        self._style_axis[style] = axis
+        return axis
+
+    @staticmethod
+    def _rotate_xyz(x, y, z, rx, ry, rz):
+        cy, sy = math.cos(ry), math.sin(ry)
+        cx, sx = math.cos(rx), math.sin(rx)
+        cz, sz = math.cos(rz), math.sin(rz)
+
+        x, z = (x * cy - z * sy), (x * sy + z * cy)
+        y, z = (y * cx - z * sx), (y * sx + z * cx)
+        x, y = (x * cz - y * sz), (x * sz + y * cz)
+        return x, y, z
+
+    @staticmethod
+    def _put_pixel(lines, x, y, char):
+        if 0 <= y < len(lines) and 0 <= x < len(lines[y]):
+            lines[y][x] = char
+
+    def _draw_line(self, lines, x0, y0, x1, y1, char):
+        x0 = int(round(x0))
+        y0 = int(round(y0))
+        x1 = int(round(x1))
+        y1 = int(round(y1))
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+        while True:
+            self._put_pixel(lines, x0, y0, char)
+            if x0 == x1 and y0 == y1:
+                break
+            e2 = err * 2
+            if e2 > -dy:
+                err -= dy
+                x0 += sx
+            if e2 < dx:
+                err += dx
+                y0 += sy
+
+    def _project_points(self, vertices, *, width, height, scale, rx, ry, rz, z_offset=3.2):
+        projected = []
+        center_x = (width - 1) * 0.5
+        center_y = (height - 1) * 0.5
+        for vx, vy, vz in vertices:
+            x, y, z = self._rotate_xyz(vx, vy, vz, rx, ry, rz)
+            depth = z + z_offset
+            px = center_x + (x * scale / max(0.15, depth))
+            py = center_y + (y * scale / max(0.15, depth))
+            projected.append((px, py, depth))
+        return projected
+
+    def _build_rotating_wire_shape_frame(self, width, height, t, mode, audio, pulse, *, shape):
+        lines = [[" " for _ in range(width)] for _ in range(height)]
+        profile = self._mode_profile(mode)
+        speed = 0.35 + profile["speed"] * 0.18 + audio * 0.25 + pulse * 0.12
+        ax, ay, az = self._rotation_axis(shape)
+        rx = t * speed * (0.6 + abs(ax))
+        ry = t * speed * (0.6 + abs(ay))
+        rz = t * speed * (0.6 + abs(az))
+        scale = min(width * 0.58, height * 1.55) * (0.9 + audio * 0.12 + pulse * 0.05)
+        edge_char = "#" if mode in {"wake", "recording", "speaking"} else "*"
+
+        if shape == "cube":
+            vertices = [
+                (-1, -1, -1),
+                (1, -1, -1),
+                (1, 1, -1),
+                (-1, 1, -1),
+                (-1, -1, 1),
+                (1, -1, 1),
+                (1, 1, 1),
+                (-1, 1, 1),
+            ]
+            edges = [
+                (0, 1), (1, 2), (2, 3), (3, 0),
+                (4, 5), (5, 6), (6, 7), (7, 4),
+                (0, 4), (1, 5), (2, 6), (3, 7),
+            ]
+        elif shape == "pyramid":
+            vertices = [
+                (-1, -0.9, -1),
+                (1, -0.9, -1),
+                (1, -0.9, 1),
+                (-1, -0.9, 1),
+                (0, 1.3, 0),
+            ]
+            edges = [
+                (0, 1), (1, 2), (2, 3), (3, 0),
+                (0, 4), (1, 4), (2, 4), (3, 4),
+            ]
+        else:  # rhombus (octahedron-like wireframe)
+            vertices = [
+                (0, 1.35, 0),
+                (1.0, 0, 0),
+                (0, 0, 1.0),
+                (-1.0, 0, 0),
+                (0, 0, -1.0),
+                (0, -1.35, 0),
+            ]
+            edges = [
+                (0, 1), (0, 2), (0, 3), (0, 4),
+                (5, 1), (5, 2), (5, 3), (5, 4),
+                (1, 2), (2, 3), (3, 4), (4, 1),
+            ]
+
+        projected = self._project_points(vertices, width=width, height=height, scale=scale, rx=rx, ry=ry, rz=rz)
+        for a, b in edges:
+            x0, y0, _ = projected[a]
+            x1, y1, _ = projected[b]
+            self._draw_line(lines, x0, y0, x1, y1, edge_char)
+        return ["".join(row) for row in lines]
+
+    def _build_donut_frame(self, width, height, t, mode, audio, pulse):
+        chars = ".,-~:;=!*#$@"
+        zbuf = [[-1e9 for _ in range(width)] for _ in range(height)]
+        out = [[" " for _ in range(width)] for _ in range(height)]
+        profile = self._mode_profile(mode)
+        spin = t * (0.8 + profile["speed"] * 0.45 + audio * 0.6 + pulse * 0.2)
+        a = spin * 0.7
+        b = spin * 0.9
+        r1 = 1.05 + audio * 0.18
+        r2 = 2.15 + pulse * 0.22
+        k2 = 5.2
+        k1 = min(width, height * 2.1) * 0.30
+        cx = width * 0.5
+        cy = height * 0.5
+
+        for theta_i in range(0, 628, 7):
+            theta = theta_i / 100.0
+            cost, sint = math.cos(theta), math.sin(theta)
+            for phi_i in range(0, 628, 3):
+                phi = phi_i / 100.0
+                cosp, sinp = math.cos(phi), math.sin(phi)
+                circle_x = r2 + r1 * cost
+                circle_y = r1 * sint
+
+                x = circle_x * (math.cos(b) * cosp + math.sin(a) * math.sin(b) * sinp) - circle_y * math.cos(a) * math.sin(b)
+                y = circle_x * (math.sin(b) * cosp - math.sin(a) * math.cos(b) * sinp) + circle_y * math.cos(a) * math.cos(b)
+                z = k2 + math.cos(a) * circle_x * sinp + circle_y * math.sin(a)
+                ooz = 1.0 / max(0.18, z)
+                px = int(cx + k1 * ooz * x)
+                py = int(cy - k1 * ooz * y * 0.55)
+                if not (0 <= px < width and 0 <= py < height):
+                    continue
+                luminance = (
+                    cosp * cost * math.sin(b)
+                    - math.cos(a) * cost * sinp
+                    - math.sin(a) * sint
+                    + math.cos(b) * (math.cos(a) * sint - cost * math.sin(a) * sinp)
+                )
+                if ooz <= zbuf[py][px]:
+                    continue
+                zbuf[py][px] = ooz
+                idx = max(0, min(len(chars) - 1, int((luminance + 1.2) * 4.3)))
+                out[py][px] = chars[idx]
+        return ["".join(row) for row in out]
+
+    def _build_ellipsoid_frame(self, width, height, t, mode, audio, pulse):
+        lines = [[" " for _ in range(width)] for _ in range(height)]
+        chars = " .,:-~=+*#%@"
+        profile = self._mode_profile(mode)
+        cx = (width - 1) * 0.5
+        cy = (height - 1) * 0.5
+        rx = max(8.0, min(width * 0.36, height * 1.65))
+        ry = max(5.0, rx / 2.25)
+        wobble = 0.08 + audio * 0.22 + pulse * 0.12
+        spin = t * (0.55 + profile["speed"] * 0.22)
+        lx, ly, lz = -0.56, -0.28, 0.78
+        norm = math.sqrt(lx * lx + ly * ly + lz * lz)
+        lx, ly, lz = lx / norm, ly / norm, lz / norm
+
+        for y in range(height):
+            ny = (y - cy) / max(1e-6, ry)
+            for x in range(width):
+                nx = (x - cx) / max(1e-6, rx)
+                dist2 = nx * nx + ny * ny
+                if dist2 > 1.0:
+                    continue
+                z = math.sqrt(max(0.0, 1.0 - dist2))
+                deform = math.sin(nx * 7.0 + spin) * math.sin(ny * 5.0 - spin * 0.8) * wobble * (1.0 - dist2)
+                depth = max(0.0, z + deform * 0.25)
+                nnx = nx + deform * 0.2
+                nny = ny - deform * 0.2
+                nnz = max(1e-6, depth)
+                normal = math.sqrt(nnx * nnx + nny * nny + nnz * nnz)
+                nnx, nny, nnz = nnx / normal, nny / normal, nnz / normal
+                light = max(0.0, nnx * lx + nny * ly + nnz * lz)
+                shade = min(1.0, max(0.0, depth * 0.58 + light * 0.66 + (1.0 - nnz) * 0.12))
+                idx = int(shade * (len(chars) - 1))
+                lines[y][x] = chars[idx]
+        return ["".join(row) for row in lines]
+
+    def _build_waterball_frame(self, width, height, t, mode, audio, pulse):
+        lines = [[" " for _ in range(width)] for _ in range(height)]
+        profile = self._mode_profile(mode)
+        cx = (width - 1) * 0.5
+        cy = (height - 1) * 0.5
+        rx = max(8.0, min(width * 0.34, height * 1.6))
+        ry = max(5.0, rx / 2.2)
+        splash = min(1.0, audio * 1.25 + pulse * 0.9 + profile["splash"] * 0.4)
+        water_chars = ".,:;~*#"
+        shell_chars = " .:-=+*#%@"
+        water_base = 0.34
+        water_level = water_base + math.sin(t * (1.4 + splash * 1.8)) * (0.05 + splash * 0.08)
+
+        for y in range(height):
+            ny = (y - cy) / max(1e-6, ry)
+            for x in range(width):
+                nx = (x - cx) / max(1e-6, rx)
+                dist2 = nx * nx + ny * ny
+                if dist2 > 1.02:
+                    continue
+                if dist2 > 1.0:
+                    lines[y][x] = "."
+                    continue
+                z = math.sqrt(max(0.0, 1.0 - dist2))
+                shell_idx = int(min(len(shell_chars) - 1, max(0, (z * 0.45 + (1.0 - z) * 0.55) * (len(shell_chars) - 1))))
+                char = shell_chars[shell_idx]
+
+                surface = water_level + math.sin((nx * 7.0) + t * (2.2 + splash * 3.0)) * (0.04 + splash * 0.10)
+                surface += math.sin((nx * 3.4 + ny * 5.2) - t * (1.9 + splash * 2.6)) * (0.02 + splash * 0.07)
+                if ny >= surface:
+                    water_depth = min(1.0, (ny - surface) / max(0.08, 1.0 - surface))
+                    idx = min(len(water_chars) - 1, int((water_depth * 0.82 + z * 0.18) * (len(water_chars) - 1)))
+                    char = water_chars[idx]
+                    if abs(ny - surface) < 0.035 + splash * 0.02:
+                        char = "~"
+                lines[y][x] = char
+        return ["".join(row) for row in lines]
 
     def _build_ocean_frame(self, width, height, t, mode, audio, pulse):
         width = max(1, int(width))
@@ -335,6 +600,13 @@ class TerminalWaveRenderer:
         aura_strength = min(1.00, profile["aura"] + intensity * 0.35)
         spark_strength = min(1.00, profile["spark"] + intensity * 0.40)
 
+        # Pupil/iris motion for an eyeball-like effect.
+        pupil_wobble = 0.08 + (intensity * 0.05)
+        pupil_x = math.sin(t * (0.65 + profile["spin"] * 0.35)) * pupil_wobble
+        pupil_y = math.cos(t * (0.52 + profile["drift_y"] * 0.28)) * pupil_wobble * 0.65
+        pupil_radius = 0.11 + (intensity * 0.02)
+        iris_radius = pupil_radius + 0.20
+
         # pseudo-3D lighting vector
         lx = -0.62 + math.sin(t * 0.48) * 0.08
         ly = -0.33 + math.cos(t * 0.41) * 0.06
@@ -375,6 +647,20 @@ class TerminalWaveRenderer:
                     spec = diffuse ** (14 + int(profile["spec_power"] * 10))
 
                     shade = 0.18 + (depth * 0.45) + (diffuse * 0.52) + (spec * 0.34) + (fresnel * 0.18)
+
+                    # Iris/pupil shaping for a center dense spot.
+                    dxp = nx - pupil_x
+                    dyp = ny - pupil_y
+                    pupil_dist2 = (dxp * dxp) + (dyp * dyp)
+                    pupil_r2 = pupil_radius * pupil_radius
+                    iris_r2 = iris_radius * iris_radius
+                    if pupil_dist2 <= iris_r2:
+                        iris_strength = max(0.0, 1.0 - (pupil_dist2 / max(1e-6, iris_r2)))
+                        shade = max(shade, 0.70 + iris_strength * 0.18)
+                    if pupil_dist2 <= pupil_r2:
+                        pupil_strength = max(0.0, 1.0 - (pupil_dist2 / max(1e-6, pupil_r2)))
+                        shade = max(shade, 0.86 + pupil_strength * 0.12)
+
                     shade = min(1.0, max(0.0, shade))
                     idx = int(shade * (len(chars) - 1))
                     lines[y][x] = chars[idx]

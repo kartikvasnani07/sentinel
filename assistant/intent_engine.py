@@ -63,8 +63,10 @@ class IntentEngine:
         "set_wake_sensitivity",
         "set_wave_display",
         "set_bubble_display",
+        "set_interface_style",
         "enter_text_mode",
         "project_code",
+        "get_news",
     }
 
     ACTION_WORDS = {
@@ -99,7 +101,7 @@ class IntentEngine:
         "html": ".html",
         "css": ".css",
     }
-    WEBSITE_WORDS = {"youtube", "github", "spotify", "reddit", "gmail", "chatgpt", "google"}
+    WEBSITE_WORDS = {"youtube", "github", "spotify", "reddit", "gmail", "chatgpt", "google", "twitter", "x.com"}
     APP_WORDS = {
         "brave",
         "browser",
@@ -240,6 +242,8 @@ class IntentEngine:
         "waves",
         "ascii",
         "bubble",
+        "interface",
+        "transform",
         "process",
         "processes",
         "background",
@@ -481,6 +485,11 @@ class IntentEngine:
             return True
         if "youtube/" in normalized or "github/" in normalized or "spotify/" in normalized:
             return True
+        if self._contains_any(tokens, {"search", "find", "lookup", "browse"}) and not self._contains_any(tokens, self.APP_WORDS):
+            return True
+        compact = [token for token in tokens if token not in {"open", "visit", "go", "to", "search", "for", "show", "launch", "start"}]
+        if len(compact) == 1 and re.match(r"^[a-z0-9-]{3,30}$", compact[0]) and compact[0] not in self.APP_WORDS:
+            return True
         return False
 
     def _detect_action(self, text, normalized, tokens):
@@ -658,6 +667,11 @@ class IntentEngine:
             scores["set_humor"] += 12
         if self._contains_any(tokens, {"language", "conversation"}) and self._contains_any(tokens, self.ACTION_WORDS["switch"]):
             scores["change_language"] += 12
+        if self._contains_any(tokens, {"news", "headline", "headlines", "trending", "trend", "trends"}) or self._contains_phrase(
+            normalized,
+            {"what is new", "whats new", "what's new", "latest news", "top news", "top headlines", "today's headlines"},
+        ):
+            scores["get_news"] += 18
         if "voice" in token_set and "auth" not in token_set and self._contains_any(
             tokens,
             {"preset", "model", "setup", "configure"} | self.ACTION_WORDS["switch"],
@@ -689,6 +703,15 @@ class IntentEngine:
             self.ACTION_WORDS["switch"] | {"on", "off", "interface"},
         ) and not self._contains_any(tokens, {"status", "state", "check", "current", "what"}):
             scores["set_bubble_display"] += 16
+        interface_style_terms = {"waves", "wave", "bubble"}
+        if (
+            self._contains_any(tokens, {"interface", "style", "theme", "shape", "transform"})
+            and any(term in normalized for term in interface_style_terms)
+            and self._contains_any(tokens, self.ACTION_WORDS["switch"] | {"transform", "to"})
+        ):
+            scores["set_interface_style"] += 18
+        if self._contains_phrase(normalized, {"text interface", "textual interface", "plain interface", "text-only interface"}):
+            scores["set_wave_display"] += 20
         if self._contains_any(tokens, {"wake", "summon", "call"}) and self._contains_any(
             tokens,
             {"sensitivity", "sensitvity", "sensitive"},
@@ -935,8 +958,17 @@ class IntentEngine:
             elif any(word in lowered for word in ("on", "enable", "activate", "unmute")):
                 params["on"] = True
 
-        if action in {"set_wifi", "set_bluetooth", "set_airplane_mode", "set_energy_saver", "set_night_light", "set_autostart", "set_wake_response", "set_wave_display", "set_bubble_display"}:
+        if action in {"set_wifi", "set_bluetooth", "set_airplane_mode", "set_energy_saver", "set_night_light", "set_autostart", "set_wake_response", "set_wave_display", "set_bubble_display", "set_interface_style"}:
             params["on"] = not any(word in lowered for word in ("off", "disable", "deactivate"))
+        if action == "set_wave_display" and self._contains_phrase(
+            lowered,
+            {"text interface", "textual interface", "plain interface", "text-only interface"},
+        ):
+            params["on"] = False
+        if action == "set_interface_style":
+            style = self._extract_interface_style(text)
+            if style:
+                params["style"] = style
         if action == "set_voice_auth":
             if any(word in lowered for word in ("off", "disable", "deactivate")):
                 params["threshold"] = 0
@@ -952,6 +984,10 @@ class IntentEngine:
             match = re.search(r"\b(?:to|in)\s+([a-z]+)\b", lowered)
             if match:
                 params["language"] = match.group(1)
+        if action == "get_news":
+            topic = self._extract_news_topic(text)
+            if topic:
+                params["topic"] = topic
         if action in {"get_setting_status", "open_setting_panel"}:
             params["setting"] = self._extract_setting_name(lowered)
         if action == "kill_process":
@@ -980,6 +1016,13 @@ class IntentEngine:
                 if preset in tokens:
                     params["preset"] = preset
                     break
+            if "preset" not in params:
+                match = re.search(r"\b(?:to|as)\s+([a-z0-9 _-]{2,60})$", lowered, flags=re.IGNORECASE)
+                if match:
+                    candidate = match.group(1).strip(" .")
+                    candidate = re.sub(r"\b(?:voice|model|preset|profile)\b", "", candidate, flags=re.IGNORECASE).strip(" .")
+                    if candidate and candidate not in {"change", "setup", "configure"}:
+                        params["preset"] = candidate
         if action == "change_assistant_name":
             name = self._extract_requested_name(text)
             if name:
@@ -997,6 +1040,12 @@ class IntentEngine:
                 params["song"] = song
             if platform:
                 params["platform"] = platform
+            if self._contains_phrase(lowered, {"incognito", "private mode", "private window"}):
+                params["incognito"] = True
+            if self._contains_phrase(lowered, {"new tab", "separate tab"}):
+                params["new_tab"] = True
+            if self._contains_phrase(lowered, {"new window", "separate window"}):
+                params["new_window"] = True
             directory = self._extract_directory(text)
             if directory is not None:
                 directory_lower = str(directory or "").strip().lower()
@@ -1096,6 +1145,12 @@ class IntentEngine:
             browser = self._extract_browser(text)
             if browser:
                 params["browser"] = browser
+            if self._contains_phrase(lowered, {"incognito", "private mode", "private window"}):
+                params["incognito"] = True
+            if self._contains_phrase(lowered, {"new tab", "separate tab"}):
+                params["new_tab"] = True
+            if self._contains_phrase(lowered, {"new window", "separate window"}):
+                params["new_window"] = True
             if action == "open_path":
                 application = self._extract_application_target(text)
                 if application:
@@ -1179,6 +1234,27 @@ class IntentEngine:
         match = re.search(r"\bin\s+(brave|chrome|edge|firefox|brave browser|google chrome)\b", text, flags=re.IGNORECASE)
         return match.group(1).strip().lower() if match else None
 
+    def _extract_interface_style(self, text):
+        lowered = self._normalize_query_text(text)
+        style_aliases = {
+            "waves": {"wave", "waves", "ascii waves", "ocean"},
+            "bubble": {"bubble", "sphere"},
+        }
+        target_match = re.search(
+            r"\b(?:to|into)\s+(waves?|bubble)\b",
+            lowered,
+            flags=re.IGNORECASE,
+        )
+        if target_match:
+            candidate = target_match.group(1).strip().lower()
+            candidate = "waves" if candidate in {"wave", "waves"} else candidate
+            if candidate in style_aliases:
+                return candidate
+        for style, aliases in style_aliases.items():
+            if any(alias in lowered for alias in aliases):
+                return style
+        return ""
+
     def _extract_application_target(self, text):
         lowered = self._normalize_query_text(text)
         aliases = [
@@ -1247,6 +1323,32 @@ class IntentEngine:
             if phrase in lowered:
                 return phrase
         return ""
+
+    def _extract_news_topic(self, text):
+        lowered = self._normalize_query_text(text)
+        if not lowered:
+            return ""
+        match = re.search(r"\b(?:about|on|in|for|regarding)\s+([a-z0-9 ._-]+)$", lowered)
+        topic = match.group(1).strip(" .") if match else ""
+        if not topic:
+            return ""
+        noise = {
+            "news",
+            "headlines",
+            "headline",
+            "trending",
+            "trend",
+            "trends",
+            "latest",
+            "today",
+            "todays",
+            "today's",
+            "new",
+            "updates",
+            "update",
+        }
+        cleaned = " ".join(token for token in topic.split() if token not in noise).strip()
+        return cleaned or topic
 
     def _parse_number_words(self, words):
         units = {

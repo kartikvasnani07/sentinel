@@ -1,11 +1,15 @@
+import html
 import os
 import pathlib
 import re
 import sys
 import threading
 import time
+import wave
+from urllib.parse import quote_plus
 
 import keyboard
+import requests
 
 try:
     import msvcrt
@@ -13,7 +17,7 @@ except ImportError:
     msvcrt = None
 
 from .bootstrap import run_first_time_setup
-from .config import AssistantConfig, VOICE_PRESETS
+from .config import AssistantConfig, UI_MODES, VOICE_PRESETS
 from .fallback_manager import FallbackManager
 from .intent_engine import IntentEngine
 from .llm_engine import LLMEngine
@@ -60,10 +64,199 @@ MEDIA_EXTENSIONS = {
     ".wmv",
     ".mpeg",
 }
+OPTION_ORDINALS = {
+    "first": 1,
+    "second": 2,
+    "third": 3,
+    "fourth": 4,
+    "fifth": 5,
+    "sixth": 6,
+    "seventh": 7,
+    "eighth": 8,
+    "ninth": 9,
+    "tenth": 10,
+}
 
 
 def _normalize_text(text):
     return " ".join(str(text or "").lower().replace("'", "").split())
+
+
+def _strip_html_tags(value):
+    text = re.sub(r"<[^>]+>", " ", str(value or ""))
+    return " ".join(html.unescape(text).split())
+
+
+def _extract_response_options(text):
+    data = str(text or "").strip()
+    if not data:
+        return []
+    options = []
+    seen = set()
+    for line in data.splitlines():
+        match = re.match(r"^\s*(?:[-*•]\s+|\d+[.)]\s+)(.+)$", line.strip())
+        if not match:
+            continue
+        candidate = match.group(1).strip(" .")
+        if len(candidate) < 2 or len(candidate) > 180:
+            continue
+        key = candidate.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        options.append(candidate)
+        if len(options) >= 10:
+            break
+    return options
+
+
+def _resolve_selected_option(query, options):
+    normalized = _normalize_text(query)
+    if not normalized or not options:
+        return ""
+
+    numbered = re.search(r"\b(?:option|choice|select|pick)\s*(\d{1,2})\b", normalized)
+    if numbered:
+        index = int(numbered.group(1)) - 1
+        if 0 <= index < len(options):
+            return options[index]
+
+    for word, value in OPTION_ORDINALS.items():
+        if re.search(rf"\b{re.escape(word)}\b", normalized):
+            index = value - 1
+            if 0 <= index < len(options):
+                return options[index]
+
+    if normalized.isdigit():
+        index = int(normalized) - 1
+        if 0 <= index < len(options):
+            return options[index]
+
+    for option in options:
+        option_normalized = _normalize_text(option)
+        if option_normalized and (
+            normalized == option_normalized
+            or normalized in option_normalized
+            or option_normalized in normalized
+        ):
+            return option
+    return ""
+
+
+def _expand_query_with_previous_options(query, system):
+    options = system.session_context.get("last_response_options")
+    if not isinstance(options, list) or not options:
+        return query
+    selected = _resolve_selected_option(query, options)
+    if not selected:
+        return query
+    system.session_context["last_selected_option"] = selected
+    return selected
+
+
+def _looks_like_information_query(query):
+    normalized = _normalize_text(query)
+    if not normalized:
+        return False
+    if str(query or "").strip().endswith("?"):
+        return True
+    info_tokens = {
+        "what",
+        "who",
+        "when",
+        "where",
+        "why",
+        "how",
+        "explain",
+        "meaning",
+        "define",
+        "tell",
+        "difference",
+        "guide",
+    }
+    return any(token in normalized.split() for token in info_tokens)
+
+
+def _needs_web_fallback(response):
+    lowered = _normalize_text(response)
+    if not lowered:
+        return True
+    fallback_markers = {
+        "i dont know",
+        "i do not know",
+        "not sure",
+        "unable to answer",
+        "no information available",
+        "couldnt find",
+        "could not find",
+        "system action error",
+        "unknown system action",
+    }
+    return any(marker in lowered for marker in fallback_markers)
+
+
+def _fetch_web_snippets(query, limit=5):
+    url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        )
+    }
+    try:
+        response = requests.get(url, timeout=8, headers=headers)
+        if response.status_code != 200:
+            return []
+        body = response.text
+    except Exception:
+        return []
+
+    snippets = []
+    pattern = re.compile(
+        r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?'
+        r'(?:<a[^>]*class="result__snippet"[^>]*>(.*?)</a>|<div[^>]*class="result__snippet"[^>]*>(.*?)</div>)',
+        re.IGNORECASE | re.DOTALL,
+    )
+    for match in pattern.finditer(body):
+        url_value = match.group(1).strip()
+        title = _strip_html_tags(match.group(2))
+        snippet_raw = match.group(3) or match.group(4) or ""
+        snippet = _strip_html_tags(snippet_raw)
+        if not title:
+            continue
+        snippets.append({"title": title, "snippet": snippet, "url": url_value})
+        if len(snippets) >= limit:
+            break
+    return snippets
+
+
+def _build_web_fallback_response(query, llm):
+    snippets = _fetch_web_snippets(query, limit=5)
+    if not snippets:
+        return ""
+
+    references = "\n".join(
+        f"{index}. {item['title']} | {item['snippet']} | {item['url']}"
+        for index, item in enumerate(snippets, start=1)
+    )
+    prompt = (
+        "Answer the user's query using only the following web snippets.\n"
+        "Respond in English, concise, and mention if confidence is limited.\n"
+        f"User query: {query}\n\nWeb snippets:\n{references}\n\nAnswer:"
+    )
+    try:
+        answer = str(llm.generate(prompt)).strip()
+    except Exception:
+        answer = ""
+
+    if not answer:
+        best = snippets[0]
+        answer = f"{best['title']}: {best['snippet']}".strip()
+
+    top_links = ", ".join(item["url"] for item in snippets[:2] if item.get("url"))
+    if top_links:
+        answer = f"{answer}\n\nSources: {top_links}"
+    return answer
 
 
 def _clear_terminal_screen():
@@ -108,6 +301,7 @@ def _record_terminal_response(terminal_state, system, response):
     terminal_state["last_response"] = text
     system.session_context["last_terminal_response"] = text
     system.session_context["last_suggestion_text"] = text
+    system.session_context["last_response_options"] = _extract_response_options(text)
 
 
 def _resolve_local_setting_status(query, params, config):
@@ -133,9 +327,7 @@ def _resolve_local_setting_status(query, params, config):
         mode = str(config.get("ui_mode", "waves") or "waves").strip().lower()
         if not enabled:
             return "Visual interface is disabled. Text-only interface is active."
-        if mode == "bubble":
-            return "Bubble interface is enabled."
-        return "ASCII wave interface is enabled."
+        return f"{mode.title()} interface is enabled."
 
     if "bubble" in combined:
         enabled = bool(config.get("waves_enabled", True))
@@ -143,6 +335,16 @@ def _resolve_local_setting_status(query, params, config):
         return "Bubble interface is enabled." if enabled and mode == "bubble" else "Bubble interface is disabled."
 
     if "voice model" in combined or "voice preset" in combined or "voice selection" in combined:
+        active_custom = str(config.get("active_custom_voice") or "").strip()
+        if active_custom:
+            profiles = _get_custom_voice_profiles(config)
+            mode = next((item.get("mode") for item in profiles if item.get("name") == active_custom), "")
+            label = "Custom"
+            if mode == "openvoice":
+                label = "OpenVoice custom"
+            elif mode == "coqui":
+                label = "Coqui custom"
+            return f"Current voice model is {label} profile {active_custom}."
         preset = str(config.get("voice_preset", "jarvis")).strip() or "jarvis"
         return f"Current voice model is {preset}."
 
@@ -276,7 +478,12 @@ def _resolve_media_play_request(system, params, query, *, tts, voice, is_text_mo
         return None, None, ""
 
     if len(global_candidates) > 1 and not candidates_in_directory:
-        selected_text = _prompt_choice("Multiple close media files were found. Choose one to open:", [str(item) for item in global_candidates])
+        selected_text = _prompt_choice(
+            "Multiple close media files were found. Choose one to open:",
+            [str(item) for item in global_candidates],
+            tts=tts,
+            voice=voice,
+        )
         if selected_text:
             selected = next(
                 (item for item in global_candidates if str(item) == selected_text or item.name == selected_text),
@@ -341,6 +548,11 @@ def _speak_with_barge_in(
     if not text:
         return ""
     has_live_voice_loop = wake_detector is not None and voice is not None
+    restore_voice_threshold = None
+    if has_live_voice_loop and wake_detector.get_voice_reference() is not None:
+        restore_voice_threshold = wake_detector.voice_auth_threshold
+        if restore_voice_threshold < 60:
+            wake_detector.voice_auth_threshold = 60
     should_hide_waves = bool(hide_waves_during_speech or _is_complex_terminal_response(text))
     if wave_renderer is not None and has_live_voice_loop:
         if should_hide_waves:
@@ -375,12 +587,16 @@ def _speak_with_barge_in(
             transcript = voice.transcribe(audio) if audio is not None else ""
             if wave_renderer is not None:
                 wave_renderer.set_mode("processing")
+            if restore_voice_threshold is not None:
+                wake_detector.voice_auth_threshold = restore_voice_threshold
             return transcript or "__INTERRUPTED__"
     tts.wait_until_done(timeout=timeout)
     if wave_renderer is not None:
         wave_renderer.set_mode("idle")
         if should_hide_waves:
             wave_renderer.pulse(0.3)
+    if restore_voice_threshold is not None:
+        wake_detector.voice_auth_threshold = restore_voice_threshold
     return ""
 
 
@@ -400,7 +616,10 @@ def _capture_voice_text(voice, *, max_duration=4.0, silence_duration=0.6, min_du
 
 
 def _prompt_yes_no(question, *, tts=None, voice=None, default=False):
-    answer = input(question).strip().lower()
+    prompt = question.rstrip()
+    if "press Enter to answer by voice" not in prompt.lower():
+        prompt = f"{prompt} (press Enter to answer by voice): "
+    answer = input(prompt).strip().lower()
     interpreted = _interpret_yes_no(answer)
     if interpreted is not None:
         return interpreted
@@ -419,6 +638,20 @@ def _prompt_yes_no(question, *, tts=None, voice=None, default=False):
     return bool(default)
 
 
+def _prompt_text_or_voice(prompt, *, tts=None, voice=None, max_duration=5.0):
+    typed = input(f"{prompt} (press Enter to answer by voice): ").strip()
+    if typed:
+        return typed
+    if voice is None:
+        return ""
+    reminder = "You can say your answer now."
+    print(f"Assistant: {reminder}")
+    if tts is not None:
+        tts.speak(reminder, replace=True, interrupt=True)
+        tts.wait_until_done(timeout=3.0)
+    return _capture_voice_text(voice, max_duration=max_duration, silence_duration=0.7, min_duration=0.3, start_timeout=3.0).strip()
+
+
 def _interpret_yes_no(text):
     normalized = _normalize_text(text)
     if not normalized:
@@ -431,60 +664,25 @@ def _interpret_yes_no(text):
 
 
 def _confirm_prompt(prompt, *, tts, voice, is_text_mode):
-    if not is_text_mode:
-        if tts is not None:
-            tts.speak(prompt, replace=True, interrupt=True)
-            tts.wait_until_done(timeout=6.0)
-        if voice is None:
-            return _prompt_yes_no(f"{prompt} (yes/no): ", tts=tts, voice=None, default=False)
-        for _ in range(2):
-            transcript = _capture_voice_text(
-                voice,
-                max_duration=4.0,
-                silence_duration=0.6,
-                min_duration=0.2,
-                start_timeout=3.0,
-            )
-            interpreted = _interpret_yes_no(transcript)
-            if interpreted is not None:
-                return interpreted
-            retry_prompt = "Please say yes or no."
-            if tts is not None:
-                tts.speak(retry_prompt, replace=True, interrupt=True)
-                tts.wait_until_done(timeout=4.0)
-        return False
-
     print(f"Assistant: {prompt}")
-    typed = input(f"{prompt} (yes/no, press Enter to answer by voice): ").strip().lower()
-    interpreted = _interpret_yes_no(typed)
-    if interpreted is not None:
-        return interpreted
-    if voice is None:
-        return False
-    for _ in range(2):
-        transcript = _capture_voice_text(
-            voice,
-            max_duration=4.0,
-            silence_duration=0.6,
-            min_duration=0.2,
-            start_timeout=3.0,
-        )
-        interpreted = _interpret_yes_no(transcript)
-        if interpreted is not None:
-            return interpreted
-        retry_prompt = "Please say yes or no."
-        print(f"Assistant: {retry_prompt}")
-        if tts is not None:
-            tts.speak(retry_prompt, replace=True, interrupt=True)
-            tts.wait_until_done(timeout=4.0)
-    return False
+    if tts is not None:
+        tts.speak(prompt, replace=True, interrupt=True)
+        tts.wait_until_done(timeout=6.0)
+    return _prompt_yes_no(f"{prompt} (yes/no)", tts=tts, voice=voice, default=False)
 
 
-def _prompt_choice(question, options):
+def _prompt_choice(question, options, *, tts=None, voice=None):
     print(question)
     for index, option in enumerate(options, start=1):
         print(f"  {index}. {option}")
-    answer = input("Enter the number or exact file name (blank to cancel): ").strip()
+    answer = input("Enter the number or exact file name (press Enter to answer by voice): ").strip()
+    if not answer and voice is not None:
+        prompt = "Please say the number or exact name."
+        print(f"Assistant: {prompt}")
+        if tts is not None:
+            tts.speak(prompt, replace=True, interrupt=True)
+            tts.wait_until_done(timeout=4.0)
+        answer = _normalize_text(_capture_voice_text(voice, max_duration=5.0, silence_duration=0.7, min_duration=0.3, start_timeout=3.0))
     if not answer:
         return ""
     if answer.isdigit():
@@ -494,11 +692,53 @@ def _prompt_choice(question, options):
     return answer
 
 
-def _print_voice_preset_options():
+def _get_custom_voice_profiles(config):
+    profiles = config.get("custom_voice_profiles", [])
+    if not isinstance(profiles, list):
+        return []
+    cleaned = []
+    for item in profiles:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        mode = str(item.get("mode") or "coqui").strip().lower()
+        if mode not in {"coqui", "openvoice", "auto"}:
+            continue
+        if mode == "coqui":
+            sample_path = str(item.get("sample_path") or item.get("path") or "").strip()
+            if not name or not sample_path:
+                continue
+            cleaned.append({"name": name, "mode": "coqui", "sample_path": sample_path})
+            continue
+        speaker_path = str(item.get("speaker_path") or item.get("sample_path") or "").strip()
+        if not name or not speaker_path:
+            continue
+        profile = {"name": name, "mode": mode, "speaker_path": speaker_path}
+        openvoice_model_path = str(item.get("openvoice_model_path") or "").strip()
+        if openvoice_model_path:
+            profile["openvoice_model_path"] = openvoice_model_path
+        cleaned.append(profile)
+    return cleaned[:10]
+
+
+def _print_voice_preset_options(config=None):
     print("\nAvailable voice models:")
     for index, (name, preset) in enumerate(VOICE_PRESETS.items(), start=1):
         description = preset.get("description", name).strip()
         print(f"  {index}. {name} - {description}")
+    if config is not None:
+        custom_profiles = _get_custom_voice_profiles(config)
+        if custom_profiles:
+            print("\nSaved custom voices:")
+            for index, profile in enumerate(custom_profiles, start=1):
+                if profile.get("mode") == "openvoice":
+                    speaker_name = pathlib.Path(profile.get("speaker_path", "")).name
+                    label = f"OpenVoice speaker: {speaker_name}"
+                else:
+                    sample_name = pathlib.Path(profile.get("sample_path", "")).name
+                    label = f"Coqui sample: {sample_name}"
+                print(f"  c{index}. {profile['name']} - {label}")
+    print("\nCommands: 'add custom' to add a custom voice, 'delete' to remove one, 'list' to show this menu.")
 
 
 def _resolve_voice_preset_choice(choice):
@@ -515,8 +755,274 @@ def _resolve_voice_preset_choice(choice):
     return next((name for name in VOICE_PRESETS if name in cleaned), "")
 
 
+def _resolve_custom_voice_choice(choice, profiles):
+    cleaned = str(choice or "").strip().lower()
+    if not cleaned:
+        return None
+    if cleaned.startswith("c") and cleaned[1:].isdigit():
+        index = int(cleaned[1:]) - 1
+        if 0 <= index < len(profiles):
+            return profiles[index]
+    if cleaned.isdigit():
+        index = int(cleaned) - 1
+        if 0 <= index < len(profiles):
+            return profiles[index]
+    for profile in profiles:
+        if str(profile.get("name") or "").strip().lower() == cleaned:
+            return profile
+    for profile in profiles:
+        if cleaned in str(profile.get("name") or "").strip().lower():
+            return profile
+    return None
+
+
+def _save_voice_audio_sample(audio, sample_rate, destination):
+    destination = pathlib.Path(destination).resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(destination), "wb") as stream:
+        stream.setnchannels(1)
+        stream.setsampwidth(2)
+        stream.setframerate(int(sample_rate))
+        stream.writeframes(audio.astype("int16").tobytes())
+    return str(destination)
+
+
+def _record_custom_voice_sample(voice, destination, *, tts=None):
+    if voice is None:
+        return "", "Voice capture is unavailable."
+    prompt = "Press and hold Enter to record your voice. Release Enter to stop."
+    print(f"Assistant: {prompt}")
+    if tts is not None:
+        tts.speak(prompt, replace=True, interrupt=True)
+        tts.wait_until_done(timeout=4.0)
+    audio = None
+    if hasattr(voice, "record_while_key_pressed"):
+        audio = voice.record_while_key_pressed("enter", max_duration=60.0, start_timeout=15.0)
+    if audio is None:
+        audio = voice.record_until_silence(
+            max_duration=20.0,
+            silence_duration=1.2,
+            min_duration=2.0,
+            start_timeout=5.0,
+            fast_start=True,
+        )
+    if audio is None:
+        return "", "No audio was captured for the custom voice sample."
+    saved = _save_voice_audio_sample(audio, voice.sample_rate, destination)
+    return saved, ""
+
+
+def _register_custom_voice_profile(
+    config,
+    *,
+    name,
+    mode,
+    sample_path="",
+    speaker_path="",
+    openvoice_model_path="",
+):
+    display_name = str(name or "").strip()
+    if not display_name:
+        return False, "Custom voice name is required."
+
+    mode = str(mode or "coqui").strip().lower()
+    if mode not in {"coqui", "openvoice", "auto"}:
+        return False, "Unsupported custom voice mode."
+
+    if mode == "coqui":
+        path_text = str(sample_path or "").strip().strip('"').strip("'")
+        if not path_text:
+            return False, "Custom voice sample path is required."
+        sample = pathlib.Path(path_text)
+        if not sample.exists():
+            return False, f"Voice sample was not found: {sample}"
+        record = {"name": display_name, "mode": "coqui", "sample_path": str(sample.resolve())}
+    else:
+        path_text = str(speaker_path or "").strip().strip('"').strip("'")
+        if not path_text:
+            return False, "OpenVoice speaker sample path is required."
+        speaker = pathlib.Path(path_text)
+        if not speaker.exists():
+            return False, f"OpenVoice speaker sample was not found: {speaker}"
+        record = {
+            "name": display_name,
+            "mode": mode,
+            "speaker_path": str(speaker.resolve()),
+        }
+        model_text = str(openvoice_model_path or "").strip().strip('"').strip("'")
+        if model_text:
+            model_path = pathlib.Path(model_text)
+            if not model_path.exists():
+                return False, f"OpenVoice model was not found: {model_path}"
+            record["openvoice_model_path"] = str(model_path.resolve())
+
+    profiles = _get_custom_voice_profiles(config)
+    existing = next((item for item in profiles if item["name"].lower() == display_name.lower()), None)
+    if existing is None and len(profiles) >= 10:
+        return False, "You can save up to 10 custom voice profiles. Delete one before adding another."
+
+    if existing is not None:
+        profiles = [record if item["name"].lower() == display_name.lower() else item for item in profiles]
+    else:
+        profiles.append(record)
+    config.update({"custom_voice_profiles": profiles})
+    return True, f"Saved custom voice profile '{display_name}'."
+
+
+def _delete_custom_voice_profile(config, *, name_or_index):
+    profiles = _get_custom_voice_profiles(config)
+    if not profiles:
+        return False, "No custom voice profiles are saved."
+    token = str(name_or_index or "").strip().lower()
+    if not token:
+        return False, "No custom voice name or number was provided."
+
+    target = None
+    if token.startswith("c") and token[1:].isdigit():
+        index = int(token[1:]) - 1
+        if 0 <= index < len(profiles):
+            target = profiles[index]
+    elif token.isdigit():
+        index = int(token) - 1
+        if 0 <= index < len(profiles):
+            target = profiles[index]
+    else:
+        target = next((item for item in profiles if item["name"].lower() == token), None)
+        if target is None:
+            target = next((item for item in profiles if token in item["name"].lower()), None)
+
+    if target is None:
+        return False, "No matching custom voice profile was found."
+
+    updated = [item for item in profiles if item["name"].lower() != target["name"].lower()]
+    config.update({"custom_voice_profiles": updated})
+    if str(config.get("active_custom_voice") or "").strip().lower() == target["name"].lower():
+        config.set("active_custom_voice", "")
+    return True, f"Deleted custom voice profile '{target['name']}'."
+
+
+def _setup_custom_voice_profile_interactively(config, tts, *, voice=None):
+    mode_choice = _prompt_text_or_voice(
+        "Custom voice engine (coqui/openvoice/auto)",
+        tts=tts,
+        voice=voice,
+        max_duration=4.0,
+    ).strip().lower()
+    if not mode_choice:
+        mode_choice = "coqui"
+    if mode_choice in {"cancel", "stop", "exit"}:
+        return False, "Custom voice setup cancelled."
+    if mode_choice not in {"coqui", "openvoice", "auto"}:
+        mode_choice = "coqui"
+    resolved_mode = mode_choice
+    if mode_choice == "auto":
+        resolved_mode = "openvoice" if os.getenv("OPENVOICE_INFER_CMD") else "coqui"
+
+    source = input(
+        "Custom voice source [path/record/cancel] (Enter for voice input): "
+    ).strip().lower()
+    if not source and voice is not None:
+        source_prompt = "Say path or record."
+        print(f"Assistant: {source_prompt}")
+        tts.speak(source_prompt, replace=True, interrupt=True)
+        tts.wait_until_done(timeout=3.0)
+        source = _normalize_text(
+            _capture_voice_text(
+                voice, max_duration=4.0, silence_duration=0.7, min_duration=0.2, start_timeout=2.8
+            )
+        )
+    if source in {"cancel", "stop", "exit"}:
+        return False, "Custom voice setup cancelled."
+
+    sample_path = ""
+    if source in {"record", "live", "mic", "microphone"}:
+        custom_dir = pathlib.Path.home() / ".assistant" / "custom_voices"
+        timestamp = int(time.time())
+        destination = custom_dir / f"sample_{timestamp}.wav"
+        sample_path, error = _record_custom_voice_sample(voice, destination, tts=tts)
+        if error:
+            return False, error
+    else:
+        if source not in {"path", ""}:
+            sample_path = source
+        if not sample_path:
+            sample_path = _prompt_text_or_voice(
+                "Enter path to voice sample file",
+                tts=tts,
+                voice=voice,
+                max_duration=6.0,
+            ).strip().strip('"').strip("'")
+        if not sample_path:
+            return False, "No custom voice sample path was provided."
+
+    openvoice_model_path = ""
+    if resolved_mode == "openvoice":
+        openvoice_model_path = _prompt_text_or_voice(
+            "OpenVoice model path (optional, blank to skip)",
+            tts=tts,
+            voice=voice,
+            max_duration=5.0,
+        ).strip().strip('"').strip("'")
+        if _normalize_text(openvoice_model_path) in {"skip", "none", "no"}:
+            openvoice_model_path = ""
+
+    profile_name = _prompt_text_or_voice(
+        "Save this custom voice as name",
+        tts=tts,
+        voice=voice,
+        max_duration=4.5,
+    ).strip()
+    if not profile_name:
+        return False, "Custom voice name was not provided."
+
+    saved, message = _register_custom_voice_profile(
+        config,
+        name=profile_name,
+        mode=resolved_mode,
+        sample_path=sample_path if resolved_mode == "coqui" else "",
+        speaker_path=sample_path if resolved_mode != "coqui" else "",
+        openvoice_model_path=openvoice_model_path,
+    )
+    if not saved:
+        return False, message
+
+    profile = next(
+        (item for item in _get_custom_voice_profiles(config) if item["name"].lower() == profile_name.lower()),
+        None,
+    )
+    if not profile:
+        return False, "Custom voice profile was saved but could not be loaded."
+
+    result = tts.apply_custom_voice_profile(profile)
+    print(result)
+    ok, err = tts.check_custom_voice_ready() if hasattr(tts, "check_custom_voice_ready") else (True, "")
+    if not ok:
+        tts.clear_custom_voice()
+        config.set("active_custom_voice", "")
+        return False, f"Custom voice could not be loaded. {err}"
+    preview_line = f"This is custom voice {profile['name']}. Do you want to use this voice?"
+    if not _confirm_prompt(preview_line, tts=tts, voice=voice, is_text_mode=False):
+        return False, "Custom voice not applied."
+
+    config.set("active_custom_voice", profile["name"])
+    return True, f"Custom voice applied: {profile['name']}."
+
+
+def _apply_active_voice_from_config(config, tts):
+    active_custom = str(config.get("active_custom_voice") or "").strip()
+    custom_profiles = _get_custom_voice_profiles(config)
+    if active_custom:
+        profile = next((item for item in custom_profiles if item["name"] == active_custom), None)
+        if profile:
+            applied = tts.apply_custom_voice_profile(profile)
+            if "could not" not in applied.lower() and "not found" not in applied.lower():
+                return applied
+    tts.clear_custom_voice()
+    return tts.apply_voice_preset(config.get("voice_preset", "jarvis"))
+
+
 def _setup_voice_model_interactively(config, tts, *, voice=None):
-    _print_voice_preset_options()
+    _print_voice_preset_options(config)
     while True:
         choice = input("Voice model (name/number, 'list', blank to use voice/cancel): ").strip().lower()
         if not choice and voice is not None:
@@ -528,7 +1034,36 @@ def _setup_voice_model_interactively(config, tts, *, voice=None):
         if not choice:
             return False, "Voice model setup cancelled."
         if choice in {"list", "show", "help", "?"}:
-            _print_voice_preset_options()
+            _print_voice_preset_options(config)
+            continue
+        if choice in {"add custom", "custom", "custom voice", "record custom voice"}:
+            applied, result = _setup_custom_voice_profile_interactively(config, tts, voice=voice)
+            if applied:
+                return True, result
+            print(result)
+            continue
+        if choice in {"delete custom", "remove custom", "delete voice", "remove voice", "delete", "remove"}:
+            delete_target = _prompt_text_or_voice(
+                "Delete custom voice by name or number",
+                tts=tts,
+                voice=voice,
+                max_duration=4.5,
+            )
+            delete_target = _normalize_text(delete_target)
+            ok, message = _delete_custom_voice_profile(config, name_or_index=delete_target)
+            print(message)
+            if ok:
+                continue
+            continue
+        custom_choice = _resolve_custom_voice_choice(choice, _get_custom_voice_profiles(config))
+        if custom_choice is not None:
+            result = tts.apply_custom_voice_profile(custom_choice)
+            print(result)
+            preview_line = f"This is custom voice {custom_choice['name']}. Do you want to use this voice?"
+            if _confirm_prompt(preview_line, tts=tts, voice=voice, is_text_mode=False):
+                config.set("active_custom_voice", custom_choice["name"])
+                return True, f"Custom voice applied: {custom_choice['name']}."
+            print("Voice model not applied. Choose another model.")
             continue
         preset = _resolve_voice_preset_choice(choice)
         if not preset:
@@ -544,6 +1079,7 @@ def _setup_voice_model_interactively(config, tts, *, voice=None):
         tts.wait_until_done(timeout=8.0)
         if _confirm_prompt("Use this voice model?", tts=tts, voice=voice, is_text_mode=False):
             config.set("voice_preset", preset)
+            config.set("active_custom_voice", "")
             _preview_active_voice(config, tts)
             return True, f"Voice model changed to {preset}."
         print("Voice model not applied. Choose another model.")
@@ -562,7 +1098,12 @@ def _resolve_transfer_request(system, action, params, *, tts, voice, is_text_mod
         if len(candidates) == 1:
             chosen = candidates[0]
         else:
-            selected = _prompt_choice("Multiple source matches found. Choose the exact source path:", [str(item) for item in candidates])
+            selected = _prompt_choice(
+                "Multiple source matches found. Choose the exact source path:",
+                [str(item) for item in candidates],
+                tts=tts,
+                voice=voice,
+            )
             if not selected:
                 return None, "Transfer cancelled."
             chosen = next((item for item in candidates if str(item) == selected or item.name == selected), None)
@@ -581,6 +1122,8 @@ def _resolve_transfer_request(system, action, params, *, tts, voice, is_text_mod
                 selected = _prompt_choice(
                     "Multiple destination directories matched. Choose the destination path:",
                     [str(item) for item in destination_candidates],
+                    tts=tts,
+                    voice=voice,
                 )
                 if not selected:
                     return None, "Transfer cancelled."
@@ -607,7 +1150,12 @@ def _resolve_delete_request(system, params, *, tts, voice, is_text_mode):
         chosen = candidates[0]
     else:
         choices = [str(candidate) for candidate in candidates]
-        selected = _prompt_choice("Multiple matching paths were found. Choose the exact one to delete:", choices)
+        selected = _prompt_choice(
+            "Multiple matching paths were found. Choose the exact one to delete:",
+            choices,
+            tts=tts,
+            voice=voice,
+        )
         if not selected:
             return None, "Deletion cancelled."
         chosen = next((candidate for candidate in candidates if str(candidate) == selected or candidate.name == selected), None)
@@ -634,6 +1182,8 @@ def _resolve_existing_path_request(system, params, *, tts, voice, is_text_mode, 
                 picked = _prompt_choice(
                     "I found this file outside the specified directory. Choose the file to continue:",
                     [str(item) for item in fallback_candidates],
+                    tts=tts,
+                    voice=voice,
                 )
                 if picked:
                     selected = next(
@@ -661,7 +1211,12 @@ def _resolve_existing_path_request(system, params, *, tts, voice, is_text_mode, 
     chosen = exact_matches[0] if exact_matches else candidates[0]
     if len(candidates) > 1 and not exact_matches:
         choices = [str(candidate) for candidate in candidates]
-        selected = _prompt_choice(f"Multiple close matches were found. Choose the exact path to {purpose}:", choices)
+        selected = _prompt_choice(
+            f"Multiple close matches were found. Choose the exact path to {purpose}:",
+            choices,
+            tts=tts,
+            voice=voice,
+        )
         if not selected:
             return None, f"{purpose.title()} cancelled."
         chosen = next((candidate for candidate in candidates if str(candidate) == selected or candidate.name == selected), None)
@@ -686,7 +1241,12 @@ def _resolve_create_request(system, params, *, tts=None, voice=None):
     requested_name = str(params.get("name") or "notes.txt").strip()
     directory = params.get("directory")
     if not directory:
-        selected_path = input(f"Enter a directory path for '{requested_name}' (blank for Home): ").strip()
+        selected_path = _prompt_text_or_voice(
+            f"Enter a directory path for '{requested_name}' (blank for Home)",
+            tts=tts,
+            voice=voice,
+            max_duration=6.0,
+        )
         if _normalize_text(selected_path) == "cancel":
             return None, "Creation cancelled."
         params["directory"] = selected_path or str(pathlib.Path.home())
@@ -767,7 +1327,7 @@ def _run_setup_flow(
     run_first_time_setup(config, voice_engine=voice, tts=tts)
     llm.language = "en"
     llm.humor_level = config.get("humor_level", 50)
-    tts.apply_voice_preset(config.get("voice_preset", "jarvis"))
+    _apply_active_voice_from_config(config, tts)
     system.clear_context()
     memory.clear()
     terminal_state["last_response"] = ""
@@ -812,6 +1372,7 @@ def _process_command(
     is_text_mode=False,
     wave_renderer=None,
 ):
+    query = _expand_query_with_previous_options(query, system)
     context = dict(system.session_context)
     intent_data = intent_engine.detect(query, context=context)
     intent = intent_data.get("intent", "conversation")
@@ -1086,14 +1647,35 @@ def _process_command(
         return None
 
     if action == "change_voice":
+        restore_wave = bool(wave_renderer is not None and wave_renderer.enabled)
+        if wave_renderer is not None and wave_renderer.enabled:
+            wave_renderer.pause_and_clear()
+            _clear_terminal_screen()
         preset = str(params.get("preset") or "").strip().lower()
         if not preset:
             applied, result = _setup_voice_model_interactively(config, tts, voice=voice)
         else:
-            result = tts.apply_voice_preset(preset)
-            if "Unknown voice preset" not in result:
-                config.set("voice_preset", preset)
-                _preview_active_voice(config, tts)
+            custom_profile = _resolve_custom_voice_choice(preset, _get_custom_voice_profiles(config))
+            if custom_profile is not None:
+                result = tts.apply_custom_voice_profile(custom_profile)
+                ok, err = tts.check_custom_voice_ready() if hasattr(tts, "check_custom_voice_ready") else (True, "")
+                if not ok:
+                    tts.clear_custom_voice()
+                    config.set("active_custom_voice", "")
+                    result = f"Custom voice could not be loaded. {err}"
+                elif "could not" not in result.lower() and "not found" not in result.lower():
+                    config.set("active_custom_voice", custom_profile["name"])
+            else:
+                result = tts.apply_voice_preset(preset)
+                if "Unknown voice preset" not in result:
+                    config.set("voice_preset", preset)
+                    config.set("active_custom_voice", "")
+                    _preview_active_voice(config, tts)
+        if wave_renderer is not None and restore_wave:
+            wave_renderer.set_style(config.get("ui_mode", "waves"))
+            wave_renderer.set_enabled(bool(config.get("waves_enabled", True)))
+            if wave_renderer.enabled:
+                wave_renderer.set_mode("idle")
         _show_terminal_output(result)
         _record_terminal_response(terminal_state, system, result)
         if can_speak:
@@ -1181,6 +1763,42 @@ def _process_command(
                 wave_renderer.set_enabled(False)
                 _prepare_terminal_for_text(wave_renderer=None)
         result = "Bubble interface enabled." if enabled else "Bubble interface disabled. Using text status interface."
+        _show_terminal_output(result, force=True)
+        _record_terminal_response(terminal_state, system, result)
+        if can_speak:
+            _speak_with_barge_in(
+                tts,
+                result,
+                wake_detector=wake_detector if not is_text_mode else None,
+                voice=voice if not is_text_mode else None,
+                wave_renderer=wave_renderer,
+            )
+        return None
+
+    if action == "set_interface_style":
+        enabled = bool(params.get("on", True))
+        style = str(params.get("style") or config.get("ui_mode", "waves")).strip().lower()
+        if style not in UI_MODES:
+            style = "waves"
+        if enabled:
+            config.update({"waves_enabled": True, "ui_mode": style})
+        else:
+            config.set("waves_enabled", False)
+        if wave_renderer is not None:
+            if enabled:
+                wave_renderer.pause_and_clear()
+                wave_renderer.set_style(style)
+                wave_renderer.set_enabled(True)
+                wave_renderer.set_mode("idle")
+                wave_renderer.pulse(0.5)
+            else:
+                wave_renderer.set_enabled(False)
+                _prepare_terminal_for_text(wave_renderer=None)
+        result = (
+            f"{style.title()} interface enabled."
+            if enabled
+            else f"{style.title()} interface disabled. Using text status interface."
+        )
         _show_terminal_output(result, force=True)
         _record_terminal_response(terminal_state, system, result)
         if can_speak:
@@ -1350,6 +1968,10 @@ def _process_command(
             wave_renderer.set_mode("processing")
         local_status = _resolve_local_setting_status(query, params, config) if action == "get_setting_status" else None
         result = local_status if local_status is not None else system.execute(action, params)
+        if local_status is None and _needs_web_fallback(result) and _looks_like_information_query(query):
+            web_result = _build_web_fallback_response(query, llm)
+            if web_result:
+                result = web_result
         _show_terminal_output(result)
         memory.add("user", query)
         memory.add("assistant", result)
@@ -1376,6 +1998,10 @@ def _process_command(
     if wave_renderer is not None:
         wave_renderer.set_mode("processing")
     response = pipeline.run(prompt, speak=False, display=is_text_mode)
+    if _needs_web_fallback(response) and _looks_like_information_query(query):
+        web_response = _build_web_fallback_response(query, llm)
+        if web_response:
+            response = web_response
     if wave_renderer is not None:
         if not is_text_mode:
             wave_renderer.clear_for_response()
@@ -1620,7 +2246,7 @@ def run():
 
     voice.warmup_local_model_async()
 
-    tts.apply_voice_preset(config.get("voice_preset", "jarvis"))
+    _apply_active_voice_from_config(config, tts)
     intent_engine = IntentEngine(llm)
     pipeline = StreamingPipeline(llm, tts)
 
@@ -1700,12 +2326,16 @@ def run():
 
             if text_mode_toggle_event.is_set():
                 text_mode_toggle_event.clear()
-                wave_renderer.pause_and_clear()
+                if wave_renderer is not None:
+                    wave_renderer.set_enabled(False)
                 _clear_terminal_screen()
                 if config.get("password_hash") and not prompt_password_check(config.get("password_hash"), purpose="enter text mode"):
                     print("Access denied for text mode.")
-                    if wave_renderer.enabled:
-                        wave_renderer.set_mode("idle")
+                    if wave_renderer is not None:
+                        wave_renderer.set_enabled(bool(config.get("waves_enabled", True)))
+                        wave_renderer.set_style(config.get("ui_mode", "waves"))
+                        if wave_renderer.enabled:
+                            wave_renderer.set_mode("idle")
                     continue
                 _clear_terminal_screen()
                 text_mode_result = _run_text_mode(
@@ -1725,7 +2355,11 @@ def run():
                     voice,
                     wave_renderer=wave_renderer,
                 )
-                wave_renderer.set_mode("idle")
+                if wave_renderer is not None:
+                    wave_renderer.set_enabled(bool(config.get("waves_enabled", True)))
+                    wave_renderer.set_style(config.get("ui_mode", "waves"))
+                    if wave_renderer.enabled:
+                        wave_renderer.set_mode("idle")
                 if text_mode_result == "FACTORY_RESET":
                     result = _run_setup_flow(
                         config,

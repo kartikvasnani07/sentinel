@@ -17,6 +17,10 @@ edge-tts
 playsound==1.2.2
 pyttsx3
 piper-tts
+TTS
+soundfile
+pydub
+transformers>=4.41.0
 
 # Terminal UI
 rich

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 import webbrowser
+import xml.etree.ElementTree as ET
 from ctypes import POINTER, cast
 from dataclasses import dataclass
 from difflib import get_close_matches
@@ -130,6 +131,18 @@ class SystemActions:
         "edge": "msedge.exe",
         "microsoft edge": "msedge.exe",
         "firefox": "firefox.exe",
+        "brave-linux": "brave-browser",
+        "chrome-linux": "google-chrome",
+        "edge-linux": "microsoft-edge",
+    }
+    BROWSER_PROCESS_HINTS = {
+        "brave": {"names": {"brave"}, "titles": {"brave"}},
+        "brave browser": {"names": {"brave"}, "titles": {"brave"}},
+        "chrome": {"names": {"chrome", "google-chrome"}, "titles": {"chrome", "google chrome"}},
+        "google chrome": {"names": {"chrome", "google-chrome"}, "titles": {"chrome", "google chrome"}},
+        "edge": {"names": {"msedge", "microsoft-edge"}, "titles": {"edge", "microsoft edge"}},
+        "microsoft edge": {"names": {"msedge", "microsoft-edge"}, "titles": {"edge", "microsoft edge"}},
+        "firefox": {"names": {"firefox"}, "titles": {"firefox"}},
     }
     SPECIAL_FOLDERS = {
         "desktop": "Desktop",
@@ -290,6 +303,7 @@ class SystemActions:
             "eject_drive": self._eject_drive,
             "run_as_admin": self._run_as_admin,
             "play_music": self._play_music,
+            "get_news": self._get_news,
             "draw_file_tree": self._draw_file_tree,
             "project_code": self._project_code,
         }
@@ -479,6 +493,8 @@ class SystemActions:
             return "Closed all open applications."
         if action == "list_processes":
             return "Listing running background processes."
+        if action == "get_news":
+            return text
         if action == "kill_process":
             process_id = params.get("process_id")
             process_name = params.get("process")
@@ -1207,8 +1223,18 @@ $matches | Stop-Process -Force
         )
         if domain_match:
             return domain_match.group(1)
-        if "youtube" in lowered or "github" in lowered or "spotify" in lowered:
+        if "youtube" in lowered or "github" in lowered or "spotify" in lowered or "twitter" in lowered or re.search(r"\bx\.com\b", lowered):
             return lowered
+        verb_match = re.search(
+            r"\b(?:open|visit|go to|browse|search|search for|find)\s+([a-z0-9-]{3,40})(?:\s+(.+))?$",
+            lowered,
+        )
+        if verb_match:
+            site = verb_match.group(1).strip().lower()
+            tail = (verb_match.group(2) or "").strip()
+            blocked = set(self.APP_ALIASES.keys()) | {"camera", "blender", "matlab", "explorer", "terminal"}
+            if site and site not in blocked:
+                return f"{site} {tail}".strip()
         return None
 
     def _extract_directory_from_text(self, text):
@@ -1797,24 +1823,159 @@ $matches | Stop-Process -Force
         return f"Opened {target}."
 
     def _find_browser_executable(self, browser):
-        alias = self.BROWSER_ALIASES.get(browser, browser)
-        return self._find_executable(alias)
-
-    def _open_website(self, params):
-        url = self._resolve_website_url(params)
-        browser = str(params.get("browser") or "").strip().lower()
-
-        if browser:
-            executable = self._find_browser_executable(browser)
+        key = str(browser or "").strip().lower()
+        if not key:
+            return None
+        alias_candidates = []
+        alias = self.BROWSER_ALIASES.get(key)
+        if alias:
+            alias_candidates.append(alias)
+        if not self.is_windows:
+            linux_aliases = {
+                "brave": "brave-browser",
+                "brave browser": "brave-browser",
+                "chrome": "google-chrome",
+                "google chrome": "google-chrome",
+                "edge": "microsoft-edge",
+                "microsoft edge": "microsoft-edge",
+                "firefox": "firefox",
+            }
+            if linux_aliases.get(key):
+                alias_candidates.append(linux_aliases[key])
+        alias_candidates.append(key)
+        seen = set()
+        for candidate in alias_candidates:
+            normalized = str(candidate).strip().lower()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            executable = self._find_executable(candidate)
             if executable:
-                subprocess.Popen([executable, url])
-                return f"Opened {url} in {browser}."
+                return executable
+        return None
+
+    def _browser_hints(self, browser=None):
+        key = str(browser or "").strip().lower()
+        names = set()
+        titles = set()
+        if key and key in self.BROWSER_PROCESS_HINTS:
+            names.update(self.BROWSER_PROCESS_HINTS[key]["names"])
+            titles.update(self.BROWSER_PROCESS_HINTS[key]["titles"])
+        if not names:
+            for hint in self.BROWSER_PROCESS_HINTS.values():
+                names.update(hint["names"])
+                titles.update(hint["titles"])
+        return sorted(names), sorted(titles)
+
+    def _is_browser_running(self, browser=None):
+        names, titles = self._browser_hints(browser)
+        if self.is_windows:
+            data = self._query_matching_processes(names=names, titles=titles)
+            return int(data.get("count", 0)) > 0
+        for name in names:
+            try:
+                result = subprocess.run(
+                    ["pgrep", "-f", name],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                    check=False,
+                )
+            except Exception:
+                continue
+            if result.returncode == 0 and result.stdout.strip():
+                return True
+        return False
+
+    def _focus_browser_and_navigate(self, url, browser=None):
+        if not self._is_browser_running(browser):
+            return False
+        if not self.is_windows:
+            return False
+
+        _, titles = self._browser_hints(browser)
+        activation_tokens = list(titles)
+        if not activation_tokens:
+            activation_tokens = ["chrome", "brave", "edge", "firefox"]
+        activated = False
+        for token in activation_tokens:
+            try:
+                script = (
+                    "$ws = New-Object -ComObject WScript.Shell; "
+                    f"$ok = $ws.AppActivate({self._ps_quote(token)}); "
+                    "if ($ok) { 'true' } else { 'false' }"
+                )
+                out = self._powershell(script, timeout=5).strip().lower()
+                if out == "true":
+                    activated = True
+                    break
+            except Exception:
+                continue
+        if not activated:
+            return False
+        try:
+            time.sleep(0.12)
+            keyboard.send("ctrl+l")
+            time.sleep(0.08)
+            keyboard.write(url)
+            time.sleep(0.05)
+            keyboard.send("enter")
+            return True
+        except Exception:
+            return False
+
+    def _launch_browser_url(self, url, *, browser="", new_tab=False, new_window=False, incognito=False):
+        requested_browser = str(browser or "").strip().lower()
+        executable = self._find_browser_executable(requested_browser) if requested_browser else None
+
+        if incognito and not requested_browser:
+            for candidate in ("edge", "chrome", "brave", "firefox"):
+                executable = self._find_browser_executable(candidate)
+                if executable:
+                    requested_browser = candidate
+                    break
+
+        if executable:
+            args = [executable]
+            if incognito:
+                if "firefox" in requested_browser:
+                    args.append("--private-window")
+                else:
+                    args.append("--incognito")
+            elif new_window:
+                args.append("--new-window")
+            elif new_tab:
+                args.append("--new-tab")
+            args.append(url)
+            subprocess.Popen(args)
+            mode = "incognito window" if incognito else ("new window" if new_window else ("new tab" if new_tab else "browser"))
+            browser_label = requested_browser or Path(str(executable)).stem
+            return f"Opened {url} in {browser_label} ({mode})."
 
         if self.is_windows:
             os.startfile(url)
         else:
-            webbrowser.open(url)
+            webbrowser.open(url, new=2 if (new_window or new_tab) else 0)
         return f"Opened {url}."
+
+    def _open_website(self, params):
+        url = self._resolve_website_url(params)
+        browser = str(params.get("browser") or "").strip().lower()
+        incognito = bool(params.get("incognito", False))
+        new_tab = bool(params.get("new_tab", False))
+        new_window = bool(params.get("new_window", False))
+
+        if not any([incognito, new_tab, new_window]):
+            if self._focus_browser_and_navigate(url, browser or None):
+                return f"Opened {url} in the existing browser tab."
+
+        return self._launch_browser_url(
+            url,
+            browser=browser,
+            new_tab=new_tab,
+            new_window=new_window,
+            incognito=incognito,
+        )
 
     def _open_application(self, params):
         requested = str(params.get("application") or params.get("name") or "").strip()
@@ -3394,12 +3555,61 @@ $devices | ConvertTo-Json -Depth 4 -Compress
         open_params = {"website": url}
         if browser:
             open_params["browser"] = browser
+        if params.get("incognito"):
+            open_params["incognito"] = True
+        if params.get("new_tab"):
+            open_params["new_tab"] = True
+        if params.get("new_window"):
+            open_params["new_window"] = True
         self._open_website(open_params)
         if platform_name == "spotify":
             return f"Opened Spotify for {song}."
         if platform_name == "youtube_music":
             return f"Showing YouTube Music search results for {song}."
         return f"Showing YouTube search results for {song}."
+
+    def _get_news(self, params):
+        topic = str(params.get("topic") or "").strip()
+        if topic:
+            url = f"https://news.google.com/rss/search?q={quote_plus(topic)}&hl=en-IN&gl=IN&ceid=IN:en"
+            header = f"Trending now for {topic}:"
+        else:
+            url = "https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en"
+            header = "Top headlines:"
+
+        response = requests.get(
+            url,
+            timeout=8,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                )
+            },
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"Google News request failed ({response.status_code}).")
+
+        root = ET.fromstring(response.text)
+        items = []
+        for item in root.findall(".//item"):
+            title = (item.findtext("title") or "").strip()
+            source = (item.findtext("source") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            if not title:
+                continue
+            items.append({"title": title, "source": source, "link": link})
+            if len(items) >= 7:
+                break
+
+        if not items:
+            return "No news items were returned."
+
+        lines = [header]
+        for index, item in enumerate(items, start=1):
+            source = f" ({item['source']})" if item.get("source") else ""
+            lines.append(f"{index}. {item['title']}{source}")
+        return "\n".join(lines)
 
     def _draw_file_tree(self, params):
         if params.get("current"):
@@ -4070,40 +4280,109 @@ $devices | ConvertTo-Json -Depth 4 -Compress
         return request + ("\n" if request and not request.endswith("\n") else "")
 
     def _resolve_website_url(self, params):
-        website = str(params.get("website") or "").strip()
+        website = str(params.get("website") or params.get("raw_text") or "").strip()
         lowered = self._normalize_query(website)
+        lowered = lowered.replace("youtube music", "youtube_music")
         lowered = re.sub(r"^(?:open|launch|show|start|run|visit|go to)\s+", "", lowered).strip()
         lowered = re.sub(r"\b(?:website|site|homepage|home page)\b", "", lowered).strip()
         lowered = " ".join(lowered.split())
+        if not lowered:
+            return "https://www.google.com"
 
         if re.match(r"^https?://", lowered):
             return lowered
         if re.match(r"^(?:www\.)?[a-z0-9-]+\.[a-z0-9.-]+(?:/.*)?$", lowered):
             return f"https://{lowered}"
+
+        search_match = re.search(r"\b(?:search|find|lookup|look up)\s+(?:for\s+)?(.+)$", lowered)
+        if search_match:
+            lowered = search_match.group(1).strip()
+
+        lowered = lowered.strip()
         if lowered in {"youtube", "youtube.com", "www.youtube.com"}:
             return "https://www.youtube.com"
+        if lowered in {"youtube_music", "music.youtube.com"}:
+            return "https://music.youtube.com"
         if lowered in {"github", "github.com", "www.github.com"}:
             return "https://github.com"
         if lowered in {"spotify", "spotify.com", "open.spotify.com"}:
             return "https://open.spotify.com"
+        if lowered in {"twitter", "twitter.com", "www.twitter.com", "x", "x.com", "www.x.com"}:
+            return "https://twitter.com"
+
         if "github" in lowered:
             user = self._extract_site_path(lowered, "github")
-            return f"https://github.com/{user}" if user else "https://github.com"
+            if user:
+                return f"https://github.com/{user.strip('/')}"
+            return "https://github.com"
+
+        if "youtube_music" in lowered:
+            query = re.sub(r"\byoutube_music\b", " ", lowered).strip()
+            query = re.sub(r"\b(?:play|open|run|start|search|find|for|on|in|music|song|video)\b", " ", query)
+            query = " ".join(query.split())
+            if query:
+                return f"https://music.youtube.com/search?q={quote_plus(query)}"
+            return "https://music.youtube.com"
+
         if "youtube" in lowered:
             if "channel" in lowered or "profile" in lowered:
                 handle = self._extract_handle(lowered, "youtube")
                 if handle:
                     return f"https://www.youtube.com/@{handle.lstrip('@')}"
             path = self._extract_site_path(lowered, "youtube")
-            if path in {"website", "site", "homepage", "home", "page", "app", "application"}:
-                path = ""
-            return f"https://www.youtube.com/{path}" if path else "https://www.youtube.com"
+            if path and path not in {"website", "site", "homepage", "home", "page", "app", "application"}:
+                if "/" in path or path.startswith("@"):
+                    return f"https://www.youtube.com/{path.lstrip('/')}"
+            query = re.sub(r"\byoutube\b", " ", lowered)
+            query = re.sub(r"\b(?:play|open|run|start|search|find|for|on|in|video|videos|song|music)\b", " ", query)
+            query = " ".join(query.split())
+            if query:
+                noise = {
+                    "already",
+                    "opened",
+                    "open",
+                    "existing",
+                    "current",
+                    "browser",
+                    "tab",
+                    "window",
+                    "incognito",
+                    "private",
+                    "mode",
+                    "in",
+                    "on",
+                    "the",
+                    "a",
+                    "an",
+                }
+                cleaned_tokens = [token for token in query.split() if token not in noise]
+                query = " ".join(cleaned_tokens).strip()
+            if query:
+                return f"https://www.youtube.com/results?search_query={quote_plus(query)}"
+            return "https://www.youtube.com"
+
         if "spotify" in lowered:
             path = self._extract_site_path(lowered, "spotify")
-            if path in {"website", "site", "homepage", "home", "page", "app", "application"}:
-                path = ""
-            return f"https://open.spotify.com/{path}" if path else "https://open.spotify.com"
-        return f"https://{quote_plus(website)}"
+            if path and path not in {"website", "site", "homepage", "home", "page", "app", "application"}:
+                return f"https://open.spotify.com/{path.lstrip('/')}"
+            query = re.sub(r"\bspotify\b", " ", lowered)
+            query = re.sub(r"\b(?:play|open|run|start|search|find|for|on|in|song|music)\b", " ", query)
+            query = " ".join(query.split())
+            if query:
+                return f"https://open.spotify.com/search/{quote_plus(query)}"
+            return "https://open.spotify.com"
+
+        if "twitter" in lowered or "x.com" in lowered:
+            query = re.sub(r"\b(?:twitter|x\.com|x)\b", " ", lowered)
+            query = re.sub(r"\b(?:open|run|start|search|find|for|on|in|site|website|incognito|private|mode|tab|window)\b", " ", query)
+            query = " ".join(query.split())
+            if query:
+                return f"https://twitter.com/search?q={quote_plus(query)}"
+            return "https://twitter.com"
+
+        if " " in lowered:
+            return f"https://www.google.com/search?q={quote_plus(lowered)}"
+        return f"https://{lowered}"
 
     def _extract_site_path(self, text, site_name):
         lowered = self._normalize_query(text)

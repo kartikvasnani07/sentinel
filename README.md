@@ -15,6 +15,7 @@ It supports:
 - Project pinning (`@/path`) and codebase-aware coding operations
 - Conversation history management
 - Undo/redo for reversible actions
+- One-command installer for dependencies + local models
 - Dynamic terminal wave UI (can be turned on/off)
 - Dynamic terminal visual themes (`waves` and `bubble`) with text-only fallback
 - Cloud + local fallback for LLM, STT, and TTS
@@ -29,7 +30,8 @@ It supports:
 4. Intent engine resolves command vs conversation.
 5. System action executor runs app/file/device operations.
 6. LLM handles non-system conversation and coding generation.
-7. TTS speaks response (Edge-TTS -> Piper -> pyttsx3 fallback).
+7. If response is unknown/insufficient, assistant performs web snippet fallback and summarizes results.
+8. TTS speaks response (Edge-TTS -> Piper -> pyttsx3 fallback).
 
 ## Platform Support
 
@@ -108,18 +110,38 @@ python3 -m venv venv
 source venv/bin/activate
 ```
 
-3. Install Python dependencies:
+3. Run the one-shot installer (recommended):
 
 ```bash
-pip install --upgrade pip
-pip install -r requirements.txt
+python -m assistant.installer
 ```
 
-4. Download Vosk wake-word model:
+If installed as a package with console scripts, you can also run:
 
-- Place model at:
-  - `models/vosk/vosk-model-small-en-us-0.15`
-- This path is used by default by `assistant.main`.
+```bash
+assistant-install
+```
+
+This single command performs:
+- Python dependency installation from `requirements.txt`
+- Vosk wake model download/extract to `models/vosk/vosk-model-small-en-us-0.15`
+- Local Whisper model preload (`small` by default)
+- XTTS voice-cloning model preload (`tts_models/multilingual/multi-dataset/xtts_v2` by default)
+- Ollama auto-install attempt (Windows: `winget`, Linux: install script)
+- Ollama model pulls (`OLLAMA_MODEL` and `OLLAMA_CODE_MODEL`)
+
+Optional flags:
+
+```bash
+python -m assistant.installer --skip-ollama --skip-whisper --skip-vosk --skip-xtts
+python -m assistant.installer --chat-model llama3.1:latest --code-model qwen2.5-coder:7b --whisper-model small --xtts-model tts_models/multilingual/multi-dataset/xtts_v2
+```
+
+4. (Optional manual path) if you do not use the installer:
+
+- Install dependencies: `pip install -r requirements.txt`
+- Download Vosk model to `models/vosk/vosk-model-small-en-us-0.15`
+- Preload Whisper model and pull Ollama models manually (see below)
 
 ## Model + API Setup (Beginner Guide)
 
@@ -130,6 +152,8 @@ Important:
 - You must set environment variables in your shell or OS environment.
 
 ## 1. Install local models/assets first
+
+If you ran `python -m assistant.installer`, this section is mostly already done.
 
 1. Wake-word model (required):
    - Download `vosk-model-small-en-us-0.15`.
@@ -156,7 +180,11 @@ ollama pull qwen2.5-coder:7b
 4. Optional local neural TTS model (Piper):
    - Package is already in requirements (`piper-tts`), but you still need a voice model file.
    - Download a Piper voice model from the Piper voices release pages and set `PIPER_MODEL_PATH` to that `.onnx` file.
-   - If Piper is not configured, TTS falls back to `pyttsx3`.
+   - If Piper is not configured, TTS falls back to `pyttsx3` (custom voices require Piper).
+
+5. Custom voice cloning (Coqui/OpenVoice):
+   - XTTS (Coqui) is preloaded by the installer and uses your reference sample.
+   - OpenVoice is optional and requires its own inference command (see Custom Voice section).
 
 ## 2. Create cloud API keys (optional, but improves quality/speed)
 
@@ -240,6 +268,12 @@ STT:
 TTS:
 - `EDGE_TTS_VOICE`, `EDGE_TTS_RATE`, `EDGE_TTS_PITCH`, `EDGE_TTS_VOLUME`
 - `PIPER_MODEL_PATH`
+- `XTTS_MODEL_NAME` (default: `tts_models/multilingual/multi-dataset/xtts_v2`)
+- `XTTS_DEVICE` (`cpu` or `cuda`)
+- `XTTS_CHUNK_CHARS` (chunk size for XTTS synthesis)
+- `OPENVOICE_INFER_CMD` (optional, for OpenVoice custom voices)
+- `OPENVOICE_INFER_ARGS` (optional extra args for OpenVoice CLI)
+- `OPENVOICE_DEVICE` (`cpu` or `cuda`, default: `cpu`)
 
 ## 5. Provider fallback order used by this project
 
@@ -287,7 +321,7 @@ Every setup choice supports keyboard input and voice fallback:
 - `open text mode`
 - `enable voice mode` (inside text mode for spoken responses)
 
-## Wave UI
+## Interface UI
 
 - `enable waves`
 - `disable waves`
@@ -297,9 +331,72 @@ Every setup choice supports keyboard input and voice fallback:
 - `disable bubble`
 - `turn on bubble interface`
 - `turn off bubble interface`
+- `switch to text interface`
 
 When visual mode is disabled, assistant uses classic text status output.
 During setup/reset and any terminal text-heavy output, visual rendering is cleared first to prevent ASCII overlap.
+
+## Custom Voice (Coqui XTTS + OpenVoice)
+
+Custom voices use either:
+
+- **Coqui XTTS**: in-process, local voice cloning from a reference sample.
+- **OpenVoice**: external inference command (often faster with GPU).
+
+Built‑in presets are unchanged; only custom voices use these engines.
+
+### What You Need
+
+**Coqui XTTS**
+- Installed via `pip install -r requirements.txt`
+- A reference sample (wav/mp3/flac/m4a/etc.)
+- Optional: GPU for speed (`XTTS_DEVICE=cuda`)
+
+**OpenVoice (optional)**
+- An OpenVoice setup with its own inference command
+- `OPENVOICE_INFER_CMD` configured to call that command
+
+### Configure OpenVoice (optional)
+
+Set `OPENVOICE_INFER_CMD` to your OpenVoice inference command. Two styles are supported:
+
+1. **Template mode** (placeholders):
+
+```bash
+# Windows PowerShell (example)
+$env:OPENVOICE_INFER_CMD="python C:\path\to\openvoice\infer.py --text-file {text_file} --speaker {speaker} --output {output} --device {device}"
+```
+
+2. **Base command mode** (assistant appends args):
+
+```bash
+# Windows PowerShell (example)
+$env:OPENVOICE_INFER_CMD="python C:\path\to\openvoice\infer.py"
+```
+
+Optional:
+- `OPENVOICE_INFER_ARGS` to append extra flags.
+- `OPENVOICE_DEVICE=cuda` to enable GPU inference.
+
+### Use in the Assistant
+
+Commands:
+- `change voice model`
+- `setup voice model`
+- `change your voice model to <saved custom name>`
+
+Inside voice setup:
+- Choose preset by number/name, or choose `add custom`.
+- Select engine: `coqui` or `openvoice` (or `auto`).
+- Provide a reference sample (path or live recording).
+- Save the profile by name (up to 10).
+
+The assistant will speak a preview in the custom voice and ask for confirmation.
+
+### Performance Tips
+
+- Coqui XTTS is faster on GPU (`XTTS_DEVICE=cuda`).
+- OpenVoice is usually the lowest-latency option when GPU‑accelerated.
 
 ## Apps / System
 
@@ -345,6 +442,22 @@ Status queries:
 - `open github slash your-username`
 - `play despacito on youtube`
 - `play lo-fi beats on spotify`
+- `search for youtube entropy video`
+- `search for github python websocket examples`
+- `open youtube in incognito mode`
+- `open wikipedia in new tab`
+
+## News
+
+- `what is new today`
+- `what are the headlines`
+- `what's trending today`
+- `what's trending today in AI`
+
+Browser behavior:
+- If a browser is already open and no `new tab/new window/incognito` is requested, assistant tries to reuse the existing tab (address-bar navigation) instead of opening extra windows.
+- If user explicitly asks for `incognito`, `new tab`, or `new window`, assistant opens accordingly.
+- YouTube/YT Music commands now open search-results pages by intent query instead of forcing direct watch links.
 
 ## Coding / Project Mode
 
@@ -429,6 +542,7 @@ sudo systemctl start assistant.service
 - Edge-TTS needs network
 - Piper needs a valid `PIPER_MODEL_PATH`
 - pyttsx3 fallback depends on system voice packages
+- Custom voices require XTTS (Coqui) or OpenVoice configuration
 
 ## STT fallback issues
 

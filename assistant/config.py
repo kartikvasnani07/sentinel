@@ -15,6 +15,7 @@ except ImportError:
 
 _CONFIG_DIR = Path.home() / ".assistant"
 _CONFIG_FILE = _CONFIG_DIR / "config.yaml"
+UI_MODES = {"waves", "bubble"}
 
 VOICE_PRESETS = {
     "jarvis": {
@@ -155,6 +156,8 @@ _DEFAULTS = {
     "wake_response_enabled": True,
     "waves_enabled": True,
     "ui_mode": "waves",
+    "custom_voice_profiles": [],
+    "active_custom_voice": "",
     "wake_sensitivity": 65,
     "password_hash": "",
     "voice_auth_threshold": 0,
@@ -231,9 +234,49 @@ class AssistantConfig:
         self._data["wake_response_enabled"] = bool(self._data.get("wake_response_enabled", True))
         self._data["waves_enabled"] = bool(self._data.get("waves_enabled", True))
         ui_mode = str(self._data.get("ui_mode") or "waves").strip().lower()
-        if ui_mode not in {"waves", "bubble"}:
+        if ui_mode not in UI_MODES:
             ui_mode = "waves"
         self._data["ui_mode"] = ui_mode
+        profiles = self._data.get("custom_voice_profiles")
+        if not isinstance(profiles, list):
+            profiles = []
+        cleaned_profiles = []
+        seen_names = set()
+        for item in profiles:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            mode = str(item.get("mode") or "coqui").strip().lower()
+            if mode not in {"coqui", "openvoice", "auto"}:
+                continue
+            key = name.lower()
+            if key in seen_names:
+                continue
+            seen_names.add(key)
+            if mode == "coqui":
+                sample_path = str(item.get("sample_path") or item.get("path") or "").strip()
+                if not sample_path:
+                    continue
+                cleaned_profiles.append(
+                    {"name": name, "mode": "coqui", "sample_path": sample_path}
+                )
+            else:
+                speaker_path = str(item.get("speaker_path") or item.get("sample_path") or "").strip()
+                if not speaker_path:
+                    continue
+                profile = {"name": name, "mode": mode, "speaker_path": speaker_path}
+                openvoice_model_path = str(item.get("openvoice_model_path") or "").strip()
+                if openvoice_model_path:
+                    profile["openvoice_model_path"] = openvoice_model_path
+                cleaned_profiles.append(profile)
+            if len(cleaned_profiles) >= 10:
+                break
+        self._data["custom_voice_profiles"] = cleaned_profiles
+        active_custom = str(self._data.get("active_custom_voice") or "").strip()
+        active_names = {str(item.get("name") or "").strip() for item in cleaned_profiles}
+        if active_custom and active_custom not in active_names:
+            active_custom = ""
+        self._data["active_custom_voice"] = active_custom
         self._data["wake_sensitivity"] = _clamp_percentage(
             self._data.get("wake_sensitivity"),
             _DEFAULTS["wake_sensitivity"],

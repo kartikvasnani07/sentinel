@@ -2,6 +2,7 @@ import io
 import os
 import re
 import threading
+import time
 import unicodedata
 import wave
 from collections import deque
@@ -293,6 +294,41 @@ class VoiceEngine:
             return None
 
         return np.concatenate(captured).astype(np.int16)
+
+    def record_while_key_pressed(self, key="enter", *, max_duration=45.0, block_duration=0.08, start_timeout=12.0):
+        try:
+            import keyboard as kb
+        except Exception:
+            return None
+
+        start = time.time()
+        while time.time() - start < max(1.0, float(start_timeout)):
+            if kb.is_pressed(key):
+                break
+            time.sleep(0.02)
+        if not kb.is_pressed(key):
+            return None
+
+        block_size = max(512, int(self.sample_rate * block_duration))
+        frames = []
+        total_seconds = 0.0
+        with sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=1,
+            dtype="int16",
+            blocksize=block_size,
+        ) as stream:
+            while kb.is_pressed(key) and total_seconds < max_duration:
+                chunk, _ = stream.read(block_size)
+                if chunk is None:
+                    continue
+                audio = chunk.flatten()
+                if audio.size:
+                    frames.append(audio.copy())
+                total_seconds += audio.size / self.sample_rate
+        if not frames:
+            return None
+        return np.concatenate(frames).astype(np.int16)
 
     def _speaker_similarity(self, audio, reference):
         if reference is None:
