@@ -1,0 +1,67 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:AssistantDesktop.Linux"
+        x:Class="AssistantDesktop.Linux.MainWindow"
+        Width="1100"
+        Height="720"
+        Title="Assistant"
+        Background="#0F1116"
+        FontFamily="Noto Sans">
+    <Window.Resources>
+        <DataTemplate x:Key="MessageTemplate" DataType="local:ChatMessage">
+            <Border Padding="14"
+                    Margin="0,8"
+                    CornerRadius="16"
+                    Background="{Binding IsUser, Converter={x:Static local:UserBackgroundConverter.Instance}}"
+                    HorizontalAlignment="{Binding IsUser, Converter={x:Static local:UserAlignmentConverter.Instance}}">
+                <TextBlock Text="{Binding Text}" TextWrapping="Wrap" Foreground="#F3F5F7" MaxWidth="640"/>
+            </Border>
+        </DataTemplate>
+    </Window.Resources>
+
+    <Grid Margin="32">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <DockPanel Grid.Row="0" LastChildFill="False" Margin="0,0,0,20">
+            <TextBlock Text="Assistant" FontSize="20" Foreground="#F3F5F7"/>
+            <TextBlock Text="{Binding StatusText}" Foreground="#A6AFBF" HorizontalAlignment="Right"/>
+        </DockPanel>
+
+        <StackPanel Grid.Row="1" Spacing="16">
+            <TextBlock Text="What can I help with?" FontSize="30" Foreground="#F3F5F7"/>
+            <StackPanel Orientation="Horizontal" Spacing="8">
+                <Button Content="Search"/>
+                <Button Content="Open App"/>
+                <Button Content="System Settings"/>
+                <Button Content="Summarize"/>
+            </StackPanel>
+            <Border Background="#171A21" CornerRadius="18" BorderBrush="#232735" BorderThickness="1">
+                <Grid Margin="18">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto">
+                        <ItemsControl ItemsSource="{Binding Messages}" ItemTemplate="{StaticResource MessageTemplate}"/>
+                    </ScrollViewer>
+
+                    <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="12" Margin="0,12,0,0">
+                        <TextBox x:Name="InputBox"
+                                 Width="720"
+                                 Height="46"
+                                 Padding="14,6"
+                                 Text=""
+                                 KeyDown="InputBox_OnKeyDown"/>
+                        <Button Content="Send" Width="90" Height="46" Click="Send_Click"/>
+                        <Button Content="Mic" Width="70" Height="46"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+        </StackPanel>
+    </Grid>
+</Window>

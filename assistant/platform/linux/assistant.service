@@ -1,0 +1,13 @@
+[Unit]
+Description=AI Assistant Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/assistant
+ExecStart=/path/to/assistant/venv/bin/python -m assistant.main
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

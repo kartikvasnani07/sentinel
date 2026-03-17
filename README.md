@@ -31,12 +31,56 @@ It supports:
 5. System action executor runs app/file/device operations.
 6. LLM handles non-system conversation and coding generation.
 7. If response is unknown/insufficient, assistant performs web snippet fallback and summarizes results.
-8. TTS speaks response (Edge-TTS -> Piper -> pyttsx3 fallback).
+8. TTS speaks response (Edge-TTS -> Piper -> Linux CLI TTS -> pyttsx3 fallback).
+
+## GUI Apps (Desktop + Android)
+
+Desktop GUI apps talk to a lightweight local HTTP bridge so the UI stays decoupled from the Python core.
+
+Start the bridge:
+
+```bash
+assistant-gui
+```
+
+Or:
+
+```bash
+python -m assistant.gui_server
+```
+
+If `assistant-gui` is not found, run:
+
+```bash
+python -m pip install -e .
+```
+
+Windows GUI (WPF):
+- Project: `apps/windows/AssistantDesktop`
+- Target: .NET 8 WPF
+- Run: `dotnet run` inside the project folder
+
+Linux GUI (Avalonia):
+- Project: `apps/linux/AssistantDesktop.Linux`
+- Target: .NET 8 Avalonia
+- Run: `dotnet run` inside the project folder
+
+Android GUI (Kotlin + Compose):
+- Project: `apps/android/AssistantMobile`
+- Target: Android Studio (Compose)
+- Run: open in Android Studio and deploy to device/emulator
 
 ## Platform Support
 
 - Windows: Full support (primary target).
 - Linux: Supported for core assistant behavior and major system controls.
+- Android: Native Kotlin app with local command routing and on-device TTS/STT.
+
+Codebase separation:
+- Python core lives in `assistant/` (intent engine, system actions, LLM/TTS/STT).
+- Platform adapters live in `assistant/platform/` with Windows and Linux split.
+- Desktop GUI apps live in `apps/windows/` and `apps/linux/`.
+- Android app lives in `apps/android/`.
 
 Linux support includes:
 - app/file/folder commands
@@ -46,6 +90,13 @@ Linux support includes:
 - energy saver (via `powerprofilesctl`)
 - night light and some settings (via `gsettings` / GNOME tools when available)
 - process listing/termination and terminal command execution
+- Linux TTS via `spd-say`, `espeak-ng`, or `festival` (CLI fallback)
+
+Android support includes:
+- On-device TTS via Android `TextToSpeech`
+- Voice input via Android `SpeechRecognizer`/`RecognizerIntent`
+- App/URL launch via Intents with fuzzy name matching
+- Settings shortcuts via Android settings intents
 
 Linux command coverage from cheat-sheet style requests is handled in two ways:
 - Direct command execution (`run terminal command ...`, `execute command ...`, or writing command syntax directly)
@@ -69,7 +120,7 @@ sudo apt install -y \
   python3 python3-venv python3-dev \
   build-essential portaudio19-dev ffmpeg \
   libasound2-dev libpulse-dev \
-  espeak-ng flac \
+  speech-dispatcher espeak-ng flac \
   network-manager rfkill bluez \
   power-profiles-daemon brightnessctl \
   gnome-control-center wmctrl
@@ -84,6 +135,14 @@ Notes:
 - Windows 10/11
 - PowerShell available
 - Python 3.10+ installed and added to PATH
+
+## Desktop GUI Requirements
+
+- .NET 8 SDK (Windows + Linux)
+
+## Android Requirements
+
+- Android Studio + Android SDK (API 34 recommended)
 
 ## Installation
 
@@ -263,15 +322,15 @@ STT:
 TTS:
 - `EDGE_TTS_VOICE`, `EDGE_TTS_RATE`, `EDGE_TTS_PITCH`, `EDGE_TTS_VOLUME`
 - `PIPER_MODEL_PATH`
-- `OPENVOICE_INFER_ARGS` (optional extra args for OpenVoice CLI)
-- `OPENVOICE_DEVICE` (`cpu` or `cuda`, default: `cpu`)
+Linux CLI fallback tools (installed via system packages):
+- `spd-say` or `espeak-ng` or `festival`
 
 ## 5. Provider fallback order used by this project
 
 - LLM (general chat): `Groq -> OpenRouter -> Ollama`
 - LLM (coding requests): `GROQ_CODE_MODEL -> OPENROUTER_CODE_MODEL -> OLLAMA_CODE_MODEL`
 - STT: `Deepgram -> local Faster-Whisper`
-- TTS: `Edge-TTS -> Piper -> pyttsx3`
+- TTS: `Edge-TTS -> Piper -> Linux CLI TTS -> pyttsx3`
 
 ## Run
 
@@ -279,6 +338,93 @@ From project root:
 
 ```bash
 python -m assistant.main
+```
+
+## Quick Start by Platform
+
+### Windows (CLI + GUI)
+
+1. Install Python 3.10+ and .NET 8 SDK.
+2. In PowerShell:
+
+```powershell
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+python -m assistant.installer
+```
+
+3. Start the GUI bridge:
+
+```powershell
+assistant-gui
+```
+
+4. Run the Windows GUI:
+
+```powershell
+cd apps\windows\AssistantDesktop
+dotnet run
+```
+
+### Linux (CLI + GUI)
+
+1. Install system packages (Debian/Ubuntu example):
+
+```bash
+sudo apt update
+sudo apt install -y \
+  python3 python3-venv python3-dev \
+  build-essential portaudio19-dev ffmpeg \
+  libasound2-dev libpulse-dev \
+  speech-dispatcher espeak-ng flac \
+  network-manager rfkill bluez \
+  power-profiles-daemon brightnessctl \
+  gnome-control-center wmctrl
+```
+
+2. Create venv + install dependencies:
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+python -m assistant.installer
+```
+
+3. Start the GUI bridge:
+
+```bash
+assistant-gui
+```
+
+4. Run the Linux GUI:
+
+```bash
+cd apps/linux/AssistantDesktop.Linux
+dotnet run
+```
+
+### Android (Native app)
+
+1. Install Android Studio + Android SDK (API 34).
+2. Open `apps/android/AssistantMobile` in Android Studio.
+3. Run on a device or emulator.
+
+Notes:
+- Android uses on-device STT/TTS and Intent-based controls.
+- Desktop GUIs use the local bridge at `http://127.0.0.1:8765`.
+
+## GUI Bridge Smoke Test
+
+After starting the bridge, run:
+
+```bash
+assistant-smoke
+```
+
+Or:
+
+```bash
+python scripts/smoke_gui_bridge.py --url http://127.0.0.1:8765
 ```
 
 ## First-Time Setup
@@ -323,6 +469,11 @@ Every setup choice supports keyboard input and voice fallback:
 - `turn on bubble interface`
 - `turn off bubble interface`
 - `switch to text interface`
+
+GUI-specific:
+- Model selector (Auto/Groq/OpenRouter/Ollama + code variants)
+- Access mode selector (read / write / full) which gates system actions
+- Pin button to attach files or folders for context-aware responses
 
 When visual mode is disabled, assistant uses classic text status output.
 During setup/reset and any terminal text-heavy output, visual rendering is cleared first to prevent ASCII overlap.
@@ -438,10 +589,10 @@ This command path returns terminal output directly in the assistant response.
 ## Autostart
 
 - Windows: startup registry/launcher handled by assistant setup.
-- Linux: use `assistant/serve/linux.service` as template (edit user/path first), then:
+- Linux: use `assistant/platform/linux/assistant.service` as template (edit user/path first), then:
 
 ```bash
-sudo cp assistant/serve/linux.service /etc/systemd/system/assistant.service
+sudo cp assistant/platform/linux/assistant.service /etc/systemd/system/assistant.service
 sudo systemctl daemon-reload
 sudo systemctl enable assistant.service
 sudo systemctl start assistant.service
@@ -470,8 +621,8 @@ sudo systemctl start assistant.service
 
 - Edge-TTS needs network
 - Piper needs a valid `PIPER_MODEL_PATH`
+- Linux CLI TTS needs `spd-say` or `espeak-ng` or `festival`
 - pyttsx3 fallback depends on system voice packages
-- Custom voices require XTTS (Coqui) or OpenVoice configuration
 
 ## STT fallback issues
 
@@ -479,6 +630,14 @@ sudo systemctl start assistant.service
 - Keep microphone device accessible (OS permissions)
 
 ## Security Notes
+
+## GUI Bridge not found
+
+If `assistant-gui` is not recognized, install the console scripts:
+
+```bash
+python -m pip install -e .
+```
 
 - Assistant executes system-level actions; run only on trusted machines.
 - Use a strong password.

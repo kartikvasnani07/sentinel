@@ -6,6 +6,8 @@ assistant/config.py
 assistant/config_tui.py
 assistant/fallback_manager.py
 assistant/github_actions.py
+assistant/gui_server.py
+assistant/installer.py
 assistant/intent_engine.py
 assistant/intent_parser.py
 assistant/llm_engine.py
@@ -14,8 +16,10 @@ assistant/memory.py
 assistant/security.py
 assistant/streaming_pipeline.py
 assistant/system_actions.py
+assistant/terminal_wave.py
 assistant/tts_engine.py
 assistant/utils.py
+assistant/voice_auth.py
 assistant/voice_engine.py
 assistant/wake_word.py
 assistant.egg-info/PKG-INFO
@@ -24,3 +28,11 @@ assistant.egg-info/dependency_links.txt
 assistant.egg-info/entry_points.txt
 assistant.egg-info/requires.txt
 assistant.egg-info/top_level.txt
+assistant/platform/__init__.py
+assistant/platform/linux_actions.py
+assistant/platform/windows_actions.py
+assistant/platform/linux/__init__.py
+assistant/platform/linux/actions.py
+assistant/platform/windows/__init__.py
+assistant/platform/windows/actions.py
+assistant/platform/windows/service.py

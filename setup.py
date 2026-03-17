@@ -30,6 +30,8 @@ setup(
         "console_scripts": [
             "assistant=assistant.main:run",
             "assistant-install=assistant.installer:main",
+            "assistant-gui=assistant.gui_server:run",
+            "assistant-smoke=scripts.smoke_gui_bridge:main",
         ]
     },
 )

@@ -11,8 +11,11 @@ pyttsx3 fallback voice.  Users can switch presets at runtime.
 
 import asyncio
 import os
+import platform
 import queue
 import re
+import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -58,6 +61,7 @@ class TTSEngine:
         self.stop_event = threading.Event()
         self.speaking_event = threading.Event()
         self.model_lock = threading.Lock()
+        self.is_linux = platform.system().lower().startswith("linux")
 
         self.low_latency_mode = self._parse_bool_env("TTS_LOW_LATENCY_MODE", True)
         self.interrupt_on_new_speech = self._parse_bool_env("TTS_INTERRUPT_ON_NEW_SPEECH", True)
@@ -90,9 +94,10 @@ class TTSEngine:
 
         edge_state = "available" if edge_tts is not None and playsound is not None else "unavailable"
         piper_state = "available" if PiperVoice is not None else "unavailable (use 'pip install piper-tts')"
+        linux_state = "available" if self.is_linux else "n/a"
         print(
             "TTS initialized "
-            f"(primary=Edge-TTS[{edge_state}], fallback=Piper[{piper_state}], voice={self.edge_voice})"
+            f"(primary=Edge-TTS[{edge_state}], fallback=Piper[{piper_state}], linux_cli={linux_state}, voice={self.edge_voice})"
         )
 
     # ------------------------------------------------------------------
@@ -412,6 +417,27 @@ class TTSEngine:
         self.local_engine.runAndWait()
 
     # ------------------------------------------------------------------
+    # Linux CLI TTS fallback (system speech tools)
+    # ------------------------------------------------------------------
+
+    def _linux_cli_speak(self, text):
+        if not self.is_linux:
+            raise RuntimeError("Linux CLI TTS is unavailable on this platform.")
+        if shutil.which("spd-say"):
+            subprocess.run(["spd-say", text], check=False)
+            return
+        if shutil.which("espeak-ng"):
+            subprocess.run(["espeak-ng", text], check=False)
+            return
+        if shutil.which("espeak"):
+            subprocess.run(["espeak", text], check=False)
+            return
+        if shutil.which("festival"):
+            subprocess.run(["festival", "--tts"], input=text, text=True, check=False)
+            return
+        raise RuntimeError("No Linux TTS CLI (spd-say/espeak/festival) is available.")
+
+    # ------------------------------------------------------------------
     # Queue worker  (cascading fallback:  Edge → Piper → pyttsx3)
     # ------------------------------------------------------------------
 
@@ -440,6 +466,12 @@ class TTSEngine:
                     print(f"  [TTS Fallback] Edge/Piper failed ({p_err}) -> Using Pyttsx3.")
                     
                     try:
+                        if self.is_linux:
+                            try:
+                                self._linux_cli_speak(text)
+                                return
+                            except Exception:
+                                pass
                         self._local_speak(text)
                     except Exception as local_error:
                         print(f"  [TTS] All engines failed. Last error: {local_error}")

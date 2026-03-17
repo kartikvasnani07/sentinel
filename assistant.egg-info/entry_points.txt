@@ -1,2 +1,5 @@
 [console_scripts]
 assistant = assistant.main:run
+assistant-gui = assistant.gui_server:run
+assistant-install = assistant.installer:main
+assistant-smoke = scripts.smoke_gui_bridge:main

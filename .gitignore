@@ -14,3 +14,8 @@ __pycache__/
 *.exe
 qwen3tts/
 *.safetensors
+apps/**/bin/
+apps/**/obj/
+apps/android/**/.gradle/
+apps/android/**/.idea/
+apps/android/**/build/

@@ -157,6 +157,8 @@ _DEFAULTS = {
     "waves_enabled": True,
     "ui_mode": "waves",
     "wake_sensitivity": 65,
+    "access_level": "full",
+    "model_preference": "auto",
     "password_hash": "",
     "voice_auth_threshold": 0,
     "voice_sample_path": "",
@@ -241,6 +243,16 @@ class AssistantConfig:
             self._data.get("wake_sensitivity"),
             _DEFAULTS["wake_sensitivity"],
         )
+
+        access_level = str(self._data.get("access_level") or "full").strip().lower()
+        if access_level not in {"read", "write", "full"}:
+            access_level = "full"
+        self._data["access_level"] = access_level
+
+        model_preference = str(self._data.get("model_preference") or "auto").strip().lower()
+        if not model_preference:
+            model_preference = "auto"
+        self._data["model_preference"] = model_preference
 
         self._data["voice_auth_threshold"] = _clamp_percentage(
             self._data.get("voice_auth_threshold"),

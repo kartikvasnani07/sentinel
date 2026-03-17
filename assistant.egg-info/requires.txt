@@ -3,7 +3,20 @@ vosk
 sounddevice
 torch
 requests
+yt-dlp
+edge-tts
+playsound==1.2.2
 pyttsx3
+soundfile
 rich
 textual
 keyboard
+numpy
+pyyaml
+scipy
+piper-tts
+
+[:platform_system == "Windows"]
+pycaw
+comtypes
+pywin32

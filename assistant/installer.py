@@ -43,6 +43,13 @@ def _ensure_python_dependencies(project_root: Path) -> None:
     _run([sys.executable, "-m", "pip", "install", "-r", str(requirements)])
 
 
+def _ensure_console_scripts(project_root: Path) -> None:
+    setup_file = project_root / "setup.py"
+    if not setup_file.exists():
+        return
+    _run([sys.executable, "-m", "pip", "install", "-e", str(project_root)])
+
+
 def _download_file(url: str, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     with urlopen(url, timeout=60) as response:  # nosec - trusted URL for installer asset
@@ -137,6 +144,7 @@ def main() -> int:
 
     try:
         _ensure_python_dependencies(project_root)
+        _ensure_console_scripts(project_root)
         if not args.skip_vosk:
             _ensure_vosk_model(project_root)
         if not args.skip_whisper:

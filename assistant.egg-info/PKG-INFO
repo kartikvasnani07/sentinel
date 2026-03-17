@@ -6,8 +6,19 @@ Requires-Dist: vosk
 Requires-Dist: sounddevice
 Requires-Dist: torch
 Requires-Dist: requests
+Requires-Dist: yt-dlp
+Requires-Dist: edge-tts
+Requires-Dist: playsound==1.2.2
 Requires-Dist: pyttsx3
+Requires-Dist: soundfile
 Requires-Dist: rich
 Requires-Dist: textual
 Requires-Dist: keyboard
+Requires-Dist: numpy
+Requires-Dist: pyyaml
+Requires-Dist: scipy
+Requires-Dist: piper-tts
+Requires-Dist: pycaw; platform_system == "Windows"
+Requires-Dist: comtypes; platform_system == "Windows"
+Requires-Dist: pywin32; platform_system == "Windows"
 Dynamic: requires-dist
