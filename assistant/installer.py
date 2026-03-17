@@ -80,16 +80,6 @@ def _ensure_whisper_local_model(model_name: str = "small") -> None:
     _run([sys.executable, "-c", preload_script], check=False)
 
 
-def _ensure_xtts_model(model_name: str) -> None:
-    preload_script = (
-        "from TTS.api import TTS; "
-        f"TTS('{model_name}').to('cpu'); "
-        "print('XTTS model ready')"
-    )
-    _print(f"Preloading custom-voice model: {model_name}")
-    _run([sys.executable, "-c", preload_script], check=False)
-
-
 def _install_ollama_if_missing() -> bool:
     if shutil.which("ollama"):
         return True
@@ -136,11 +126,9 @@ def main() -> int:
     parser.add_argument("--skip-ollama", action="store_true", help="Skip Ollama installation/model pulls.")
     parser.add_argument("--skip-whisper", action="store_true", help="Skip local Whisper model preload.")
     parser.add_argument("--skip-vosk", action="store_true", help="Skip Vosk model download.")
-    parser.add_argument("--skip-xtts", action="store_true", help="Skip XTTS model preload for custom voice cloning.")
     parser.add_argument("--chat-model", default=os.getenv("OLLAMA_MODEL", "llama3.1:latest"))
     parser.add_argument("--code-model", default=os.getenv("OLLAMA_CODE_MODEL", "qwen2.5-coder:7b"))
     parser.add_argument("--whisper-model", default=os.getenv("WHISPER_MODEL_SIZE", "small"))
-    parser.add_argument("--xtts-model", default=os.getenv("XTTS_MODEL_NAME", "tts_models/multilingual/multi-dataset/xtts_v2"))
     args = parser.parse_args()
 
     project_root = Path(__file__).resolve().parent.parent
@@ -153,8 +141,6 @@ def main() -> int:
             _ensure_vosk_model(project_root)
         if not args.skip_whisper:
             _ensure_whisper_local_model(args.whisper_model)
-        if not args.skip_xtts:
-            _ensure_xtts_model(args.xtts_model)
         if not args.skip_ollama:
             _ensure_ollama_models(args.chat_model, args.code_model)
         _print("Installation completed.")

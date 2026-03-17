@@ -126,15 +126,14 @@ This single command performs:
 - Python dependency installation from `requirements.txt`
 - Vosk wake model download/extract to `models/vosk/vosk-model-small-en-us-0.15`
 - Local Whisper model preload (`small` by default)
-- XTTS voice-cloning model preload (`tts_models/multilingual/multi-dataset/xtts_v2` by default)
 - Ollama auto-install attempt (Windows: `winget`, Linux: install script)
 - Ollama model pulls (`OLLAMA_MODEL` and `OLLAMA_CODE_MODEL`)
 
 Optional flags:
 
 ```bash
-python -m assistant.installer --skip-ollama --skip-whisper --skip-vosk --skip-xtts
-python -m assistant.installer --chat-model llama3.1:latest --code-model qwen2.5-coder:7b --whisper-model small --xtts-model tts_models/multilingual/multi-dataset/xtts_v2
+python -m assistant.installer --skip-ollama --skip-whisper --skip-vosk
+python -m assistant.installer --chat-model llama3.1:latest --code-model qwen2.5-coder:7b --whisper-model small
 ```
 
 4. (Optional manual path) if you do not use the installer:
@@ -180,11 +179,7 @@ ollama pull qwen2.5-coder:7b
 4. Optional local neural TTS model (Piper):
    - Package is already in requirements (`piper-tts`), but you still need a voice model file.
    - Download a Piper voice model from the Piper voices release pages and set `PIPER_MODEL_PATH` to that `.onnx` file.
-   - If Piper is not configured, TTS falls back to `pyttsx3` (custom voices require Piper).
-
-5. Custom voice cloning (Coqui/OpenVoice):
-   - XTTS (Coqui) is preloaded by the installer and uses your reference sample.
-   - OpenVoice is optional and requires its own inference command (see Custom Voice section).
+   - If Piper is not configured, TTS falls back to `pyttsx3`.
 
 ## 2. Create cloud API keys (optional, but improves quality/speed)
 
@@ -268,10 +263,6 @@ STT:
 TTS:
 - `EDGE_TTS_VOICE`, `EDGE_TTS_RATE`, `EDGE_TTS_PITCH`, `EDGE_TTS_VOLUME`
 - `PIPER_MODEL_PATH`
-- `XTTS_MODEL_NAME` (default: `tts_models/multilingual/multi-dataset/xtts_v2`)
-- `XTTS_DEVICE` (`cpu` or `cuda`)
-- `XTTS_CHUNK_CHARS` (chunk size for XTTS synthesis)
-- `OPENVOICE_INFER_CMD` (optional, for OpenVoice custom voices)
 - `OPENVOICE_INFER_ARGS` (optional extra args for OpenVoice CLI)
 - `OPENVOICE_DEVICE` (`cpu` or `cuda`, default: `cpu`)
 
@@ -335,68 +326,6 @@ Every setup choice supports keyboard input and voice fallback:
 
 When visual mode is disabled, assistant uses classic text status output.
 During setup/reset and any terminal text-heavy output, visual rendering is cleared first to prevent ASCII overlap.
-
-## Custom Voice (Coqui XTTS + OpenVoice)
-
-Custom voices use either:
-
-- **Coqui XTTS**: in-process, local voice cloning from a reference sample.
-- **OpenVoice**: external inference command (often faster with GPU).
-
-Built‑in presets are unchanged; only custom voices use these engines.
-
-### What You Need
-
-**Coqui XTTS**
-- Installed via `pip install -r requirements.txt`
-- A reference sample (wav/mp3/flac/m4a/etc.)
-- Optional: GPU for speed (`XTTS_DEVICE=cuda`)
-
-**OpenVoice (optional)**
-- An OpenVoice setup with its own inference command
-- `OPENVOICE_INFER_CMD` configured to call that command
-
-### Configure OpenVoice (optional)
-
-Set `OPENVOICE_INFER_CMD` to your OpenVoice inference command. Two styles are supported:
-
-1. **Template mode** (placeholders):
-
-```bash
-# Windows PowerShell (example)
-$env:OPENVOICE_INFER_CMD="python C:\path\to\openvoice\infer.py --text-file {text_file} --speaker {speaker} --output {output} --device {device}"
-```
-
-2. **Base command mode** (assistant appends args):
-
-```bash
-# Windows PowerShell (example)
-$env:OPENVOICE_INFER_CMD="python C:\path\to\openvoice\infer.py"
-```
-
-Optional:
-- `OPENVOICE_INFER_ARGS` to append extra flags.
-- `OPENVOICE_DEVICE=cuda` to enable GPU inference.
-
-### Use in the Assistant
-
-Commands:
-- `change voice model`
-- `setup voice model`
-- `change your voice model to <saved custom name>`
-
-Inside voice setup:
-- Choose preset by number/name, or choose `add custom`.
-- Select engine: `coqui` or `openvoice` (or `auto`).
-- Provide a reference sample (path or live recording).
-- Save the profile by name (up to 10).
-
-The assistant will speak a preview in the custom voice and ask for confirmation.
-
-### Performance Tips
-
-- Coqui XTTS is faster on GPU (`XTTS_DEVICE=cuda`).
-- OpenVoice is usually the lowest-latency option when GPU‑accelerated.
 
 ## Apps / System
 

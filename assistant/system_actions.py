@@ -19,13 +19,10 @@ from urllib.parse import quote_plus
 import keyboard
 import requests
 
-try:
-    from comtypes import CLSCTX_ALL
-    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-except Exception:  # pragma: no cover - optional dependency
-    CLSCTX_ALL = None
-    AudioUtilities = None
-    IAudioEndpointVolume = None
+# Legacy placeholders for deprecated Windows-only helpers (now in platform adapters).
+CLSCTX_ALL = None
+AudioUtilities = None
+IAudioEndpointVolume = None
 
 try:
     from yt_dlp import YoutubeDL
@@ -33,6 +30,7 @@ except Exception:  # pragma: no cover - optional dependency
     YoutubeDL = None
 
 from .utils import draw_file_tree
+from .platform import get_platform_actions
 
 
 @dataclass
@@ -244,6 +242,7 @@ class SystemActions:
     def __init__(self, base_dir=None, llm=None):
         self.base_dir = Path(base_dir or os.getcwd()).resolve()
         self.is_windows = platform.system().lower().startswith("win")
+        self.platform_actions = get_platform_actions(self)
         self.llm = llm
         self.home = Path.home()
         self.standard_paths = {
@@ -2033,77 +2032,10 @@ $matches | Stop-Process -Force
         return f"Closed {requested}." if not process_names else f"Closed {requested} ({process_names})."
 
     def _close_all_apps(self, params):
-        if self.is_windows:
-            script = r"""
-$excluded = @('python', 'python3', 'powershell', 'pwsh', 'cmd', 'conhost')
-$closed = @()
-Get-Process -ErrorAction SilentlyContinue | Where-Object {
-    $_.MainWindowHandle -ne 0 -and $_.ProcessName -and ($excluded -notcontains $_.ProcessName.ToLower())
-} | ForEach-Object {
-    try {
-        Stop-Process -Id $_.Id -Force -ErrorAction Stop
-        $closed += $_.ProcessName
-    } catch {}
-}
-$unique = $closed | Sort-Object -Unique
-if ($unique.Count -eq 0) {
-    'No open application windows were found.'
-} else {
-    'Closed applications: ' + ($unique -join ', ')
-}
-""".strip()
-            return self._powershell(script, timeout=30)
-
-        if shutil.which("wmctrl"):
-            output = self._run_process(["wmctrl", "-lp"], timeout=20)
-            pids = []
-            for line in output.splitlines():
-                parts = line.split()
-                if len(parts) < 3:
-                    continue
-                pid_text = parts[2].strip()
-                if pid_text.isdigit():
-                    pid = int(pid_text)
-                    if pid > 0 and pid not in pids and pid != os.getpid():
-                        pids.append(pid)
-            if not pids:
-                return "No open application windows were found."
-            for pid in pids:
-                subprocess.run(["kill", "-15", str(pid)], capture_output=True, text=True, check=False)
-            return f"Closed {len(pids)} open application window processes."
-
-        # Fallback for Linux desktops without wmctrl: best effort against common GUI apps.
-        common = ["firefox", "chrome", "chromium", "code", "vlc", "spotify", "brave", "edge", "slack", "discord"]
-        closed = []
-        for name in common:
-            result = subprocess.run(["pkill", "-15", "-x", name], capture_output=True, text=True, check=False)
-            if result.returncode == 0:
-                closed.append(name)
-        if not closed:
-            return "No open application windows were found."
-        return "Closed applications: " + ", ".join(sorted(set(closed))) + "."
+        return self.platform_actions.close_all_apps()
 
     def _list_processes(self, params):
-        if self.is_windows:
-            script = r"""
-$rows = Get-Process -ErrorAction SilentlyContinue |
-    Sort-Object -Property CPU -Descending |
-    Select-Object -First 220 -Property Id, ProcessName, CPU, WorkingSet64
-$lines = @('PID`tProcess`tCPU(s)`tMemory(MB)')
-foreach ($row in $rows) {
-    $cpu = if ($row.CPU -eq $null) { 0 } else { [Math]::Round([double]$row.CPU, 2) }
-    $mem = [Math]::Round(([double]$row.WorkingSet64 / 1MB), 1)
-    $lines += ("{0}`t{1}`t{2}`t{3}" -f $row.Id, $row.ProcessName, $cpu, $mem)
-}
-$lines -join [Environment]::NewLine
-""".strip()
-            return self._powershell(script, timeout=25)
-
-        output = self._run_process(["ps", "-eo", "pid,comm,%cpu,%mem", "--sort=-%cpu"], timeout=20)
-        lines = output.splitlines()
-        if not lines:
-            return "No running processes were found."
-        return "\n".join(lines[:221])
+        return self.platform_actions.list_processes()
 
     def _kill_process(self, params):
         process_id = params.get("process_id")
@@ -2114,36 +2046,16 @@ $lines -join [Environment]::NewLine
 
         if process_id is not None:
             pid = int(process_id)
-            if self.is_windows:
-                self._run_process(["taskkill", "/PID", str(pid), "/F"], timeout=20)
-            else:
-                self._run_process(["kill", "-9", str(pid)], timeout=20)
+            self.platform_actions.kill_process_id(pid)
             return f"Terminated process {pid}."
 
         # process-name termination
         if self.is_windows:
             normalized = self._normalize_app_name(process_name)
             candidates = [process_name, normalized, normalized.replace(" ", "")]
-            tried = []
-            for candidate in candidates:
-                candidate = candidate.strip()
-                if not candidate:
-                    continue
-                image_name = candidate if candidate.lower().endswith(".exe") else f"{candidate}.exe"
-                if image_name.lower() in tried:
-                    continue
-                tried.append(image_name.lower())
-                result = subprocess.run(["taskkill", "/IM", image_name, "/F"], capture_output=True, text=True, check=False)
-                if result.returncode == 0:
-                    return f"Terminated process {process_name}."
-            raise RuntimeError(f"No running process matched {process_name}.")
-
-        if shutil.which("pkill"):
-            result = subprocess.run(["pkill", "-9", "-f", process_name], capture_output=True, text=True, check=False)
-            if result.returncode != 0:
-                raise RuntimeError(f"No running process matched {process_name}.")
-            return f"Terminated process {process_name}."
-        self._run_process(["killall", "-9", process_name], timeout=20)
+            self.platform_actions.kill_process_name(process_name, candidates)
+        else:
+            self.platform_actions.kill_process_name(process_name)
         return f"Terminated process {process_name}."
 
     def _looks_like_shell_command(self, command):
@@ -2841,48 +2753,15 @@ $lines -join [Environment]::NewLine
         return f"Duplicated {source} to {destination}."
 
     def _shutdown_system(self, params):
-        try:
-            self._close_all_apps({})
-        except Exception:
-            pass
-        time.sleep(0.6)
-        if self.is_windows:
-            os.system("shutdown /s /t 0")
-        else:
-            if shutil.which("systemctl"):
-                os.system("systemctl poweroff")
-            else:
-                os.system("shutdown -h now")
+        self.platform_actions.shutdown_system()
         return "Shutting down the device."
 
     def _restart_system(self, params):
-        try:
-            self._close_all_apps({})
-        except Exception:
-            pass
-        time.sleep(0.6)
-        if self.is_windows:
-            os.system("shutdown /r /t 0")
-        else:
-            if shutil.which("systemctl"):
-                os.system("systemctl reboot")
-            else:
-                os.system("shutdown -r now")
+        self.platform_actions.restart_system()
         return "Restarting the device."
 
     def _sleep_system(self, params):
-        if self.is_windows:
-            try:
-                import ctypes
-
-                result = ctypes.windll.powrprof.SetSuspendState(False, True, False)
-                if result == 0:
-                    raise RuntimeError("SetSuspendState returned 0.")
-            except Exception:
-                # Fallback for systems where direct API invocation is blocked.
-                self._run_process(["rundll32.exe", "powrprof.dll,SetSuspendState", "0,1,0"], timeout=20)
-        else:
-            os.system("systemctl suspend")
+        self.platform_actions.sleep_system()
         return "Putting the device to sleep."
 
     def _set_brightness(self, params):
@@ -2893,17 +2772,8 @@ $lines -join [Environment]::NewLine
         if percent is None:
             raise RuntimeError("No brightness level was provided.")
         percent = max(0, min(100, int(percent)))
-        if self.is_windows:
-            script = (
-                "$monitors = Get-WmiObject -Namespace root\\wmi -Class WmiMonitorBrightnessMethods; "
-                f"foreach ($m in $monitors) {{ $m.WmiSetBrightness(1,{percent}) | Out-Null }}"
-            )
-            self._powershell(script)
-            return f"Brightness set to {percent} percent."
-        if shutil.which("brightnessctl"):
-            self._run_process(["brightnessctl", "set", f"{percent}%"])
-            return f"Brightness set to {percent} percent."
-        raise RuntimeError("Brightness control is not available on this system.")
+        self.platform_actions.set_brightness(percent)
+        return f"Brightness set to {percent} percent."
 
     def _windows_audio_endpoint_script(self, flow, *, percent=None, delta=None, mute_action=""):
         target_level = "" if percent is None else max(0, min(100, int(percent))) / 100.0
@@ -3070,54 +2940,13 @@ $finalMuted = [AudioUtil.AudioManager]::GetMute($flow)
             percent = 50
         else:
             raise RuntimeError(f"No {label.lower()} level or state was provided.")
-
-        if self.is_windows:
-            state = self._python_audio_state(flow, percent=percent, delta=delta, mute_action=mute_action)
-            if state is None:
-                payload = self._powershell(
-                    self._windows_audio_endpoint_script(flow, percent=percent, delta=delta, mute_action=mute_action),
-                    timeout=25,
-                )
-                state = json.loads(payload)
-                if not isinstance(state, dict):
-                    state = {}
-            final_level = int(state.get("level") or state.get("Level") or 0)
-            is_muted = bool(state.get("muted") if "muted" in state else state.get("Muted", False))
-            if is_muted or final_level == 0:
-                return f"{label} turned off."
-            return f"{label} set to {final_level} percent."
-
-        if shutil.which("pactl"):
-            target = "@DEFAULT_SINK@" if flow == 0 else "@DEFAULT_SOURCE@"
-            if mute_action == "mute":
-                self._run_process(["pactl", "set-source-mute" if flow else "set-sink-mute", target, "1"])
-                return f"{label} turned off."
-            if mute_action == "unmute":
-                self._run_process(["pactl", "set-source-mute" if flow else "set-sink-mute", target, "0"])
-            if percent is not None:
-                self._run_process(["pactl", "set-source-volume" if flow else "set-sink-volume", target, f"{percent}%"])
-                return f"{label} set to {percent} percent."
-            if delta is not None:
-                amount = f"{abs(int(delta * 100))}%"
-                command = ["pactl", "set-source-volume" if flow else "set-sink-volume", target, f"{'+' if delta > 0 else '-'}{amount}"]
-                self._run_process(command)
-                direction_text = "up" if delta > 0 else "down"
-                return f"{label} adjusted {direction_text}."
-        if shutil.which("amixer"):
-            channel = "Capture" if flow else "Master"
-            if mute_action == "mute":
-                self._run_process(["amixer", "set", channel, "mute"], timeout=20)
-                return f"{label} turned off."
-            if mute_action == "unmute":
-                self._run_process(["amixer", "set", channel, "unmute"], timeout=20)
-            if percent is not None:
-                self._run_process(["amixer", "set", channel, f"{percent}%"], timeout=20)
-                return f"{label} set to {percent} percent."
-            if delta is not None:
-                sign = "+" if delta > 0 else "-"
-                self._run_process(["amixer", "set", channel, f"{abs(int(delta * 100))}%{sign}"], timeout=20)
-                return f"{label} adjusted {'up' if delta > 0 else 'down'}."
-        raise RuntimeError(f"{label} control is not available on this system.")
+        return self.platform_actions.set_audio_endpoint(
+            flow=flow,
+            label=label,
+            percent=percent,
+            delta=delta,
+            mute_action=mute_action,
+        )
 
     def _set_volume(self, params):
         return self._set_audio_endpoint(params, flow=0, label="System sound")
@@ -3188,48 +3017,11 @@ $devices | ConvertTo-Json -Depth 4 -Compress
 
     def _open_setting_panel(self, params):
         setting = self._normalize_setting_name(params.get("setting") or params.get("raw_text") or "")
-        if not self.is_windows:
-            if shutil.which("gnome-control-center"):
-                panel_map = {
-                    "wifi": "wifi",
-                    "bluetooth": "bluetooth",
-                    "airplane mode": "network",
-                    "brightness": "display",
-                    "volume": "sound",
-                    "microphone": "sound",
-                    "energy saver": "power",
-                    "night light": "display",
-                    "vpn": "network",
-                    "display": "display",
-                    "screen saver": "privacy",
-                }
-                panel = panel_map.get(setting) or "privacy"
-                subprocess.Popen(["gnome-control-center", panel])
-                return f"Opened {setting or panel} settings."
-            raise RuntimeError("Settings panel integration is not available on this Linux desktop.")
-        uri_map = {
-            "wifi": "ms-settings:network-wifi",
-            "bluetooth": "ms-settings:bluetooth",
-            "airplane mode": "ms-settings:network-airplanemode",
-            "brightness": "ms-settings:display",
-            "volume": "ms-settings:sound",
-            "microphone": "ms-settings:privacy-microphone",
-            "energy saver": "ms-settings:powersleep",
-            "night light": "ms-settings:nightlight",
-            "vpn": "ms-settings:network-vpn",
-            "display": "ms-settings:display",
-        }
-        if setting == "screen saver":
-            subprocess.Popen(["control.exe", "desk.cpl,,@screensaver"])
-            return "Opened Screen Saver settings."
-        uri = uri_map.get(setting)
-        if not uri:
-            raise RuntimeError(f"Settings panel not mapped for {setting or 'that request'}.")
-        os.startfile(uri)
-        return f"Opened {setting} settings."
+        return self.platform_actions.open_setting_panel(setting)
 
     def _get_setting_status(self, params):
         setting = self._normalize_setting_name(params.get("setting") or params.get("raw_text") or "")
+        return self.platform_actions.get_setting_status(setting)
         if setting == "wifi":
             if self.is_windows:
                 output = self._run_process(["netsh", "interface", "show", "interface"], timeout=20)
@@ -3398,6 +3190,8 @@ $devices | ConvertTo-Json -Depth 4 -Compress
 
     def _set_wifi(self, params):
         turn_on = bool(params.get("on", True))
+        self.platform_actions.set_wifi(turn_on)
+        return f"Wi-Fi turned {'on' if turn_on else 'off'}."
         if self.is_windows:
             errors = []
             for name in self._wireless_interface_names():
@@ -3417,6 +3211,8 @@ $devices | ConvertTo-Json -Depth 4 -Compress
 
     def _set_bluetooth(self, params):
         turn_on = bool(params.get("on", True))
+        self.platform_actions.set_bluetooth(turn_on)
+        return f"Bluetooth turned {'on' if turn_on else 'off'}."
         if self.is_windows:
             adapters = self._windows_bluetooth_adapters()
             if not adapters:
@@ -3449,6 +3245,8 @@ $devices | ConvertTo-Json -Depth 4 -Compress
 
     def _set_airplane_mode(self, params):
         turn_on = bool(params.get("on", True))
+        result = self.platform_actions.set_airplane_mode(turn_on)
+        return result or f"Airplane mode turned {'on' if turn_on else 'off'}."
         if self.is_windows:
             updates = []
             errors = []
@@ -3472,6 +3270,8 @@ $devices | ConvertTo-Json -Depth 4 -Compress
 
     def _set_energy_saver(self, params):
         turn_on = bool(params.get("on", True))
+        self.platform_actions.set_energy_saver(turn_on)
+        return f"Energy saver turned {'on' if turn_on else 'off'}."
         if self.is_windows:
             self._run_process(
                 ["powercfg", "/setactive", self.POWER_SAVER_GUID if turn_on else self.BALANCED_POWER_GUID],
@@ -3485,6 +3285,10 @@ $devices | ConvertTo-Json -Depth 4 -Compress
 
     def _set_night_light(self, params):
         turn_on = bool(params.get("on", True))
+        self.platform_actions.set_night_light(turn_on)
+        if self.is_windows:
+            return f"Opened Night Light settings to turn it {'on' if turn_on else 'off'}."
+        return f"Night light turned {'on' if turn_on else 'off'}."
         if self.is_windows:
             os.startfile("ms-settings:nightlight")
             return f"Opened Night Light settings to turn it {'on' if turn_on else 'off'}."

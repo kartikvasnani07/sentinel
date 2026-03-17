@@ -44,30 +44,9 @@ except ImportError:
     PiperVoice = None
 
 try:
-    from TTS.api import TTS as CoquiTTS
-except ImportError:
-    CoquiTTS = None
-try:
-    from TTS.tts.configs.xtts_config import XttsConfig
-except Exception:
-    XttsConfig = None
-
-try:
     import soundfile as sf
 except ImportError:
     sf = None
-
-try:
-    import torch
-except ImportError:
-    torch = None
-
-try:
-    from pydub import AudioSegment
-except ImportError:
-    AudioSegment = None
-
-from .openvoice_engine import OpenVoiceEngine
 
 
 class TTSEngine:
@@ -78,7 +57,7 @@ class TTSEngine:
         self.running = True
         self.stop_event = threading.Event()
         self.speaking_event = threading.Event()
-        self.coqui_lock = threading.Lock()
+        self.model_lock = threading.Lock()
 
         self.low_latency_mode = self._parse_bool_env("TTS_LOW_LATENCY_MODE", True)
         self.interrupt_on_new_speech = self._parse_bool_env("TTS_INTERRUPT_ON_NEW_SPEECH", True)
@@ -104,20 +83,6 @@ class TTSEngine:
 
         # Active preset name (for display)
         self.active_preset = "jarvis"
-        self.custom_voice_name = ""
-        self.custom_voice_enabled = False
-        self.custom_voice_mode = ""
-        self.custom_voice_profile = None
-        self.custom_voice_sample_path = ""
-        self.openvoice_engine = None
-        self.xtts_model_name = os.getenv("XTTS_MODEL_NAME", "tts_models/multilingual/multi-dataset/xtts_v2").strip()
-        preferred_device = os.getenv("XTTS_DEVICE", "").strip().lower()
-        if preferred_device in {"cuda", "cpu"}:
-            self.xtts_device = preferred_device
-        else:
-            self.xtts_device = "cuda" if (torch is not None and torch.cuda.is_available()) else "cpu"
-        self.xtts_chunk_chars = self._parse_int_env("XTTS_CHUNK_CHARS", 180)
-        self._xtts_engine = None
         self._piper_voice_cache = {}
 
         self.worker = threading.Thread(target=self._process_queue, daemon=True)
@@ -148,8 +113,6 @@ class TTSEngine:
             available = ", ".join(sorted(VOICE_PRESETS.keys()))
             return f"Unknown voice preset '{preset_name}'. Available: {available}"
 
-        self.clear_custom_voice()
-
         self.edge_voice = preset["edge_voice"]
         self.edge_rate = preset.get("edge_rate", "+0%")
         self.edge_pitch = preset.get("edge_pitch", "+0Hz")
@@ -169,151 +132,6 @@ class TTSEngine:
         desc = preset.get("description", key)
         print(f"Voice preset applied: {desc} ({self.edge_voice})")
         return f"Voice changed to {desc}."
-
-    def apply_custom_voice(self, sample_path: str, profile_name: str = "custom") -> str:
-        if isinstance(sample_path, dict):
-            return self.apply_custom_voice_profile(sample_path)
-        profile = {
-            "mode": "coqui",
-            "name": profile_name or "custom",
-            "sample_path": sample_path,
-        }
-        return self.apply_custom_voice_profile(profile)
-
-    def apply_custom_voice_profile(self, profile: dict) -> str:
-        if not isinstance(profile, dict):
-            return "Custom voice profile is invalid."
-
-        mode = str(profile.get("mode") or "coqui").strip().lower()
-        if mode not in {"coqui", "openvoice", "auto"}:
-            return "Custom voice profile mode is not supported."
-
-        name = str(profile.get("name") or "custom").strip() or "custom"
-        if mode == "auto":
-            mode = "openvoice" if OpenVoiceEngine.is_available() else "coqui"
-
-        if mode == "coqui":
-            sample_path = str(profile.get("sample_path") or "").strip()
-            if not sample_path:
-                return "No custom voice sample path was provided."
-            if not Path(sample_path).exists():
-                return f"Custom voice sample was not found: {sample_path}"
-            prepared_sample = self._prepare_custom_voice_sample(sample_path)
-            self.custom_voice_sample_path = prepared_sample
-            self.custom_voice_profile = {
-                "mode": "coqui",
-                "name": name,
-                "sample_path": prepared_sample,
-            }
-            self.custom_voice_mode = "coqui"
-        else:
-            speaker_path = str(profile.get("speaker_path") or profile.get("sample_path") or "").strip()
-            if not speaker_path:
-                return "No OpenVoice speaker sample path was provided."
-            if not Path(speaker_path).exists():
-                return f"OpenVoice speaker sample was not found: {speaker_path}"
-            model_path = str(profile.get("openvoice_model_path") or "").strip()
-            if model_path and not Path(model_path).exists():
-                return f"OpenVoice model was not found: {model_path}"
-            self.custom_voice_profile = {
-                "mode": "openvoice",
-                "name": name,
-                "speaker_path": speaker_path,
-                "openvoice_model_path": model_path,
-            }
-            self.custom_voice_mode = "openvoice"
-
-        self.custom_voice_name = name
-        self.custom_voice_enabled = True
-        self.active_preset = f"custom:{self.custom_voice_name}"
-
-        # Reset local engine so fallback remains consistent if custom synthesis fails.
-        if self.local_engine is not None:
-            try:
-                self.local_engine.stop()
-            except Exception:
-                pass
-            self.local_engine = None
-
-        try:
-            if self.custom_voice_mode == "coqui":
-                self._ensure_xtts_model()
-            else:
-                self._get_openvoice_engine(self.custom_voice_profile)
-        except Exception as exc:
-            self.clear_custom_voice()
-            return f"Custom voice could not be loaded. {exc}"
-
-        label = "Coqui XTTS" if self.custom_voice_mode == "coqui" else "OpenVoice"
-        return f"Voice changed to custom {label} profile '{self.custom_voice_name}'."
-
-    def _prepare_custom_voice_sample(self, sample_path: str) -> str:
-        candidate = Path(str(sample_path)).resolve()
-        if candidate.suffix.lower() == ".wav":
-            return str(candidate)
-        if sf is None:
-            return self._convert_with_pydub(candidate)
-        try:
-            audio, sample_rate = sf.read(str(candidate), dtype="float32")
-            cache_dir = Path.home() / ".assistant" / "custom_voices" / "_processed"
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", candidate.stem).strip("_") or "voice"
-            stamp = int(candidate.stat().st_mtime)
-            normalized = cache_dir / f"{safe_name}_{stamp}.wav"
-            sf.write(str(normalized), audio, int(sample_rate), subtype="PCM_16")
-            return str(normalized.resolve())
-        except Exception:
-            return self._convert_with_pydub(candidate)
-
-    def _convert_with_pydub(self, candidate: Path) -> str:
-        if AudioSegment is None:
-            return str(candidate)
-        try:
-            audio = AudioSegment.from_file(str(candidate))
-            cache_dir = Path.home() / ".assistant" / "custom_voices" / "_processed"
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", candidate.stem).strip("_") or "voice"
-            stamp = int(candidate.stat().st_mtime)
-            normalized = cache_dir / f"{safe_name}_{stamp}.wav"
-            audio = audio.set_channels(1).set_frame_rate(22050)
-            audio.export(str(normalized), format="wav")
-            return str(normalized.resolve())
-        except Exception:
-            return str(candidate)
-
-    def _get_openvoice_engine(self, profile: dict):
-        if not profile:
-            raise RuntimeError("OpenVoice profile is missing.")
-        if self.openvoice_engine is not None and self.custom_voice_profile == profile:
-            return self.openvoice_engine
-        engine = OpenVoiceEngine(
-            model_path=str(profile.get("openvoice_model_path") or "").strip() or None,
-            device=os.getenv("OPENVOICE_DEVICE", "").strip().lower() or None,
-        )
-        self.openvoice_engine = engine
-        return engine
-
-    def clear_custom_voice(self):
-        self.custom_voice_enabled = False
-        self.custom_voice_name = ""
-        self.custom_voice_profile = None
-        self.custom_voice_mode = ""
-        self.custom_voice_sample_path = ""
-        self.openvoice_engine = None
-
-    def check_custom_voice_ready(self):
-        if not self.custom_voice_enabled or not self.custom_voice_profile:
-            return False, "Custom voice is not enabled."
-        if self.custom_voice_mode not in {"coqui", "openvoice"}:
-            return False, "Custom voice mode is unsupported."
-        try:
-            if self.custom_voice_mode == "coqui":
-                self._ensure_xtts_model()
-            else:
-                self._get_openvoice_engine(self.custom_voice_profile)
-        except Exception as exc:
-            return False, str(exc)
-        return True, ""
 
     def get_current_preset_info(self) -> str:
         from .config import VOICE_PRESETS
@@ -480,7 +298,7 @@ class TTSEngine:
         if cached is not None:
             return cached
 
-        with self.coqui_lock:
+        with self.model_lock:
             cached = self._piper_voice_cache.get(resolved)
             if cached is not None:
                 return cached
@@ -525,96 +343,6 @@ class TTSEngine:
         sd.play(audio, sample_rate)
         sd.wait()
 
-    def _ensure_xtts_model(self):
-        if self._xtts_engine is not None:
-            return
-        if CoquiTTS is None:
-            raise RuntimeError("Coqui TTS is not installed. Install package 'TTS' to enable voice cloning.")
-        with self.coqui_lock:
-            if self._xtts_engine is not None:
-                return
-            if torch is not None and XttsConfig is not None:
-                try:
-                    torch.serialization.add_safe_globals([XttsConfig])
-                except Exception:
-                    pass
-            if torch is not None and self.xtts_device == "cuda":
-                try:
-                    torch.backends.cuda.matmul.allow_tf32 = True
-                except Exception:
-                    pass
-            self._xtts_engine = CoquiTTS(self.xtts_model_name).to(self.xtts_device)
-
-    def _xtts_speak(self, text):
-        if not self.custom_voice_enabled or self.custom_voice_mode != "coqui":
-            raise RuntimeError("Custom voice mode is not enabled.")
-        if not self.custom_voice_sample_path:
-            raise RuntimeError("Custom voice sample path is missing.")
-        self._ensure_xtts_model()
-        chunks = self._chunk_text_limit(text, self.xtts_chunk_chars)
-        for chunk in chunks:
-            if self.stop_event.is_set():
-                return
-            fd, tmp_name = tempfile.mkstemp(suffix=".wav")
-            os.close(fd)
-            tmp_path = Path(tmp_name)
-            try:
-                self._xtts_engine.tts_to_file(
-                    text=chunk,
-                    speaker_wav=self.custom_voice_sample_path,
-                    language="en",
-                    file_path=str(tmp_path),
-                )
-                self._play_wav_file(tmp_path)
-            finally:
-                try:
-                    tmp_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
-
-    def _openvoice_speak(self, text):
-        if not self.custom_voice_enabled or self.custom_voice_mode != "openvoice":
-            raise RuntimeError("Custom voice mode is not enabled.")
-        profile = self.custom_voice_profile or {}
-        speaker_path = str(profile.get("speaker_path") or "").strip()
-        if not speaker_path:
-            raise RuntimeError("OpenVoice speaker sample path is missing.")
-        engine = self._get_openvoice_engine(profile)
-        fd, tmp_name = tempfile.mkstemp(suffix=".wav")
-        os.close(fd)
-        tmp_path = Path(tmp_name)
-        try:
-            engine.synthesize(text, speaker_path, tmp_path)
-            self._play_wav_file(tmp_path)
-        finally:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-
-    def _chunk_text_limit(self, text, limit):
-        clean = re.sub(r"\s+", " ", text).strip()
-        if not clean:
-            return []
-        limit = max(60, int(limit))
-        parts = re.split(r"(?<=[\.\!\?\;\:])\s+", clean)
-        chunks = []
-        current = ""
-        for part in parts:
-            part = part.strip()
-            if not part:
-                continue
-            candidate = part if not current else f"{current} {part}"
-            if len(candidate) <= limit:
-                current = candidate
-            else:
-                if current:
-                    chunks.append(current)
-                current = part
-        if current:
-            chunks.append(current)
-        return chunks or [clean]
-
     def _piper_speak(self, text):
         self._ensure_piper_model()
         chunks = self._chunk_text(text)
@@ -641,7 +369,7 @@ class TTSEngine:
                 except Exception:
                     pass
 
-    # _piper_synthesize_to_file and RVC pipeline removed (custom voice now uses Coqui/OpenVoice)
+    # _piper_synthesize_to_file removed (not needed for current pipeline)
 
     # ------------------------------------------------------------------
     # pyttsx3  (offline system TTS – fallback 2, preset-matched voice)
@@ -697,15 +425,6 @@ class TTSEngine:
             self.stop_event.clear()
             self.speaking_event.set()
             try:
-                if self.custom_voice_enabled:
-                    try:
-                        if self.custom_voice_mode == "openvoice":
-                            self._openvoice_speak(text)
-                        else:
-                            self._xtts_speak(text)
-                        continue
-                    except Exception as custom_error:
-                        print(f"  [TTS] Custom voice failed ({custom_error}). Falling back to standard voice.")
                 self._edge_speak(text)
             except Exception as edge_error:
                 try:
