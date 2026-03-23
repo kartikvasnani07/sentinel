@@ -5,6 +5,7 @@ Configuration is stored at ``~/.assistant/config.yaml`` and is normalized on
 load so runtime code can depend on a consistent shape.
 """
 
+import os
 from pathlib import Path
 
 try:
@@ -167,6 +168,8 @@ _DEFAULTS = {
     "voice_preset": "jarvis",
     "auto_start": True,
     "is_setup_complete": False,
+    "openweather_api_key": "",
+    "default_location": "",
 }
 
 
@@ -225,6 +228,15 @@ class AssistantConfig:
         if legacy_preset and not self._data.get("voice_preset"):
             self._data["voice_preset"] = legacy_preset
 
+        if not str(self._data.get("openweather_api_key") or "").strip():
+            env_key = os.getenv("OPENWEATHER_API_KEY", "").strip()
+            if env_key:
+                self._data["openweather_api_key"] = env_key
+        if not str(self._data.get("default_location") or "").strip():
+            env_loc = os.getenv("ASSISTANT_DEFAULT_LOCATION", "").strip()
+            if env_loc:
+                self._data["default_location"] = env_loc
+
         assistant_name = str(self._data.get("assistant_name") or "friday").strip().lower()
         assistant_name = " ".join(assistant_name.split()) or "friday"
         self._data["assistant_name"] = assistant_name
@@ -254,6 +266,9 @@ class AssistantConfig:
             model_preference = "auto"
         self._data["model_preference"] = model_preference
 
+        self._data["openweather_api_key"] = str(self._data.get("openweather_api_key") or "").strip()
+        self._data["default_location"] = str(self._data.get("default_location") or "").strip()
+
         self._data["voice_auth_threshold"] = _clamp_percentage(
             self._data.get("voice_auth_threshold"),
             _DEFAULTS["voice_auth_threshold"],
@@ -276,22 +291,30 @@ class AssistantConfig:
         self._data["is_setup_complete"] = bool(self._data.get("is_setup_complete"))
 
     def _load(self):
-        if not self.path.exists():
-            return
+        self._load_from_path(self.path)
+        local_path = (Path.cwd() / "config.yaml").resolve()
+        if local_path != self.path:
+            self._load_from_path(local_path)
 
+    def _load_from_path(self, path):
+        if not path.exists():
+            return
         try:
             if yaml is not None:
-                with open(self.path, "r", encoding="utf-8") as handle:
+                with open(path, "r", encoding="utf-8") as handle:
                     loaded = yaml.safe_load(handle)
                 if isinstance(loaded, dict):
                     self._data.update(loaded)
             else:
-                self._load_fallback()
+                self._load_fallback_path(path)
         except Exception as exc:
-            print(f"[config] Failed to load {self.path}: {exc}")
+            print(f"[config] Failed to load {path}: {exc}")
 
     def _load_fallback(self):
-        with open(self.path, "r", encoding="utf-8") as handle:
+        self._load_fallback_path(self.path)
+
+    def _load_fallback_path(self, path):
+        with open(path, "r", encoding="utf-8") as handle:
             for raw_line in handle:
                 line = raw_line.strip()
                 if not line or line.startswith("#") or ":" not in line:

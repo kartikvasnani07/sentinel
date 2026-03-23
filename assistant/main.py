@@ -1876,7 +1876,7 @@ def run():
     llm.language = "en"
     llm.humor_level = config.get("humor_level", 50)
 
-    system = SystemActions(llm=llm)
+    system = SystemActions(llm=llm, config=config)
     memory = Memory(max_turns=12)
     memory.start_new_conversation()
     terminal_state = {"last_response": ""}

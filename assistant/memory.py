@@ -135,6 +135,19 @@ class Memory:
         rows.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
         return rows
 
+    def get_conversation(self, conversation_id):
+        normalized = self._normalize_conversation_id(conversation_id)
+        conversation = self._data["conversations"].get(normalized)
+        if conversation is None:
+            return None
+        return {
+            "id": normalized,
+            "title": str(conversation.get("title") or "Untitled"),
+            "created_at": str(conversation.get("created_at") or ""),
+            "updated_at": str(conversation.get("updated_at") or ""),
+            "messages": list(conversation.get("messages") or []),
+        }
+
     def switch_to_conversation(self, conversation_id):
         normalized = self._normalize_conversation_id(conversation_id)
         if normalized not in self._data["conversations"]:

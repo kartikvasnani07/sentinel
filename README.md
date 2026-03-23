@@ -646,3 +646,39 @@ python -m pip install -e .
 ## License
 
 Add your license details here.
+
+---
+
+# AI Ops Assistant (CodeWar 2.0 spec)
+
+This repo now includes a separate `ai_ops_assistant/` module that implements the required **Planner → Executor → Verifier** architecture with real APIs (GitHub + Open‑Meteo weather) and a local HTTP endpoint.
+
+Structure:
+
+```
+ai_ops_assistant/
+  agents/
+  tools/
+  llm/
+  main.py
+  requirements.txt
+  .env.example
+```
+
+Run via CLI:
+
+```bash
+python -m ai_ops_assistant.main --task "Find the top 3 trending Python repos on GitHub and the weather in Amsterdam"
+```
+
+Run as local HTTP service:
+
+```bash
+python -m ai_ops_assistant.main --serve 8010
+```
+
+Then POST:
+
+```bash
+curl -X POST http://127.0.0.1:8010/run -H "Content-Type: application/json" -d "{\"task\": \"Find top 3 Python repos and the weather in Amsterdam\"}"
+```

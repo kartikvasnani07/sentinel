@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import time
+import threading
 import webbrowser
 import xml.etree.ElementTree as ET
 from ctypes import POINTER, cast
@@ -239,11 +240,12 @@ class SystemActions:
         "windows powershell": {"names": {"powershell", "pwsh"}, "titles": {"powershell", "windows powershell"}},
     }
 
-    def __init__(self, base_dir=None, llm=None):
+    def __init__(self, base_dir=None, llm=None, config=None):
         self.base_dir = Path(base_dir or os.getcwd()).resolve()
         self.is_windows = platform.system().lower().startswith("win")
         self.platform_actions = get_platform_actions(self)
         self.llm = llm
+        self.config = config
         self.home = Path.home()
         self.standard_paths = {
             alias: (self.home / suffix).resolve() if suffix else self.home.resolve()
@@ -305,11 +307,31 @@ class SystemActions:
             "get_news": self._get_news,
             "draw_file_tree": self._draw_file_tree,
             "project_code": self._project_code,
+            "change_assistant_name": self._change_assistant_name,
         }
 
         handler = handlers.get(action)
         if handler is None:
             return f"Unknown system action: {action}"
+
+        async_actions = {
+            "open_application",
+            "open_path",
+            "open_setting_panel",
+            "play_music",
+        }
+        if action in async_actions:
+            target = self.describe_target(params)
+
+            def _run():
+                try:
+                    handler(params)
+                except Exception:
+                    return
+
+            threading.Thread(target=_run, daemon=True).start()
+            verb = "Opening" if action != "play_music" else "Playing"
+            return f"{verb} {target}."
 
         try:
             result = handler(params)
@@ -328,6 +350,18 @@ class SystemActions:
         if data.get("website"):
             return str(data["website"])
         return str(data.get("name") or "the requested item")
+
+    def _change_assistant_name(self, params):
+        name = params.get("assistant_name") or params.get("name") or params.get("target") or ""
+        cleaned = " ".join(str(name).strip().split())
+        if not cleaned:
+            return "Please provide a name for the assistant."
+        if self.config is not None:
+            try:
+                self.config.set("assistant_name", cleaned)
+            except Exception:
+                pass
+        return f"Assistant name set to {cleaned}."
 
     def _spoken_target_name(self, params):
         data = self._prepare_params(params or {})
@@ -4084,8 +4118,10 @@ $devices | ConvertTo-Json -Depth 4 -Compress
         return request + ("\n" if request and not request.endswith("\n") else "")
 
     def _resolve_website_url(self, params):
-        website = str(params.get("website") or params.get("raw_text") or "").strip()
+        raw_text = str(params.get("raw_text") or "")
+        website = str(params.get("website") or raw_text or "").strip()
         lowered = self._normalize_query(website)
+        raw_lowered = self._normalize_query(raw_text)
         lowered = lowered.replace("youtube music", "youtube_music")
         lowered = re.sub(r"^(?:open|launch|show|start|run|visit|go to)\s+", "", lowered).strip()
         lowered = re.sub(r"\b(?:website|site|homepage|home page)\b", "", lowered).strip()
@@ -4120,15 +4156,15 @@ $devices | ConvertTo-Json -Depth 4 -Compress
                 return f"https://github.com/{user.strip('/')}"
             return "https://github.com"
 
-        if "youtube_music" in lowered:
+        if "youtube_music" in lowered or "youtube_music" in raw_lowered:
             query = re.sub(r"\byoutube_music\b", " ", lowered).strip()
-            query = re.sub(r"\b(?:play|open|run|start|search|find|for|on|in|music|song|video)\b", " ", query)
+            query = re.sub(r"\b(?:play|open|run|start|search|find|for|on|in|music|song|video|new|tab|window|incognito|private|mode)\b", " ", query)
             query = " ".join(query.split())
             if query:
                 return f"https://music.youtube.com/search?q={quote_plus(query)}"
             return "https://music.youtube.com"
 
-        if "youtube" in lowered:
+        if "youtube" in lowered or "youtube" in raw_lowered:
             if "channel" in lowered or "profile" in lowered:
                 handle = self._extract_handle(lowered, "youtube")
                 if handle:
@@ -4138,7 +4174,7 @@ $devices | ConvertTo-Json -Depth 4 -Compress
                 if "/" in path or path.startswith("@"):
                     return f"https://www.youtube.com/{path.lstrip('/')}"
             query = re.sub(r"\byoutube\b", " ", lowered)
-            query = re.sub(r"\b(?:play|open|run|start|search|find|for|on|in|video|videos|song|music)\b", " ", query)
+            query = re.sub(r"\b(?:play|open|run|start|search|find|for|on|in|video|videos|song|music|new|tab|window|incognito|private|mode|next)\b", " ", query)
             query = " ".join(query.split())
             if query:
                 noise = {
@@ -4150,9 +4186,11 @@ $devices | ConvertTo-Json -Depth 4 -Compress
                     "browser",
                     "tab",
                     "window",
+                    "new",
                     "incognito",
                     "private",
                     "mode",
+                    "next",
                     "in",
                     "on",
                     "the",
@@ -4185,7 +4223,9 @@ $devices | ConvertTo-Json -Depth 4 -Compress
             return "https://twitter.com"
 
         if " " in lowered:
-            return f"https://www.google.com/search?q={quote_plus(lowered)}"
+            cleaned = re.sub(r"\b(?:new|tab|window|incognito|private|mode|next)\b", " ", lowered)
+            cleaned = " ".join(cleaned.split())
+            return f"https://www.google.com/search?q={quote_plus(cleaned or lowered)}"
         return f"https://{lowered}"
 
     def _extract_site_path(self, text, site_name):

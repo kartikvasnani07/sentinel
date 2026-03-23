@@ -12,6 +12,7 @@ __pycache__/
 *.zip
 *.tar
 *.exe
+*.yaml
 qwen3tts/
 *.safetensors
 apps/**/bin/

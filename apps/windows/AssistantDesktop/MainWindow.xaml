@@ -9,18 +9,243 @@
         WindowStartupLocation="CenterScreen"
         FontFamily="Bahnschrift">
     <Window.Resources>
-        <Style TargetType="Button" x:Key="ChipButton">
+        <BooleanToVisibilityConverter x:Key="BoolToVisibility"/>
+        <local:WeatherKindToVisibilityConverter x:Key="WeatherKindVisibility"/>
+        <Style TargetType="ScrollBar" x:Key="ThemedScrollBar">
+            <Setter Property="Width" Value="10"/>
+            <Setter Property="Background" Value="#101520"/>
+            <Setter Property="Foreground" Value="#2F3A4C"/>
+            <Setter Property="Margin" Value="2"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ScrollBar">
+                        <Grid Background="{TemplateBinding Background}">
+                            <Track x:Name="PART_Track" IsDirectionReversed="True">
+                                <Track.DecreaseRepeatButton>
+                                    <RepeatButton Command="ScrollBar.PageUpCommand" Opacity="0" IsEnabled="False"/>
+                                </Track.DecreaseRepeatButton>
+                                <Track.IncreaseRepeatButton>
+                                    <RepeatButton Command="ScrollBar.PageDownCommand" Opacity="0" IsEnabled="False"/>
+                                </Track.IncreaseRepeatButton>
+                                <Track.Thumb>
+                                    <Thumb Background="{TemplateBinding Foreground}">
+                                        <Thumb.Template>
+                                            <ControlTemplate TargetType="Thumb">
+                                                <Border Background="{TemplateBinding Background}"
+                                                        CornerRadius="6"
+                                                        Margin="2"/>
+                                            </ControlTemplate>
+                                        </Thumb.Template>
+                                    </Thumb>
+                                </Track.Thumb>
+                            </Track>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style TargetType="Button" x:Key="AppButton">
+            <Setter Property="Padding" Value="14,8"/>
+            <Setter Property="Background" Value="#1E2430"/>
+            <Setter Property="BorderBrush" Value="{StaticResource CardBorderBrush}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="12">
+                            <ContentPresenter HorizontalAlignment="Center"
+                                              VerticalAlignment="Center"
+                                              Margin="{TemplateBinding Padding}"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Background" Value="#263040"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter Property="Background" Value="#2F3B4F"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style TargetType="Button" x:Key="ChipButton" BasedOn="{StaticResource AppButton}">
             <Setter Property="Margin" Value="6,0,0,0"/>
             <Setter Property="Padding" Value="14,6"/>
             <Setter Property="Background" Value="{StaticResource CardBackgroundBrush}"/>
             <Setter Property="BorderBrush" Value="{StaticResource CardBorderBrush}"/>
-            <Setter Property="BorderThickness" Value="1"/>
             <Setter Property="Foreground" Value="{StaticResource TextSecondaryBrush}"/>
-            <Setter Property="Cursor" Value="Hand"/>
+        </Style>
+        <Style TargetType="TextBox" x:Key="AppTextBox">
+            <Setter Property="Background" Value="{StaticResource AppBackgroundBrush}"/>
+            <Setter Property="BorderBrush" Value="{StaticResource CardBorderBrush}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}"/>
+            <Setter Property="Padding" Value="14,6"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TextBox">
+                        <Border Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="12">
+                            <ScrollViewer x:Name="PART_ContentHost"
+                                          Margin="{TemplateBinding Padding}"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style TargetType="ComboBox" x:Key="AppComboBox">
+            <Setter Property="Background" Value="#F7F9FC"/>
+            <Setter Property="BorderBrush" Value="#D6DCE5"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Foreground" Value="#111418"/>
+            <Setter Property="Padding" Value="10,4"/>
+            <Setter Property="ItemContainerStyle">
+                <Setter.Value>
+                    <Style TargetType="ComboBoxItem">
+                        <Setter Property="Foreground" Value="#111418"/>
+                        <Setter Property="Background" Value="#F7F9FC"/>
+                        <Setter Property="Padding" Value="8,4"/>
+                    </Style>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style TargetType="TextBox" x:Key="SettingsTextBox" BasedOn="{StaticResource AppTextBox}">
+            <Setter Property="Background" Value="#F7F9FC"/>
+            <Setter Property="Foreground" Value="#111418"/>
+            <Setter Property="CaretBrush" Value="#111418"/>
+            <Setter Property="Padding" Value="10,2"/>
+            <Setter Property="MinHeight" Value="30"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+            <Setter Property="BorderBrush" Value="#D6DCE5"/>
+            <Setter Property="BorderThickness" Value="1"/>
         </Style>
     </Window.Resources>
 
-    <Grid Margin="32">
+    <Grid Margin="0">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+
+        <Border Grid.Column="0"
+                Width="260"
+                Background="#10131A"
+                BorderBrush="{StaticResource CardBorderBrush}"
+                BorderThickness="0,0,1,0"
+                Visibility="{Binding IsMenuOpen, Converter={StaticResource BoolToVisibility}}">
+            <Grid Margin="18">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Text="History" FontSize="18" Foreground="{StaticResource TextPrimaryBrush}" FontWeight="SemiBold"/>
+                    <Button Grid.Column="1"
+                            Width="32"
+                            Height="28"
+                            Margin="8,0,0,0"
+                            Click="RefreshHistory_Click"
+                            Style="{StaticResource AppButton}">
+                        <TextBlock FontFamily="Segoe UI Symbol" Text="↻" FontSize="14"/>
+                    </Button>
+                </Grid>
+                <Button Grid.Row="1"
+                        Margin="0,12,0,12"
+                        Content="New Chat"
+                        Click="NewChat_Click"
+                        Style="{StaticResource AppButton}"/>
+                <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto">
+                    <ScrollViewer.Resources>
+                        <Style TargetType="ScrollBar" BasedOn="{StaticResource ThemedScrollBar}"/>
+                    </ScrollViewer.Resources>
+                    <ItemsControl ItemsSource="{Binding Conversations}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate DataType="{x:Type local:ConversationItem}">
+                                <Grid Margin="0,0,0,8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Button Grid.Column="0"
+                                            Tag="{Binding}"
+                                            Click="OpenChat_Click"
+                                            HorizontalContentAlignment="Left">
+                                        <Button.Style>
+                                            <Style TargetType="Button" BasedOn="{StaticResource AppButton}">
+                                                <Setter Property="Background" Value="#171B24"/>
+                                                <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}"/>
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding IsCurrent}" Value="True">
+                                                        <Setter Property="Background" Value="#1F2D3F"/>
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </Button.Style>
+                                        <StackPanel>
+                                            <TextBlock Text="{Binding Title}" FontSize="13" TextWrapping="Wrap"/>
+                                            <TextBlock Text="{Binding Id}" FontSize="11" Foreground="{StaticResource TextSecondaryBrush}"/>
+                                        </StackPanel>
+                                    </Button>
+                                    <Button Grid.Column="1"
+                                            Width="28"
+                                            Height="28"
+                                            Margin="6,0,0,0"
+                                            Tag="{Binding}"
+                                            Click="ChatMenu_Click">
+                                        <Button.Content>
+                                            <TextBlock FontFamily="Segoe MDL2 Assets"
+                                                       Text="&#xE712;"
+                                                       FontSize="16"
+                                                       Foreground="{StaticResource TextPrimaryBrush}"
+                                                       HorizontalAlignment="Center"
+                                                       VerticalAlignment="Center"/>
+                                        </Button.Content>
+                                        <Button.Style>
+                                            <Style TargetType="Button" BasedOn="{StaticResource AppButton}">
+                                                <Setter Property="Background" Value="#171B24"/>
+                                                <Setter Property="Foreground" Value="{StaticResource TextSecondaryBrush}"/>
+                                            </Style>
+                                        </Button.Style>
+                                        <Button.ContextMenu>
+                                            <ContextMenu DataContext="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource Self}}">
+                                                <MenuItem Header="Export chat" Click="ExportChat_Click" Tag="{Binding}"/>
+                                                <MenuItem Header="Delete chat" Click="DeleteChat_Click" Tag="{Binding}"/>
+                                            </ContextMenu>
+                                        </Button.ContextMenu>
+                                    </Button>
+                                </Grid>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </ScrollViewer>
+                <Button Grid.Row="3"
+                        Margin="0,16,0,0"
+                        Click="OpenSettings_Click"
+                        HorizontalContentAlignment="Left"
+                        Style="{StaticResource AppButton}">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock FontFamily="Segoe MDL2 Assets" Text="&#xE713;" Margin="0,0,8,0"/>
+                        <TextBlock Text="Settings"/>
+                    </StackPanel>
+                </Button>
+            </Grid>
+        </Border>
+
+        <Grid Grid.Column="1" Margin="32">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
@@ -29,6 +254,7 @@
 
         <DockPanel Grid.Row="0" LastChildFill="False" Margin="0,0,0,20">
             <StackPanel Orientation="Horizontal" DockPanel.Dock="Left">
+                <Button Content="≡" Width="36" Height="32" Margin="0,0,12,0" Click="Menu_Click" Style="{StaticResource AppButton}"/>
                 <TextBlock Text="Assistant" FontSize="20" Foreground="{StaticResource TextPrimaryBrush}" FontWeight="SemiBold"/>
                 <Border Background="{StaticResource AccentSoftBrush}" CornerRadius="10" Padding="8,2" Margin="12,0,0,0">
                     <TextBlock Text="Local" Foreground="{StaticResource AccentBrush}" FontSize="12"/>
@@ -41,6 +267,17 @@
         </DockPanel>
 
         <Grid Grid.Row="1">
+            <Grid x:Name="ChatView">
+                <Grid.Style>
+                    <Style TargetType="Grid">
+                        <Setter Property="Visibility" Value="Visible"/>
+                        <Style.Triggers>
+                            <DataTrigger Binding="{Binding IsSettingsActive}" Value="True">
+                                <Setter Property="Visibility" Value="Collapsed"/>
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </Grid.Style>
             <Grid.RowDefinitions>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
@@ -64,7 +301,10 @@
                         <RowDefinition Height="Auto"/>
                     </Grid.RowDefinitions>
 
-                    <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto">
+                    <ScrollViewer x:Name="ChatScrollViewer" Grid.Row="0" VerticalScrollBarVisibility="Auto">
+                        <ScrollViewer.Resources>
+                            <Style TargetType="ScrollBar" BasedOn="{StaticResource ThemedScrollBar}"/>
+                        </ScrollViewer.Resources>
                         <ItemsControl ItemsSource="{Binding Messages}">
                             <ItemsControl.ItemTemplate>
                                 <DataTemplate DataType="{x:Type local:ChatMessage}">
@@ -81,7 +321,238 @@
                                                 </Style.Triggers>
                                             </Style>
                                         </Border.Style>
-                                        <TextBlock Text="{Binding Text}" TextWrapping="Wrap" Foreground="{StaticResource TextPrimaryBrush}" MaxWidth="640"/>
+                                        <StackPanel>
+                                            <DockPanel>
+                                                <Button DockPanel.Dock="Right"
+                                                        Content="JSON"
+                                                        Tag="{Binding}"
+                                                        Click="ToggleJson_Click"
+                                                        Width="46"
+                                                        Height="24"
+                                                        Padding="0"
+                                                        Margin="8,0,0,0">
+                                                    <Button.Style>
+                                                        <Style TargetType="Button" BasedOn="{StaticResource AppButton}">
+                                                            <Setter Property="Background" Value="#202632"/>
+                                                            <Setter Property="Foreground" Value="{StaticResource TextSecondaryBrush}"/>
+                                                            <Style.Triggers>
+                                                                <DataTrigger Binding="{Binding IsUser}" Value="True">
+                                                                    <Setter Property="Visibility" Value="Collapsed"/>
+                                                                </DataTrigger>
+                                                            </Style.Triggers>
+                                                        </Style>
+                                                    </Button.Style>
+                                                </Button>
+                                                <TextBlock Text="{Binding DisplayText}"
+                                                           TextWrapping="Wrap"
+                                                           Foreground="{StaticResource TextPrimaryBrush}"
+                                                           FontSize="{Binding DataContext.ChatFontSizeValue, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                           MaxWidth="640"/>
+                                            </DockPanel>
+                                            <Border Margin="0,12,0,0"
+                                                    Background="#101522"
+                                                    CornerRadius="14"
+                                                    BorderBrush="#273243"
+                                                    BorderThickness="1"
+                                                    Visibility="{Binding IsWeatherVisible, Converter={StaticResource BoolToVisibility}}">
+                                                <Grid Margin="12">
+                                                    <Grid.RowDefinitions>
+                                                        <RowDefinition Height="Auto"/>
+                                                        <RowDefinition Height="Auto"/>
+                                                        <RowDefinition Height="Auto"/>
+                                                        <RowDefinition Height="Auto"/>
+                                                    </Grid.RowDefinitions>
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*"/>
+                                                        <ColumnDefinition Width="Auto"/>
+                                                    </Grid.ColumnDefinitions>
+                                                    <Grid Grid.RowSpan="4"
+                                                          Grid.ColumnSpan="2"
+                                                          ClipToBounds="True"
+                                                          Opacity="0.55"
+                                                          IsHitTestVisible="False">
+                                                        <Grid Visibility="{Binding Weather.Kind, Converter={StaticResource WeatherKindVisibility}, ConverterParameter=sunny}">
+                                                            <Rectangle Fill="#1C2A44"/>
+                                                            <Ellipse Width="90" Height="90" Fill="#F6C24B" HorizontalAlignment="Right" Margin="0,-28,-16,0"/>
+                                                            <Ellipse x:Name="SunGlow" Width="150" Height="150" Fill="#F6C24B" Opacity="0.2" HorizontalAlignment="Right" Margin="0,-60,-40,0">
+                                                                <Ellipse.Triggers>
+                                                                    <EventTrigger RoutedEvent="Loaded">
+                                                                        <BeginStoryboard>
+                                                                            <Storyboard RepeatBehavior="Forever" AutoReverse="True">
+                                                                                <DoubleAnimation Storyboard.TargetName="SunGlow"
+                                                                                                 Storyboard.TargetProperty="Opacity"
+                                                                                                 From="0.15" To="0.4" Duration="0:0:1.6"/>
+                                                                            </Storyboard>
+                                                                        </BeginStoryboard>
+                                                                    </EventTrigger>
+                                                                </Ellipse.Triggers>
+                                                            </Ellipse>
+                                                        </Grid>
+                                                        <Grid Visibility="{Binding Weather.Kind, Converter={StaticResource WeatherKindVisibility}, ConverterParameter=rain}">
+                                                            <Rectangle Fill="#1A2333"/>
+                                                            <Canvas>
+                                                                <Rectangle x:Name="Rain1" Width="2" Height="12" Fill="#7FC8FF" Opacity="0.8" Canvas.Left="20" Canvas.Top="-10"/>
+                                                                <Rectangle x:Name="Rain2" Width="2" Height="14" Fill="#7FC8FF" Opacity="0.7" Canvas.Left="60" Canvas.Top="-20"/>
+                                                                <Rectangle x:Name="Rain3" Width="2" Height="10" Fill="#7FC8FF" Opacity="0.7" Canvas.Left="110" Canvas.Top="-12"/>
+                                                                <Rectangle x:Name="Rain4" Width="2" Height="16" Fill="#7FC8FF" Opacity="0.8" Canvas.Left="160" Canvas.Top="-18"/>
+                                                                <Rectangle x:Name="Rain5" Width="2" Height="12" Fill="#7FC8FF" Opacity="0.75" Canvas.Left="210" Canvas.Top="-14"/>
+                                                                <Canvas.Triggers>
+                                                                    <EventTrigger RoutedEvent="Loaded">
+                                                                        <BeginStoryboard>
+                                                                            <Storyboard RepeatBehavior="Forever">
+                                                                                <DoubleAnimation Storyboard.TargetName="Rain1" Storyboard.TargetProperty="(Canvas.Top)" From="-10" To="90" Duration="0:0:0.9"/>
+                                                                                <DoubleAnimation Storyboard.TargetName="Rain2" Storyboard.TargetProperty="(Canvas.Top)" From="-20" To="90" Duration="0:0:0.8"/>
+                                                                                <DoubleAnimation Storyboard.TargetName="Rain3" Storyboard.TargetProperty="(Canvas.Top)" From="-12" To="90" Duration="0:0:1.0"/>
+                                                                                <DoubleAnimation Storyboard.TargetName="Rain4" Storyboard.TargetProperty="(Canvas.Top)" From="-18" To="90" Duration="0:0:0.75"/>
+                                                                                <DoubleAnimation Storyboard.TargetName="Rain5" Storyboard.TargetProperty="(Canvas.Top)" From="-14" To="90" Duration="0:0:0.85"/>
+                                                                            </Storyboard>
+                                                                        </BeginStoryboard>
+                                                                    </EventTrigger>
+                                                                </Canvas.Triggers>
+                                                            </Canvas>
+                                                        </Grid>
+                                                        <Grid Visibility="{Binding Weather.Kind, Converter={StaticResource WeatherKindVisibility}, ConverterParameter=cloudy}">
+                                                            <Rectangle Fill="#202735"/>
+                                                            <Canvas>
+                                                                <Ellipse Width="120" Height="60" Fill="#E0E4EA" Opacity="0.6" Canvas.Left="20" Canvas.Top="10"/>
+                                                                <Ellipse Width="90" Height="50" Fill="#D2D7DE" Opacity="0.7" Canvas.Left="90" Canvas.Top="0"/>
+                                                                <Canvas.RenderTransform>
+                                                                    <TranslateTransform x:Name="CloudShift"/>
+                                                                </Canvas.RenderTransform>
+                                                                <Canvas.Triggers>
+                                                                    <EventTrigger RoutedEvent="Loaded">
+                                                                        <BeginStoryboard>
+                                                                            <Storyboard RepeatBehavior="Forever" AutoReverse="True">
+                                                                                <DoubleAnimation Storyboard.TargetName="CloudShift" Storyboard.TargetProperty="X" From="-8" To="12" Duration="0:0:3"/>
+                                                                            </Storyboard>
+                                                                        </BeginStoryboard>
+                                                                    </EventTrigger>
+                                                                </Canvas.Triggers>
+                                                            </Canvas>
+                                                        </Grid>
+                                                        <Grid Visibility="{Binding Weather.Kind, Converter={StaticResource WeatherKindVisibility}, ConverterParameter=storm}">
+                                                            <Rectangle Fill="#1A1F2C"/>
+                                                            <Polygon Points="40,10 60,10 50,35 70,35 35,80 45,45 30,45"
+                                                                     Fill="#F9E16A" Opacity="0.7">
+                                                                <Polygon.Triggers>
+                                                                    <EventTrigger RoutedEvent="Loaded">
+                                                                        <BeginStoryboard>
+                                                                            <Storyboard RepeatBehavior="Forever" AutoReverse="True">
+                                                                                <DoubleAnimation Storyboard.TargetProperty="Opacity" From="0.2" To="0.85" Duration="0:0:1.2"/>
+                                                                            </Storyboard>
+                                                                        </BeginStoryboard>
+                                                                    </EventTrigger>
+                                                                </Polygon.Triggers>
+                                                            </Polygon>
+                                                        </Grid>
+                                                        <Grid Visibility="{Binding Weather.Kind, Converter={StaticResource WeatherKindVisibility}, ConverterParameter=snow}">
+                                                            <Rectangle Fill="#1A2230"/>
+                                                            <Canvas>
+                                                                <Ellipse x:Name="Snow1" Width="4" Height="4" Fill="#E8F4FF" Canvas.Left="30" Canvas.Top="-6"/>
+                                                                <Ellipse x:Name="Snow2" Width="5" Height="5" Fill="#E8F4FF" Canvas.Left="80" Canvas.Top="-12"/>
+                                                                <Ellipse x:Name="Snow3" Width="4" Height="4" Fill="#E8F4FF" Canvas.Left="140" Canvas.Top="-10"/>
+                                                                <Ellipse x:Name="Snow4" Width="6" Height="6" Fill="#E8F4FF" Canvas.Left="200" Canvas.Top="-8"/>
+                                                                <Canvas.Triggers>
+                                                                    <EventTrigger RoutedEvent="Loaded">
+                                                                        <BeginStoryboard>
+                                                                            <Storyboard RepeatBehavior="Forever">
+                                                                                <DoubleAnimation Storyboard.TargetName="Snow1" Storyboard.TargetProperty="(Canvas.Top)" From="-6" To="90" Duration="0:0:1.3"/>
+                                                                                <DoubleAnimation Storyboard.TargetName="Snow2" Storyboard.TargetProperty="(Canvas.Top)" From="-12" To="90" Duration="0:0:1.1"/>
+                                                                                <DoubleAnimation Storyboard.TargetName="Snow3" Storyboard.TargetProperty="(Canvas.Top)" From="-10" To="90" Duration="0:0:1.4"/>
+                                                                                <DoubleAnimation Storyboard.TargetName="Snow4" Storyboard.TargetProperty="(Canvas.Top)" From="-8" To="90" Duration="0:0:1.25"/>
+                                                                            </Storyboard>
+                                                                        </BeginStoryboard>
+                                                                    </EventTrigger>
+                                                                </Canvas.Triggers>
+                                                            </Canvas>
+                                                        </Grid>
+                                                        <Grid Visibility="{Binding Weather.Kind, Converter={StaticResource WeatherKindVisibility}, ConverterParameter=mist}">
+                                                            <Rectangle Fill="#202734"/>
+                                                            <Rectangle Fill="#CED6E0" Opacity="0.15" Height="18" VerticalAlignment="Center"/>
+                                                            <Rectangle Fill="#CED6E0" Opacity="0.18" Height="10" VerticalAlignment="Bottom" Margin="0,0,0,10"/>
+                                                        </Grid>
+                                                    </Grid>
+                                                    <TextBlock Grid.Row="0"
+                                                               Grid.Column="0"
+                                                               Text="{Binding WeatherLocation}"
+                                                               Foreground="{StaticResource TextPrimaryBrush}"
+                                                               FontSize="14"
+                                                               FontWeight="SemiBold"/>
+                                                    <Button Grid.Row="0"
+                                                            Grid.Column="1"
+                                                            Tag="{Binding}"
+                                                            Click="ToggleWeather_Click"
+                                                            Height="26"
+                                                            Padding="10,0"
+                                                            Style="{StaticResource AppButton}">
+                                                            <Button.Content>
+                                                                <StackPanel Orientation="Horizontal">
+                                                                    <TextBlock FontFamily="Segoe MDL2 Assets" Text="&#xE8A7;" Margin="0,0,6,0"/>
+                                                                    <TextBlock Text="{Binding WeatherToggleLabel}"/>
+                                                                </StackPanel>
+                                                            </Button.Content>
+                                                    </Button>
+                                                    <StackPanel Grid.Row="1" Grid.Column="0" Orientation="Horizontal" Margin="0,6,0,0">
+                                                        <TextBlock Text="{Binding WeatherTempLabel}" Foreground="{StaticResource TextPrimaryBrush}" FontSize="20" FontWeight="Bold"/>
+                                                        <TextBlock Text="  " />
+                                                        <TextBlock Text="{Binding WeatherCondition}" Foreground="{StaticResource TextSecondaryBrush}" FontSize="13" VerticalAlignment="Bottom"/>
+                                                    </StackPanel>
+                                                    <StackPanel Grid.Row="2" Grid.Column="0" Orientation="Horizontal" Margin="0,4,0,0">
+                                                        <TextBlock Text="Feels like " Foreground="{StaticResource TextSecondaryBrush}" FontSize="12"/>
+                                                        <TextBlock Text="{Binding WeatherFeelsLikeLabel}" Foreground="{StaticResource TextSecondaryBrush}" FontSize="12"/>
+                                                        <TextBlock Text="  •  Humidity " Foreground="{StaticResource TextSecondaryBrush}" FontSize="12"/>
+                                                        <TextBlock Text="{Binding WeatherHumidityLabel}" Foreground="{StaticResource TextSecondaryBrush}" FontSize="12"/>
+                                                        <TextBlock Text="  •  Wind " Foreground="{StaticResource TextSecondaryBrush}" FontSize="12"/>
+                                                        <TextBlock Text="{Binding WeatherWindLabel}" Foreground="{StaticResource TextSecondaryBrush}" FontSize="12"/>
+                                                    </StackPanel>
+                                                    <StackPanel Grid.Row="2" Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,4,0,0">
+                                                        <TextBlock Text="{Binding WeatherPressureLabel}" Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"/>
+                                                    </StackPanel>
+                                                    <ItemsControl Grid.Row="3"
+                                                                  Grid.Column="0"
+                                                                  Grid.ColumnSpan="2"
+                                                                  Margin="0,10,0,0"
+                                                                  ItemsSource="{Binding Weather.Hourly}"
+                                                                  Visibility="{Binding IsWeatherExpanded, Converter={StaticResource BoolToVisibility}}">
+                                                        <ItemsControl.ItemsPanel>
+                                                            <ItemsPanelTemplate>
+                                                                <WrapPanel/>
+                                                            </ItemsPanelTemplate>
+                                                        </ItemsControl.ItemsPanel>
+                                                        <ItemsControl.ItemTemplate>
+                                                            <DataTemplate>
+                                                                <Border Background="#182030" CornerRadius="10" Padding="8" Margin="0,0,8,8">
+                                                                    <StackPanel>
+                                                                        <TextBlock Text="{Binding Time}" Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"/>
+                                                                        <TextBlock Text="{Binding TempC, StringFormat={}{0:0.#}°C}" Foreground="{StaticResource TextPrimaryBrush}" FontSize="13" FontWeight="SemiBold"/>
+                                                                        <TextBlock Text="{Binding Condition}" Foreground="{StaticResource TextSecondaryBrush}" FontSize="11"/>
+                                                                    </StackPanel>
+                                                                </Border>
+                                                            </DataTemplate>
+                                                        </ItemsControl.ItemTemplate>
+                                                    </ItemsControl>
+                                                </Grid>
+                                            </Border>
+                                            <StackPanel Orientation="Horizontal"
+                                                        Margin="0,8,0,0"
+                                                        Visibility="{Binding IsUser, Converter={StaticResource BoolToVisibility}}">
+                                                <Button Content="Copy" Tag="{Binding}" Click="CopyPrompt_Click" Padding="8,2" Style="{StaticResource AppButton}"/>
+                                                <Button Content="Edit" Tag="{Binding}" Click="EditPrompt_Click" Padding="8,2" Margin="6,0,0,0" Style="{StaticResource AppButton}"/>
+                                            </StackPanel>
+                                            <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                                                <StackPanel.Style>
+                                                    <Style TargetType="StackPanel">
+                                                        <Setter Property="Visibility" Value="Visible"/>
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding IsUser}" Value="True">
+                                                                <Setter Property="Visibility" Value="Collapsed"/>
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </StackPanel.Style>
+                                                <Button Content="Copy" Tag="{Binding}" Click="CopyResponse_Click" Padding="8,2" Style="{StaticResource AppButton}"/>
+                                            </StackPanel>
+                                        </StackPanel>
                                     </Border>
                                 </DataTemplate>
                             </ItemsControl.ItemTemplate>
@@ -94,7 +565,7 @@
                                 <Border Background="#1D1F28" CornerRadius="12" Padding="10" Margin="0,6,0,0">
                                     <StackPanel Orientation="Horizontal">
                                         <TextBlock Text="{Binding}" Foreground="{StaticResource TextSecondaryBrush}" Width="640" TextTrimming="CharacterEllipsis"/>
-                                        <Button Content="Remove" Tag="{Binding}" Margin="10,0,0,0" Click="RemovePin_Click"/>
+                                        <Button Content="Remove" Tag="{Binding}" Margin="10,0,0,0" Click="RemovePin_Click" Style="{StaticResource AppButton}"/>
                                     </StackPanel>
                                 </Border>
                             </DataTemplate>
@@ -102,7 +573,7 @@
                     </ItemsControl>
 
                     <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,12,0,0" VerticalAlignment="Center">
-                        <Button x:Name="PinButton" Content="Pin" Width="60" Height="38" Click="Pin_Click">
+                        <Button x:Name="PinButton" Content="Pin" Width="60" Height="38" Click="Pin_Click" Style="{StaticResource AppButton}">
                             <Button.ContextMenu>
                                 <ContextMenu>
                                     <MenuItem Header="Pin File" Click="PinFile_Click"/>
@@ -112,30 +583,36 @@
                             </Button.ContextMenu>
                         </Button>
                         <ComboBox x:Name="ModelSelector"
-                                  Width="180"
+                                  Width="160"
                                   Height="38"
                                   Margin="10,0,0,0"
+                                  Style="{StaticResource AppComboBox}"
                                   ItemsSource="{Binding ModelOptions}"
                                   SelectedItem="{Binding SelectedModelOption}"
                                   DisplayMemberPath="Label"/>
                         <ComboBox x:Name="AccessSelector"
-                                  Width="140"
+                                  Width="130"
                                   Height="38"
                                   Margin="10,0,0,0"
+                                  Style="{StaticResource AppComboBox}"
                                   ItemsSource="{Binding AccessOptions}"
                                   SelectedItem="{Binding SelectedAccessOption}"
                                   DisplayMemberPath="Label"/>
+                        <ComboBox x:Name="ModeSelector"
+                                  Width="140"
+                                  Height="38"
+                                  Margin="10,0,0,0"
+                                  Style="{StaticResource AppComboBox}"
+                                  ItemsSource="{Binding ModeOptions}"
+                                  SelectedItem="{Binding SelectedModeOption}"
+                                  DisplayMemberPath="Label"/>
                         <TextBox x:Name="InputBox"
-                                 Width="520"
+                                 Width="430"
                                  Height="46"
                                  Margin="10,0,0,0"
                                  VerticalContentAlignment="Center"
-                                 FontSize="14"
-                                 Foreground="{StaticResource TextPrimaryBrush}"
-                                 Background="{StaticResource AppBackgroundBrush}"
-                                 BorderBrush="{StaticResource CardBorderBrush}"
-                                 BorderThickness="1"
-                                 Padding="14,6"
+                                 FontSize="{Binding ChatFontSizeValue}"
+                                 Style="{StaticResource AppTextBox}"
                                  KeyDown="InputBox_OnKeyDown"
                                  Text=""/>
                         <Button Content="Send"
@@ -145,17 +622,166 @@
                                 Background="{StaticResource AccentBrush}"
                                 Foreground="#0B1118"
                                 BorderThickness="0"
+                                Style="{StaticResource AppButton}"
                                 Click="Send_Click"/>
-                        <Button Content="Mic"
-                                Width="70"
+                        <Button Width="80"
                                 Height="46"
                                 Margin="12,0,0,0"
-                                Background="#1F2431"
-                                Foreground="{StaticResource TextSecondaryBrush}"
-                                BorderThickness="0"/>
+                                Click="Mic_Click">
+                            <Button.Style>
+                                <Style TargetType="Button" BasedOn="{StaticResource AppButton}">
+                                    <Setter Property="Background" Value="#1F2431"/>
+                                    <Setter Property="Foreground" Value="{StaticResource TextSecondaryBrush}"/>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsListening}" Value="True">
+                                            <Setter Property="Background" Value="{StaticResource AccentBrush}"/>
+                                            <Setter Property="Foreground" Value="#0B1118"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </Button.Style>
+                            <Grid>
+                                <TextBlock Text="{Binding MicButtonText}"
+                                           Foreground="{StaticResource TextSecondaryBrush}"
+                                           VerticalAlignment="Center"
+                                           HorizontalAlignment="Center">
+                                    <TextBlock.Style>
+                                        <Style TargetType="TextBlock">
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding IsListening}" Value="True">
+                                                    <Setter Property="Visibility" Value="Collapsed"/>
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </TextBlock.Style>
+                                </TextBlock>
+                                <StackPanel x:Name="MicBars"
+                                            Orientation="Horizontal"
+                                            HorizontalAlignment="Center"
+                                            VerticalAlignment="Center"
+                                            Visibility="Collapsed">
+                                    <StackPanel.Style>
+                                        <Style TargetType="StackPanel">
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding IsListening}" Value="True">
+                                                    <Setter Property="Visibility" Value="Visible"/>
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </StackPanel.Style>
+                                    <Rectangle x:Name="MicBar1" Width="4" Height="10" Fill="#0B1118" RadiusX="2" RadiusY="2" Margin="2,0"/>
+                                    <Rectangle x:Name="MicBar2" Width="4" Height="16" Fill="#0B1118" RadiusX="2" RadiusY="2" Margin="2,0"/>
+                                    <Rectangle x:Name="MicBar3" Width="4" Height="12" Fill="#0B1118" RadiusX="2" RadiusY="2" Margin="2,0"/>
+                                    <StackPanel.Triggers>
+                                        <EventTrigger RoutedEvent="Loaded">
+                                            <BeginStoryboard>
+                                                <Storyboard RepeatBehavior="Forever" AutoReverse="True">
+                                                    <DoubleAnimation Storyboard.TargetName="MicBar1"
+                                                                     Storyboard.TargetProperty="Height"
+                                                                     From="6" To="18" Duration="0:0:0.25"/>
+                                                    <DoubleAnimation Storyboard.TargetName="MicBar2"
+                                                                     Storyboard.TargetProperty="Height"
+                                                                     From="10" To="22" Duration="0:0:0.2" BeginTime="0:0:0.05"/>
+                                                    <DoubleAnimation Storyboard.TargetName="MicBar3"
+                                                                     Storyboard.TargetProperty="Height"
+                                                                     From="8" To="20" Duration="0:0:0.3" BeginTime="0:0:0.1"/>
+                                                </Storyboard>
+                                            </BeginStoryboard>
+                                        </EventTrigger>
+                                    </StackPanel.Triggers>
+                                </StackPanel>
+                            </Grid>
+                        </Button>
                     </StackPanel>
                 </Grid>
             </Border>
+        </Grid>
+        <Grid x:Name="SettingsView">
+            <Grid.Style>
+                <Style TargetType="Grid">
+                    <Setter Property="Visibility" Value="Collapsed"/>
+                    <Style.Triggers>
+                        <DataTrigger Binding="{Binding IsSettingsActive}" Value="True">
+                            <Setter Property="Visibility" Value="Visible"/>
+                        </DataTrigger>
+                    </Style.Triggers>
+                </Style>
+            </Grid.Style>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+            <DockPanel Grid.Row="0" Margin="0,10,0,20">
+                <TextBlock Text="Settings" FontSize="26" Foreground="{StaticResource TextPrimaryBrush}" FontWeight="SemiBold" DockPanel.Dock="Left"/>
+                <Button Content="Back" Width="70" Height="32" DockPanel.Dock="Right" Click="CloseSettings_Click" Style="{StaticResource AppButton}"/>
+            </DockPanel>
+            <Border Grid.Row="1" Background="{StaticResource CardBackgroundBrush}" CornerRadius="18" BorderBrush="{StaticResource CardBorderBrush}" BorderThickness="1">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel Margin="18">
+                        <TextBlock Text="Assistant name" Foreground="{StaticResource TextSecondaryBrush}" FontSize="12" Margin="0,0,0,4"/>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBox Width="220" Height="32" Text="{Binding AssistantNameInput}" Style="{StaticResource SettingsTextBox}"/>
+                            <Button Content="Apply" Width="70" Height="32" Margin="8,0,0,0" Click="ApplyAssistantName_Click" Style="{StaticResource AppButton}"/>
+                        </StackPanel>
+                        <TextBlock Text="Voice model" Foreground="{StaticResource TextSecondaryBrush}" FontSize="12" Margin="0,12,0,4"/>
+                        <StackPanel Orientation="Horizontal">
+                            <ComboBox Width="220"
+                                      Height="32"
+                                      ItemsSource="{Binding VoicePresetOptions}"
+                                      SelectedItem="{Binding SelectedVoicePreset}"
+                                      DisplayMemberPath="Label"
+                                      Style="{StaticResource AppComboBox}"/>
+                            <Button Content="Apply" Width="70" Height="32" Margin="8,0,0,0" Click="ApplyVoiceModel_Click" Style="{StaticResource AppButton}"/>
+                        </StackPanel>
+                        <CheckBox Content="Voice authentication"
+                                  IsChecked="{Binding VoiceAuthEnabled}"
+                                  Margin="0,12,0,0"
+                                  Foreground="{StaticResource TextSecondaryBrush}"
+                                  Checked="VoiceAuth_Toggled"
+                                  Unchecked="VoiceAuth_Toggled"/>
+                        <TextBlock Text="Voice auth sensitivity" Foreground="{StaticResource TextSecondaryBrush}" FontSize="12" Margin="0,10,0,2"/>
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                            <Slider Minimum="0"
+                                    Maximum="100"
+                                    Width="220"
+                                    TickFrequency="1"
+                                    IsSnapToTickEnabled="True"
+                                    Value="{Binding VoiceAuthSensitivityValue}"
+                                    ValueChanged="VoiceAuthSensitivity_Changed"/>
+                            <TextBlock Text="{Binding VoiceAuthSensitivityValue, StringFormat={}{0:0}%}" Foreground="{StaticResource TextSecondaryBrush}" Margin="8,0,0,0"/>
+                        </StackPanel>
+                        <TextBlock Text="Mic sensitivity" Foreground="{StaticResource TextSecondaryBrush}" FontSize="12" Margin="0,10,0,2"/>
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                            <Slider Minimum="0"
+                                    Maximum="100"
+                                    Width="220"
+                                    TickFrequency="1"
+                                    IsSnapToTickEnabled="True"
+                                    Value="{Binding MicSensitivityValue}"
+                                    ValueChanged="MicSensitivity_Changed"/>
+                            <TextBlock Text="{Binding MicSensitivityValue, StringFormat={}{0:0}%}" Foreground="{StaticResource TextSecondaryBrush}" Margin="8,0,0,0"/>
+                        </StackPanel>
+                        <TextBlock Text="Wake word sensitivity" Foreground="{StaticResource TextSecondaryBrush}" FontSize="12" Margin="0,10,0,2"/>
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                            <Slider Minimum="0"
+                                    Maximum="100"
+                                    Width="220"
+                                    TickFrequency="1"
+                                    IsSnapToTickEnabled="True"
+                                    Value="{Binding WakeSensitivityValue}"
+                                    ValueChanged="WakeSensitivity_Changed"/>
+                            <TextBlock Text="{Binding WakeSensitivityValue, StringFormat={}{0:0}%}" Foreground="{StaticResource TextSecondaryBrush}" Margin="8,0,0,0"/>
+                        </StackPanel>
+                        <TextBlock Text="Text size" Foreground="{StaticResource TextSecondaryBrush}" FontSize="12" Margin="0,10,0,2"/>
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                            <Slider Minimum="12" Maximum="20" Width="220" Value="{Binding ChatFontSizeValue}"/>
+                            <TextBlock Text="{Binding ChatFontSizeValue, StringFormat={}{0:0}pt}" Foreground="{StaticResource TextSecondaryBrush}" Margin="8,0,0,0"/>
+                        </StackPanel>
+                    </StackPanel>
+                </ScrollViewer>
+            </Border>
+        </Grid>
+        </Grid>
         </Grid>
     </Grid>
 </Window>
