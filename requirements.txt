@@ -7,7 +7,6 @@ requests
 keyboard
 numpy
 pyyaml
-scipy
 
 # Media / web helpers
 yt-dlp
@@ -18,10 +17,6 @@ playsound==1.2.2
 pyttsx3
 piper-tts
 soundfile
-
-# Terminal UI
-rich
-textual
 
 # Windows-only integrations
 pycaw; platform_system == "Windows"

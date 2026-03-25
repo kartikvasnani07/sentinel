@@ -146,6 +146,22 @@ public class AssistantClient
         return response.IsSuccessStatusCode;
     }
 
+    public async Task<AssistantTranscription?> TranscribeAsync(string mode)
+    {
+        try
+        {
+            var payload = new Dictionary<string, object?> { ["mode"] = mode };
+            var json = JsonSerializer.Serialize(payload);
+            var response = await _http.PostAsync("/api/transcribe", new StringContent(json, Encoding.UTF8, "application/json"));
+            var body = await response.Content.ReadAsStringAsync();
+            return JsonSerializer.Deserialize<AssistantTranscription>(body);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     public async Task<bool> UpdateSettingsAsync(Dictionary<string, object?> payload)
     {
         var json = JsonSerializer.Serialize(payload ?? new Dictionary<string, object?>());
@@ -188,6 +204,8 @@ public record AssistantStatus(
     [property: JsonPropertyName("cloud_ready")] bool CloudReady,
     [property: JsonPropertyName("model_preference")] string? ModelPreference,
     [property: JsonPropertyName("access_level")] string? AccessLevel,
+    [property: JsonPropertyName("assistant_name")] string? AssistantName,
+    [property: JsonPropertyName("default_create_path")] string? DefaultCreatePath,
     [property: JsonPropertyName("models")] List<AssistantModelOption>? Models);
 
 public record AssistantModelOption(
@@ -218,6 +236,10 @@ public record AssistantVoicePreset(
 public record AssistantConversation(
     [property: JsonPropertyName("status")] string Status,
     [property: JsonPropertyName("conversation")] AssistantConversationDetails? Conversation);
+
+public record AssistantTranscription(
+    [property: JsonPropertyName("status")] string Status,
+    [property: JsonPropertyName("text")] string? Text);
 
 public record AssistantConversationDetails(
     [property: JsonPropertyName("id")] string Id,

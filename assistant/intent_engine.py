@@ -495,6 +495,10 @@ class IntentEngine:
     def _detect_action(self, text, normalized, tokens):
         if re.search(r"\b(?:run|execute)\s+(?:the\s+)?(?:terminal|shell)?\s*command\b", normalized):
             return "run_terminal_command"
+        if re.search(r"\b(?:draw|show|display)\b.+\b(?:tree|structure)\b", normalized) or re.search(
+            r"\b(?:file|folder|directory|system)\s+(?:tree|structure)\b", normalized
+        ):
+            return "draw_file_tree"
         scores = defaultdict(int)
         token_set = set(tokens)
         linux_cli_terms = {
@@ -830,7 +834,7 @@ class IntentEngine:
         if self._contains_any(tokens, {"list", "browse", "contents"}) and (
             self._is_folder_context(tokens) or "files" in token_set or "inside" in token_set
         ):
-            scores["list_directory"] += 12
+            scores["list_directory"] += 8 if self._contains_any(tokens, {"tree", "structure"}) else 12
         if self._contains_phrase(normalized, {"change directory", "switch directory", "go to directory", "go to folder"}):
             scores["change_directory"] += 12
         if self._contains_any(tokens, self.ACTION_WORDS["copy"]):
@@ -868,7 +872,7 @@ class IntentEngine:
         if self._contains_any(tokens, {"song", "music"}) and len(tokens) >= 2:
             scores["play_music"] += 12
         if self._contains_any(tokens, {"tree", "structure"}) and self._contains_any(tokens, {"draw", "show", "system", "directory", "folder", "file"}):
-            scores["draw_file_tree"] += 12
+            scores["draw_file_tree"] += 20
 
         if self._contains_any(tokens, self.ACTION_WORDS["close"]) and (self._contains_any(tokens, self.APP_WORDS | {"app", "application", "browser"}) or self._refers_to_previous_target(tokens)):
             scores["close_application"] += 12
@@ -1563,6 +1567,9 @@ class IntentEngine:
             value = self._clean_directory_reference(match.group(1).strip(" ."))
             if value is not None:
                 return value
+        for word in self.FOLDER_WORDS:
+            if re.search(rf"\b{re.escape(word)}\b", lowered):
+                return word
         return None
 
     def _extract_target_name(self, text):

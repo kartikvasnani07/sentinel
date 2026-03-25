@@ -7,8 +7,10 @@ using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Threading;
 using System.Diagnostics;
 using System.IO;
+using System.Globalization;
 using Microsoft.Win32;
 using Forms = System.Windows.Forms;
 
@@ -20,16 +22,42 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private bool _awaitingConfirmation;
     private readonly HashSet<string> _pinnedLookup = new(StringComparer.OrdinalIgnoreCase);
     private SpeechRecognitionEngine? _speechEngine;
+    private Grammar? _wakeGrammar;
+    private Grammar? _dictationGrammar;
+    private bool _recognitionStarted;
     private bool _isListening;
     private string _micButtonText = "Mic";
     private string _lastVoiceText = "";
     private DateTime _lastVoiceCommandAt = DateTime.MinValue;
     private bool _voiceReplyEnabled;
+    private bool _manualMicMode;
+    private bool _wakeTriggeredSession;
+    private bool _autoSendBlocked;
+    private bool _isUpdatingFromSpeech;
+    private string _speechBuffer = "";
+    private DispatcherTimer? _autoSendTimer;
+    private string _wakeWord = "assistant";
+    private string? _lastWakeAck;
+    private DateTime _lastWakeAckAt = DateTime.MinValue;
+    private bool _suppressVoiceForNextSend;
+    private readonly Random _random = new();
+    private bool _isServerTranscribing;
+    private bool _cancelTranscription;
+    private bool _isWakeAnimating;
+    private static readonly string[] WakeReplies = new[]
+    {
+        "I'm here.",
+        "Listening.",
+        "You called?",
+        "What's up?",
+        "Huh?"
+    };
     private bool _isMenuOpen;
     private bool _isSettingsActive;
     private string? _currentConversationId;
     private string _assistantNameInput = "";
     private string _voiceModelInput = "";
+    private string _defaultCreatePathInput = "";
     private double _voiceAuthSensitivityValue = 60;
     private double _micSensitivityValue = 60;
     private double _wakeSensitivityValue = 60;
@@ -145,12 +173,32 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             OnPropertyChanged();
         }
     }
+
+    public bool IsWakeAnimating
+    {
+        get => _isWakeAnimating;
+        set
+        {
+            _isWakeAnimating = value;
+            OnPropertyChanged();
+        }
+    }
     public string AssistantNameInput
     {
         get => _assistantNameInput;
         set
         {
             _assistantNameInput = value;
+            OnPropertyChanged();
+        }
+    }
+
+    public string DefaultCreatePathInput
+    {
+        get => _defaultCreatePathInput;
+        set
+        {
+            _defaultCreatePathInput = value;
             OnPropertyChanged();
         }
     }
@@ -247,6 +295,24 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
     }
 
+    private void InputBox_OnTextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (_isUpdatingFromSpeech)
+        {
+            return;
+        }
+        if (!IsListening && string.IsNullOrWhiteSpace(InputBox.Text))
+        {
+            _suppressVoiceForNextSend = false;
+        }
+        if (IsListening)
+        {
+            _autoSendBlocked = true;
+            _speechBuffer = InputBox.Text.Trim();
+            _autoSendTimer?.Stop();
+        }
+    }
+
     private async Task SendCurrentInputAsync()
     {
         var text = InputBox.Text.Trim();
@@ -256,6 +322,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
 
         InputBox.Text = string.Empty;
+        _speechBuffer = "";
+        _autoSendBlocked = false;
+        _autoSendTimer?.Stop();
         await SendTextAsync(text);
     }
 
@@ -265,6 +334,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             return;
         }
+        var shouldReturnToWake = IsListening && !_manualMicMode && _wakeTriggeredSession;
         Messages.Add(new ChatMessage(text, true));
         ScrollChatToEnd();
         bool? confirm = null;
@@ -311,13 +381,21 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             Messages.Add(assistantMessage);
             ScrollChatToEnd();
             _awaitingConfirmation = response.needs_confirmation;
-            if (_voiceReplyEnabled && !_awaitingConfirmation)
+            if (_voiceReplyEnabled && !_awaitingConfirmation && !_suppressVoiceForNextSend)
             {
                 await _client.SpeakAsync(response.response);
-                if (!IsListening)
-                {
-                    _voiceReplyEnabled = false;
-                }
+            }
+            if (_suppressVoiceForNextSend)
+            {
+                _suppressVoiceForNextSend = false;
+            }
+            if (shouldReturnToWake && !_awaitingConfirmation)
+            {
+                EndWakeSession();
+            }
+            if (!IsListening)
+            {
+                _voiceReplyEnabled = false;
             }
         }
         catch (Exception exc)
@@ -399,6 +477,16 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             ?? AccessOptions.LastOrDefault();
         SelectedModeOption = ModeOptions.FirstOrDefault();
         await LoadVoicePresetsAsync();
+        if (!string.IsNullOrWhiteSpace(status.AssistantName))
+        {
+            AssistantNameInput = status.AssistantName.Trim();
+            ConfigureWakeWord(status.AssistantName.Trim());
+        }
+        if (!string.IsNullOrWhiteSpace(status.DefaultCreatePath))
+        {
+            DefaultCreatePathInput = status.DefaultCreatePath.Trim();
+        }
+        StartWakeListening();
     }
 
     private async Task LoadVoicePresetsAsync()
@@ -697,12 +785,52 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         var ok = await _client.UpdateSettingsAsync(new Dictionary<string, object?> { ["assistant_name"] = name });
         if (ok)
         {
+            ConfigureWakeWord(name);
             Messages.Add(new ChatMessage($"Assistant name set to {name}.", false));
             ScrollChatToEnd();
         }
         else
         {
             Messages.Add(new ChatMessage("Failed to update assistant name.", false));
+            ScrollChatToEnd();
+        }
+    }
+
+    private void BrowseDefaultCreatePath_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            using var dialog = new Forms.FolderBrowserDialog();
+            dialog.Description = "Select the default folder for new files/folders.";
+            dialog.ShowNewFolderButton = true;
+            var result = dialog.ShowDialog();
+            if (result == Forms.DialogResult.OK && !string.IsNullOrWhiteSpace(dialog.SelectedPath))
+            {
+                DefaultCreatePathInput = dialog.SelectedPath.Trim();
+            }
+        }
+        catch
+        {
+            // ignore browse failures
+        }
+    }
+
+    private async void ApplyDefaultCreatePath_Click(object sender, RoutedEventArgs e)
+    {
+        var path = DefaultCreatePathInput.Trim();
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return;
+        }
+        var ok = await _client.UpdateSettingsAsync(new Dictionary<string, object?> { ["default_create_path"] = path });
+        if (ok)
+        {
+            Messages.Add(new ChatMessage($"Default create path set to {path}.", false));
+            ScrollChatToEnd();
+        }
+        else
+        {
+            Messages.Add(new ChatMessage("Failed to update default create path.", false));
             ScrollChatToEnd();
         }
     }
@@ -882,63 +1010,178 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async void Mic_Click(object sender, RoutedEventArgs e)
     {
-        if (IsListening)
+        if (_isServerTranscribing)
         {
-            StopListening();
+            _cancelTranscription = true;
+            EndManualDictation();
+            return;
+        }
+        if (IsListening && _manualMicMode)
+        {
+            EndManualDictation();
+            return;
+        }
+        if (IsListening && !_manualMicMode)
+        {
+            EndWakeSession();
             return;
         }
         _lastStatus = StatusText;
-        StartListening();
-        try
-        {
-            await _client.SpeakAsync("Listening.");
-        }
-        catch (Exception exc)
-        {
-            Messages.Add(new ChatMessage($"Mic prompt failed: {exc.Message}", false));
-        }
+        _ = StartServerTranscriptionAsync(sendDirectly: false, fromWake: false);
     }
 
-    private void StartListening()
+    private async Task StartServerTranscriptionAsync(bool sendDirectly, bool fromWake)
     {
-        if (IsListening)
+        if (_isServerTranscribing)
         {
             return;
         }
-        EnsureSpeechEngine();
+        _isServerTranscribing = true;
+        _cancelTranscription = false;
+        StopRecognitionLoop();
+        SetGrammarMode(wakeEnabled: false, dictationEnabled: false);
+        _speechBuffer = "";
+        _autoSendBlocked = true;
+        _manualMicMode = !sendDirectly;
+        _wakeTriggeredSession = sendDirectly;
+        _voiceReplyEnabled = sendDirectly;
+        IsListening = true;
+        MicButtonText = "Stop";
+        StatusText = "Listening";
         try
         {
-            _speechEngine?.RecognizeAsync(RecognizeMode.Multiple);
-            IsListening = true;
-            MicButtonText = "Stop";
-            StatusText = "Listening";
-            _voiceReplyEnabled = true;
+            var transcript = await _client.TranscribeAsync(sendDirectly ? "wake" : "manual");
+            if (_cancelTranscription)
+            {
+                return;
+            }
+            var text = transcript?.Text?.Trim() ?? "";
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                if (sendDirectly)
+                {
+                    EndWakeSession();
+                }
+                else
+                {
+                    EndManualDictation();
+                }
+                return;
+            }
+            if (sendDirectly)
+            {
+                await SendTextAsync(text);
+                return;
+            }
+            _autoSendBlocked = false;
+            await Dispatcher.InvokeAsync(() => UpdateInputFromSpeech(text));
+            EndManualDictation();
         }
-        catch (Exception exc)
+        catch
         {
-            Messages.Add(new ChatMessage($"Mic error: {exc.Message}", false));
-            StopListening();
+            if (sendDirectly)
+            {
+                EndWakeSession();
+            }
+            else
+            {
+                EndManualDictation();
+            }
         }
+        finally
+        {
+            _isServerTranscribing = false;
+        }
+    }
+
+    private void StartWakeListening()
+    {
+        _lastStatus = StatusText;
+        BeginWakeListening();
+    }
+
+    private void BeginWakeListening()
+    {
+        EnsureSpeechEngine();
+        _manualMicMode = false;
+        _wakeTriggeredSession = false;
+        SetGrammarMode(wakeEnabled: true, dictationEnabled: false);
+        StartRecognitionLoop();
+        IsListening = false;
+        MicButtonText = "Mic";
+        StatusText = _lastStatus;
+    }
+
+    private void BeginDictationFromWake()
+    {
+        StartWakeAnimationPulse();
+        var ack = WakeReplies[_random.Next(WakeReplies.Length)];
+        _ = SpeakWakeAckAsync(ack);
+        _ = StartServerTranscriptionAsync(sendDirectly: true, fromWake: true);
+    }
+
+    private void StartWakeAnimationPulse()
+    {
+        IsWakeAnimating = true;
+    }
+
+    private void EndWakeSession()
+    {
+        _wakeTriggeredSession = false;
+        StopListening();
+    }
+
+    private void EndManualDictation()
+    {
+        _manualMicMode = false;
+        _wakeTriggeredSession = false;
+        _autoSendTimer?.Stop();
+        _autoSendBlocked = true;
+        _suppressVoiceForNextSend = true;
+        IsListening = false;
+        MicButtonText = "Mic";
+        StatusText = _lastStatus;
+        BeginWakeListening();
     }
 
     private void StopListening()
     {
-        if (!IsListening)
-        {
-            return;
-        }
-        try
-        {
-            _speechEngine?.RecognizeAsyncCancel();
-            _speechEngine?.RecognizeAsyncStop();
-        }
-        catch
-        {
-            // ignore stop errors
-        }
+        _manualMicMode = false;
+        _wakeTriggeredSession = false;
+        _speechBuffer = "";
+        _autoSendBlocked = false;
+        _autoSendTimer?.Stop();
         IsListening = false;
         MicButtonText = "Mic";
         StatusText = _lastStatus;
+        BeginWakeListening();
+    }
+
+    private void ConfigureWakeWord(string? name)
+    {
+        var cleaned = string.IsNullOrWhiteSpace(name) ? "assistant" : name.Trim();
+        _wakeWord = cleaned;
+        if (_speechEngine is null)
+        {
+            return;
+        }
+        BuildGrammars();
+        SetGrammarMode(wakeEnabled: !IsListening, dictationEnabled: IsListening);
+    }
+
+    private IEnumerable<string> BuildWakePhrases(string wakeWord)
+    {
+        var baseWord = string.IsNullOrWhiteSpace(wakeWord) ? "assistant" : wakeWord.Trim();
+        var phrases = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            baseWord,
+            $"hey {baseWord}",
+            $"hi {baseWord}",
+            $"hello {baseWord}",
+            $"ok {baseWord}",
+            $"okay {baseWord}",
+        };
+        return phrases;
     }
 
     private void EnsureSpeechEngine()
@@ -947,25 +1190,297 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             return;
         }
-        _speechEngine = new SpeechRecognitionEngine();
+        try
+        {
+            var recognizers = SpeechRecognitionEngine.InstalledRecognizers();
+            var preferred = recognizers.FirstOrDefault(r => r.Culture.Equals(CultureInfo.CurrentUICulture))
+                           ?? recognizers.FirstOrDefault();
+            _speechEngine = preferred is not null ? new SpeechRecognitionEngine(preferred) : new SpeechRecognitionEngine();
+        }
+        catch
+        {
+            _speechEngine = new SpeechRecognitionEngine();
+        }
         _speechEngine.SetInputToDefaultAudioDevice();
-        _speechEngine.LoadGrammar(new DictationGrammar());
+        BuildGrammars();
         _speechEngine.SpeechRecognized += OnSpeechRecognized;
+        _speechEngine.SpeechHypothesized += OnSpeechHypothesized;
+        _speechEngine.RecognizeCompleted += (_, _) =>
+        {
+            _recognitionStarted = false;
+            if (!_isServerTranscribing)
+            {
+                StartRecognitionLoop();
+            }
+        };
     }
 
-    private void OnSpeechRecognized(object? sender, SpeechRecognizedEventArgs e)
+    private void StopRecognitionLoop()
     {
+        if (_speechEngine is null)
+        {
+            return;
+        }
+        try
+        {
+            _speechEngine.RecognizeAsyncCancel();
+        }
+        catch
+        {
+        }
+        try
+        {
+            _speechEngine.RecognizeAsyncStop();
+        }
+        catch
+        {
+        }
+        try
+        {
+            _speechEngine.SetInputToNull();
+        }
+        catch
+        {
+        }
+        _recognitionStarted = false;
+    }
+
+    private void BuildGrammars()
+    {
+        if (_speechEngine is null)
+        {
+            return;
+        }
+        try
+        {
+            _speechEngine.RequestRecognizerUpdate();
+        }
+        catch
+        {
+            // ignore updates when not running
+        }
+        try
+        {
+            if (_wakeGrammar is not null)
+            {
+                _speechEngine.UnloadGrammar(_wakeGrammar);
+            }
+            if (_dictationGrammar is not null)
+            {
+                _speechEngine.UnloadGrammar(_dictationGrammar);
+            }
+        }
+        catch
+        {
+            // ignore unload errors
+        }
+        var wakeChoices = new Choices(BuildWakePhrases(_wakeWord).ToArray());
+        var wakeBuilder = new GrammarBuilder(wakeChoices);
+        _wakeGrammar = new Grammar(wakeBuilder) { Name = "wake" };
+        _dictationGrammar = new DictationGrammar { Name = "dictation" };
+        _speechEngine.LoadGrammar(_wakeGrammar);
+        _speechEngine.LoadGrammar(_dictationGrammar);
+    }
+
+    private void StartRecognitionLoop()
+    {
+        if (_speechEngine is null || _recognitionStarted)
+        {
+            return;
+        }
+        try
+        {
+            _speechEngine.SetInputToDefaultAudioDevice();
+            _speechEngine.RecognizeAsync(RecognizeMode.Multiple);
+            _recognitionStarted = true;
+        }
+        catch
+        {
+            _recognitionStarted = false;
+        }
+    }
+
+    private void SetGrammarMode(bool wakeEnabled, bool dictationEnabled)
+    {
+        if (_wakeGrammar is not null)
+        {
+            _wakeGrammar.Enabled = wakeEnabled;
+        }
+        if (_dictationGrammar is not null)
+        {
+            _dictationGrammar.Enabled = dictationEnabled;
+        }
+    }
+
+    private void ResetAutoSendTimer()
+    {
+        if (_autoSendTimer is null)
+        {
+            _autoSendTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
+            _autoSendTimer.Tick += AutoSendTimer_Tick;
+        }
+        _autoSendTimer.Stop();
+        _autoSendTimer.Start();
+    }
+
+    private async void AutoSendTimer_Tick(object? sender, EventArgs e)
+    {
+        _autoSendTimer?.Stop();
         if (!IsListening)
         {
             return;
         }
+        if (_manualMicMode)
+        {
+            EndManualDictation();
+            return;
+        }
+        if (_autoSendBlocked)
+        {
+            return;
+        }
+        var text = _speechBuffer.Trim();
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return;
+        }
+        _speechBuffer = "";
+        await Dispatcher.InvokeAsync(() =>
+        {
+            _isUpdatingFromSpeech = true;
+            InputBox.Text = "";
+            _isUpdatingFromSpeech = false;
+        });
+        await SendTextAsync(text);
+    }
+
+    private void UpdateInputFromSpeech(string text)
+    {
+        if (_autoSendBlocked || (_wakeTriggeredSession && !_manualMicMode))
+        {
+            return;
+        }
+        _isUpdatingFromSpeech = true;
+        InputBox.Text = text;
+        InputBox.Focus();
+        InputBox.CaretIndex = InputBox.Text.Length;
+        _isUpdatingFromSpeech = false;
+    }
+
+    private async Task SpeakWakeAckAsync(string text)
+    {
+        _lastWakeAck = text;
+        _lastWakeAckAt = DateTime.UtcNow;
+        try
+        {
+            await _client.SpeakAsync(text);
+        }
+        catch
+        {
+            // ignore ack failures
+        }
+    }
+
+    private static string NormalizeSpeechSnippet(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return string.Empty;
+        }
+        return new string(text.ToLowerInvariant()
+            .Where(ch => char.IsLetterOrDigit(ch) || char.IsWhiteSpace(ch))
+            .ToArray()).Trim();
+    }
+
+    private bool IsLikelyWakeAck(string text)
+    {
+        if (string.IsNullOrWhiteSpace(_lastWakeAck))
+        {
+            return false;
+        }
+        if ((DateTime.UtcNow - _lastWakeAckAt).TotalSeconds > 1.5)
+        {
+            return false;
+        }
+        var cleaned = NormalizeSpeechSnippet(text);
+        var ack = NormalizeSpeechSnippet(_lastWakeAck);
+        return !string.IsNullOrWhiteSpace(cleaned) && cleaned == ack;
+    }
+
+    private bool IsWakeMatch(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+        var cleaned = NormalizeSpeechSnippet(text);
+        var wake = NormalizeSpeechSnippet(_wakeWord);
+        if (!string.IsNullOrWhiteSpace(wake) && cleaned.Contains(wake, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+        foreach (var phrase in BuildWakePhrases(_wakeWord))
+        {
+            var normalized = NormalizeSpeechSnippet(phrase);
+            if (!string.IsNullOrWhiteSpace(normalized) && cleaned == normalized)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void OnSpeechHypothesized(object? sender, SpeechHypothesizedEventArgs e)
+    {
+        if (!IsListening || _autoSendBlocked || (_wakeTriggeredSession && !_manualMicMode))
+        {
+            return;
+        }
+        var text = e.Result?.Text?.Trim();
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return;
+        }
+        var preview = string.IsNullOrWhiteSpace(_speechBuffer) ? text : $"{_speechBuffer} {text}";
+        _ = Dispatcher.InvokeAsync(() => UpdateInputFromSpeech(preview));
+    }
+
+    private void OnSpeechRecognized(object? sender, SpeechRecognizedEventArgs e)
+    {
         var result = e.Result;
         if (result is null)
         {
             return;
         }
         var text = result.Text?.Trim();
-        if (string.IsNullOrWhiteSpace(text) || result.Confidence < 0.6)
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return;
+        }
+        var grammarName = result.Grammar?.Name ?? string.Empty;
+        if (grammarName == "wake")
+        {
+            if (result.Confidence < 0.35 || _manualMicMode || IsListening)
+            {
+                return;
+            }
+            BeginDictationFromWake();
+            return;
+        }
+        if (!IsListening && !_manualMicMode && IsWakeMatch(text))
+        {
+            BeginDictationFromWake();
+            return;
+        }
+        if (!IsListening)
+        {
+            return;
+        }
+        if (result.Confidence < 0.45 || _autoSendBlocked)
+        {
+            return;
+        }
+        if (IsLikelyWakeAck(text))
         {
             return;
         }
@@ -977,19 +1492,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
         _lastVoiceText = text;
         _lastVoiceCommandAt = now;
-        _ = Dispatcher.InvokeAsync(() =>
+        _speechBuffer = string.IsNullOrWhiteSpace(_speechBuffer) ? text : $"{_speechBuffer} {text}";
+        if (!_wakeTriggeredSession || _manualMicMode)
         {
-            var current = InputBox.Text.Trim();
-            if (string.IsNullOrWhiteSpace(current))
-            {
-                InputBox.Text = text;
-            }
-            else if (!current.EndsWith(text, StringComparison.OrdinalIgnoreCase))
-            {
-                InputBox.Text = $"{current} {text}";
-            }
-            InputBox.Focus();
-            InputBox.CaretIndex = InputBox.Text.Length;
-        });
+            _ = Dispatcher.InvokeAsync(() => UpdateInputFromSpeech(_speechBuffer));
+        }
+        ResetAutoSendTimer();
     }
 }

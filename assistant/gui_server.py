@@ -18,6 +18,8 @@ from .memory import Memory
 from .streaming_pipeline import StreamingPipeline
 from .system_actions import SystemActions
 from .tts_engine import TTSEngine
+from .voice_engine import VoiceEngine
+from .utils import disable_autostart
 
 
 YES_WORDS = {"yes", "y", "yeah", "yep", "sure", "ok", "okay", "proceed", "confirm", "do it"}
@@ -40,11 +42,29 @@ WORD_RE = re.compile(r"[a-z0-9']+", re.I)
 class AssistantRuntime:
     def __init__(self):
         self.config = AssistantConfig()
+        if self.config.get("auto_start", False):
+            try:
+                self.config.set("auto_start", False)
+            except Exception:
+                pass
+        try:
+            disable_autostart()
+        except Exception:
+            pass
         self.llm = LLMEngine(online=True)
         self.llm.humor_level = int(self.config.get("humor_level", 50))
         self.intent_engine = IntentEngine(self.llm)
         self.system = SystemActions(base_dir=os.getcwd(), llm=self.llm, config=self.config)
         self.tts = TTSEngine(online=self.llm.online)
+        self.voice = VoiceEngine(online=self.llm.online)
+        try:
+            self.voice.whisper_beam_size = max(5, int(self.voice.whisper_beam_size))
+        except Exception:
+            pass
+        try:
+            self.voice.warmup_local_model_async()
+        except Exception:
+            pass
         preset = self.config.get("voice_preset")
         if preset:
             try:
@@ -61,6 +81,35 @@ class AssistantRuntime:
         self.model_preference = str(self.config.get("model_preference") or "auto").strip().lower()
         self.access_level = str(self.config.get("access_level") or "full").strip().lower()
         self.lock = threading.RLock()
+
+    def transcribe_once(self, mode="manual"):
+        mode = str(mode or "manual").strip().lower()
+        fast_start = mode == "wake"
+        if fast_start:
+            time.sleep(0.35)
+        try:
+            self.tts.stop()
+        except Exception:
+            pass
+        try:
+            audio = self.voice.record_until_silence(
+                max_duration=18.0,
+                silence_duration=0.8,
+                min_duration=0.4,
+                start_timeout=6.0,
+                preroll_duration=0.5,
+                block_duration=0.05,
+                fast_start=fast_start,
+            )
+        except Exception:
+            audio = None
+        if audio is None:
+            return ""
+        try:
+            transcript = (self.voice.transcribe(audio) or "").strip()
+        except Exception:
+            transcript = ""
+        return transcript
 
     def _extract_leading_verb(self, text):
         lowered = str(text or "").strip().lower()
@@ -871,6 +920,13 @@ class AssistantRuntime:
                 updates["voice_preset"] = voice.strip().lower()
             except Exception:
                 pass
+        if "default_create_path" in payload:
+            raw_path = payload.get("default_create_path")
+            cleaned = str(raw_path or "").strip()
+            if not cleaned:
+                cleaned = "desktop"
+            self.config.set("default_create_path", cleaned)
+            updates["default_create_path"] = cleaned
         return updates
 
     def handle(self, text, confirm=None, model_preference=None, access_level=None, attachments=None, mode=None, allow_split=True):
@@ -1083,6 +1139,8 @@ class AssistantRequestHandler(BaseHTTPRequestHandler):
                     "cloud_ready": cloud_ready,
                     "model_preference": self.runtime.model_preference,
                     "access_level": self.runtime.access_level,
+                    "assistant_name": self.runtime.config.get("assistant_name", "assistant"),
+                    "default_create_path": self.runtime.config.get("default_create_path", ""),
                     "models": models,
                 }
             )
@@ -1123,7 +1181,7 @@ class AssistantRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path not in {"/api/command", "/api/speak", "/api/settings", "/api/history/open", "/api/history/delete"}:
+        if path not in {"/api/command", "/api/speak", "/api/settings", "/api/history/open", "/api/history/delete", "/api/transcribe"}:
             self._send_json({"error": "Not found"}, status=404)
             return
 
@@ -1167,6 +1225,11 @@ class AssistantRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(exc)}, status=500)
                 return
             self._send_json({"status": "ok"})
+            return
+        if path == "/api/transcribe":
+            mode = data.get("mode") or "manual"
+            transcript = self.runtime.transcribe_once(mode=mode)
+            self._send_json({"status": "ok", "text": transcript})
             return
         confirm_flag = data.get("confirm")
         model_preference = data.get("model")

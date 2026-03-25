@@ -166,10 +166,11 @@ _DEFAULTS = {
     "humor_level": 50,
     "language": "en",
     "voice_preset": "jarvis",
-    "auto_start": True,
+    "auto_start": False,
     "is_setup_complete": False,
     "openweather_api_key": "",
     "default_location": "",
+    "default_create_path": "",
 }
 
 
@@ -236,6 +237,12 @@ class AssistantConfig:
             env_loc = os.getenv("ASSISTANT_DEFAULT_LOCATION", "").strip()
             if env_loc:
                 self._data["default_location"] = env_loc
+        if not str(self._data.get("default_create_path") or "").strip():
+            env_path = os.getenv("ASSISTANT_DEFAULT_CREATE_PATH", "").strip()
+            if env_path:
+                self._data["default_create_path"] = env_path
+        if not str(self._data.get("default_create_path") or "").strip():
+            self._data["default_create_path"] = "desktop"
 
         assistant_name = str(self._data.get("assistant_name") or "friday").strip().lower()
         assistant_name = " ".join(assistant_name.split()) or "friday"
@@ -268,6 +275,7 @@ class AssistantConfig:
 
         self._data["openweather_api_key"] = str(self._data.get("openweather_api_key") or "").strip()
         self._data["default_location"] = str(self._data.get("default_location") or "").strip()
+        self._data["default_create_path"] = str(self._data.get("default_create_path") or "").strip()
 
         self._data["voice_auth_threshold"] = _clamp_percentage(
             self._data.get("voice_auth_threshold"),

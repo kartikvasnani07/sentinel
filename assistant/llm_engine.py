@@ -1,5 +1,7 @@
 import json
 import os
+import subprocess
+import time
 
 import requests
 
@@ -31,6 +33,11 @@ class LLMEngine:
         self.local_model = os.getenv("OLLAMA_MODEL", "llama3.1:latest")
         self.local_code_model = os.getenv("OLLAMA_CODE_MODEL", self.local_model)
         self.ollama_timeout = self._parse_int_env("OLLAMA_TIMEOUT_SEC", 60)
+        self._ollama_ready = False
+        self._ollama_last_check = 0.0
+        self._ollama_start_attempted = False
+        self._online_cached = None
+        self._online_last_check = 0.0
 
         self.language = "en"
         self.humor_level = 50
@@ -50,6 +57,59 @@ class LLMEngine:
             return int(raw)
         except ValueError:
             return default
+
+    def _ollama_tags_url(self):
+        base = self.ollama_url
+        if "/api/" in base:
+            base = base.split("/api/", 1)[0]
+        return base.rstrip("/") + "/api/tags"
+
+    def _is_online(self):
+        now = time.time()
+        if self._online_cached is not None and (now - self._online_last_check) < 10:
+            return bool(self._online_cached)
+        self._online_last_check = now
+        try:
+            resp = requests.get("https://www.google.com/generate_204", timeout=2)
+            ok = resp.status_code in {200, 204}
+        except Exception:
+            ok = False
+        self._online_cached = ok
+        return ok
+
+    def _ensure_ollama_running(self):
+        now = time.time()
+        if self._ollama_ready and (now - self._ollama_last_check) < 30:
+            return True
+        self._ollama_last_check = now
+        tags_url = self._ollama_tags_url()
+        try:
+            resp = requests.get(tags_url, timeout=3)
+            if resp.ok:
+                self._ollama_ready = True
+                return True
+        except Exception:
+            pass
+        self._ollama_ready = False
+        if self._ollama_start_attempted:
+            return False
+        self._ollama_start_attempted = True
+        try:
+            kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+            if os.name == "nt":
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            subprocess.Popen(["ollama", "serve"], **kwargs)
+        except Exception:
+            return False
+        time.sleep(1.2)
+        try:
+            resp = requests.get(tags_url, timeout=5)
+            if resp.ok:
+                self._ollama_ready = True
+                return True
+        except Exception:
+            return False
+        return False
 
     def _build_system_prompt(self):
         parts = [
@@ -91,13 +151,13 @@ class LLMEngine:
         return f"System: {system_prompt}\n\nUser: {prompt}\n\nAssistant:"
 
     def generate(self, prompt):
-        if self.online and self.groq_api_key:
+        if self.online and self._is_online() and self.groq_api_key:
             try:
                 return self.groq_generate(prompt)
             except Exception as exc:
                 print(f"Groq LLM failed ({exc}).")
 
-        if self.online and self.openrouter_api_key:
+        if self.online and self._is_online() and self.openrouter_api_key:
             try:
                 return self.cloud_generate(prompt)
             except Exception as exc:
@@ -107,13 +167,13 @@ class LLMEngine:
 
     def generate_code(self, prompt):
         system_prompt = self._build_code_system_prompt()
-        if self.online and self.groq_api_key:
+        if self.online and self._is_online() and self.groq_api_key:
             try:
                 return self.groq_generate(prompt, model=self.groq_code_model, system_prompt=system_prompt)
             except Exception as exc:
                 print(f"Groq code LLM failed ({exc}).")
 
-        if self.online and self.openrouter_api_key:
+        if self.online and self._is_online() and self.openrouter_api_key:
             try:
                 return self.cloud_generate(prompt, model=self.openrouter_code_model, system_prompt=system_prompt)
             except Exception as exc:
@@ -174,30 +234,57 @@ class LLMEngine:
         return data["choices"][0]["message"]["content"]
 
     def local_generate(self, prompt, *, model=None, system_prompt=None):
+        model_name = model or self.local_model
+        if not self._ensure_ollama_running():
+            raise RuntimeError("Ollama server is not reachable. Start the Ollama app or run `ollama serve`.")
         response = requests.post(
             self.ollama_url,
             json={
-                "model": model or self.local_model,
+                "model": model_name,
                 "prompt": self._compose_local_prompt(prompt, system_prompt=system_prompt),
                 "stream": False,
             },
             timeout=self.ollama_timeout,
         )
         if response.status_code != 200:
+            if response.status_code == 404 and model_name.endswith(":latest"):
+                alt_model = model_name.split(":", 1)[0]
+                retry = requests.post(
+                    self.ollama_url,
+                    json={
+                        "model": alt_model,
+                        "prompt": self._compose_local_prompt(prompt, system_prompt=system_prompt),
+                        "stream": False,
+                    },
+                    timeout=self.ollama_timeout,
+                )
+                if retry.status_code == 200:
+                    data = retry.json()
+                    text = data.get("response", "").strip()
+                    if text:
+                        return text
+                response = retry
+            if response.status_code == 404:
+                raise RuntimeError(
+                    f"Ollama model '{model_name}' not found. Run `ollama pull {model_name}`."
+                )
             raise RuntimeError(f"Ollama HTTP {response.status_code}: {response.text}")
 
         data = response.json()
-        return data.get("response", "").strip()
+        text = data.get("response", "").strip()
+        if not text:
+            raise RuntimeError("Ollama returned an empty response.")
+        return text
 
     def stream_generate(self, prompt):
-        if self.online and self.groq_api_key:
+        if self.online and self._is_online() and self.groq_api_key:
             try:
                 yield from self.groq_stream(prompt)
                 return
             except Exception as exc:
                 print(f"Groq stream failed ({exc}).")
 
-        if self.online and self.openrouter_api_key:
+        if self.online and self._is_online() and self.openrouter_api_key:
             try:
                 yield from self.cloud_stream(prompt)
                 return
@@ -289,6 +376,8 @@ class LLMEngine:
                 yield token
 
     def local_stream(self, prompt):
+        if not self._ensure_ollama_running():
+            raise RuntimeError("Ollama server is not reachable. Start the Ollama app or run `ollama serve`.")
         response = requests.post(
             self.ollama_url,
             json={

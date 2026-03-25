@@ -1,6 +1,6 @@
 # Assistant (Voice + Text Desktop AI)
 
-English-first desktop assistant with wake word, voice auth, password auth, text mode, file/app/system control, coding-project workflows, and local/cloud model fallbacks.
+English-first desktop assistant with a Python core and a Windows WPF GUI bridge. It supports wake word, voice auth, password auth, text mode, file/app/system control, coding workflows, and local/cloud model fallbacks.
 
 ## What This Project Does
 
@@ -16,21 +16,21 @@ It supports:
 - Conversation history management
 - Undo/redo for reversible actions
 - One-command installer for dependencies + local models
-- Dynamic terminal wave UI (can be turned on/off)
-- Dynamic terminal visual themes (`waves` and `bubble`) with text-only fallback
+- CLI terminal visual modes (`waves` / `bubble`) with text-only fallback
+- GUI wake animation (sphere overlay) for voice interaction
 - Cloud + local fallback for LLM, STT, and TTS
 - English-only runtime language (intent-first parsing, not rigid templates)
 - Confirmation prompts accept keyboard or voice responses
 
 ## Core Pipeline
 
-1. Wake-word listener (Vosk) waits for assistant name variants.
-2. Optional speaker verification checks user voice sample.
+1. CLI wake-word listener (Vosk) or Windows GUI wake listener (System.Speech) waits for assistant name variants.
+2. Optional speaker verification checks user voice sample (CLI).
 3. Query recording + transcription (Deepgram online, local Whisper fallback).
 4. Intent engine resolves command vs conversation.
 5. System action executor runs app/file/device operations.
 6. LLM handles non-system conversation and coding generation.
-7. If response is unknown/insufficient, assistant performs web snippet fallback and summarizes results.
+7. Weather uses Open‑Meteo (no API key required).
 8. TTS speaks response (Edge-TTS -> Piper -> Linux CLI TTS -> pyttsx3 fallback).
 
 ## GUI Apps (Desktop + Android)
@@ -55,17 +55,17 @@ If `assistant-gui` is not found, run:
 python -m pip install -e .
 ```
 
-Windows GUI (WPF):
+Windows GUI (WPF) — fully wired to the bridge:
 - Project: `apps/windows/AssistantDesktop`
 - Target: .NET 8 WPF
 - Run: `dotnet run` inside the project folder
 
-Linux GUI (Avalonia):
+Linux GUI (Avalonia) — project scaffold exists, integration still in progress:
 - Project: `apps/linux/AssistantDesktop.Linux`
 - Target: .NET 8 Avalonia
 - Run: `dotnet run` inside the project folder
 
-Android GUI (Kotlin + Compose):
+Android GUI (Kotlin + Compose) — project scaffold exists, integration still in progress:
 - Project: `apps/android/AssistantMobile`
 - Target: Android Studio (Compose)
 - Run: open in Android Studio and deploy to device/emulator
@@ -73,8 +73,8 @@ Android GUI (Kotlin + Compose):
 ## Platform Support
 
 - Windows: Full support (primary target).
-- Linux: Supported for core assistant behavior and major system controls.
-- Android: Native Kotlin app with local command routing and on-device TTS/STT.
+- Linux: Core assistant and CLI supported; GUI scaffold present.
+- Android: GUI scaffold present; feature parity in progress.
 
 Codebase separation:
 - Python core lives in `assistant/` (intent engine, system actions, LLM/TTS/STT).
@@ -588,7 +588,9 @@ This command path returns terminal output directly in the assistant response.
 
 ## Autostart
 
-- Windows: startup registry/launcher handled by assistant setup.
+- Autostart is disabled by default in the current build (CLI will not start on login).
+- If you explicitly want autostart, use the Linux service template below or add a Windows startup entry manually.
+
 - Linux: use `assistant/platform/linux/assistant.service` as template (edit user/path first), then:
 
 ```bash
@@ -606,6 +608,7 @@ sudo systemctl start assistant.service
   - `models/vosk/vosk-model-small-en-us-0.15`
 - Increase sensitivity:
   - `set wake word sensitivity to 80 percent`
+- GUI wake word (Windows WPF) uses the installed Windows Speech recognizer; ensure your system language pack is installed and matches your assistant name.
 
 ## Audio control fails on Linux
 

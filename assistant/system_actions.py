@@ -1450,6 +1450,30 @@ $matches | Stop-Process -Force
         path = Path(raw).expanduser()
         return (Path.cwd() / path).resolve()
 
+    def _default_create_directory(self):
+        configured = ""
+        if self.config is not None:
+            configured = str(self.config.get("default_create_path") or "").strip()
+        if not configured:
+            configured = "desktop"
+        candidate = self._path_from_fragment(configured)
+        if candidate is None:
+            candidate = (self.home / configured).expanduser()
+        if candidate is None:
+            return Path.cwd()
+        if self.is_windows and str(candidate).lower() == "shell:recyclebinfolder":
+            return Path.cwd()
+        try:
+            candidate = Path(candidate).expanduser()
+        except Exception:
+            return Path.cwd()
+        if not candidate.exists():
+            try:
+                candidate.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                return Path.cwd()
+        return candidate
+
     def _resolve_path(self, params, expect_existing=False, source_hint=None):
         explicit_path = params.get("path")
         name = params.get("name")
@@ -1463,7 +1487,17 @@ $matches | Stop-Process -Force
         if name:
             spoken = self._normalize_spoken_filename(name)
             name_path = Path(spoken)
-            parent = self._path_from_fragment(directory) if directory is not None else Path.cwd()
+            if directory is not None:
+                parent = self._path_from_fragment(directory)
+            else:
+                parent = self._default_create_directory() if not expect_existing else Path.cwd()
+            if parent is None:
+                parent = Path.cwd()
+            if not expect_existing and parent and str(parent).strip():
+                try:
+                    Path(parent).mkdir(parents=True, exist_ok=True)
+                except OSError:
+                    parent = Path.cwd()
             if name_path.is_absolute():
                 candidate = name_path
             else:
@@ -1993,6 +2027,19 @@ $matches | Stop-Process -Force
 
     def _open_website(self, params):
         url = self._resolve_website_url(params)
+        raw_text = str(params.get("raw_text") or "")
+        raw_lowered = self._normalize_query(raw_text)
+        if raw_lowered:
+            cleaned_raw = re.sub(
+                r"\b(?:open|launch|show|start|run|visit|go|to|in|on|new|tab|window|incognito|private|mode|the|a|an|website|site|homepage|home|page|browser)\b",
+                " ",
+                raw_lowered,
+            )
+            cleaned_raw = " ".join(cleaned_raw.split())
+            if cleaned_raw in {"youtube", "youtube.com", "www.youtube.com"}:
+                url = "https://www.youtube.com"
+            elif cleaned_raw in {"youtube_music", "music.youtube.com"}:
+                url = "https://music.youtube.com"
         browser = str(params.get("browser") or "").strip().lower()
         incognito = bool(params.get("incognito", False))
         new_tab = bool(params.get("new_tab", False))
@@ -2376,7 +2423,11 @@ $matches | Stop-Process -Force
             content = self._generate_file_content(target, str(params["content_request"]))
         if content is None:
             target.touch(exist_ok=True)
-            after_bytes = target.read_bytes() if target.exists() and target.is_file() else b""
+            if not target.exists():
+                return f"Failed to create file at {target}."
+            if not target.is_file():
+                return f"Target path is not a file: {target}."
+            after_bytes = target.read_bytes()
             self._push_undo_record(
                 {
                     "kind": "write_file",
@@ -2395,7 +2446,11 @@ $matches | Stop-Process -Force
             handle.write(str(content))
             if content and not str(content).endswith("\n"):
                 handle.write("\n")
-        after_bytes = target.read_bytes() if target.exists() and target.is_file() else b""
+        if not target.exists():
+            return f"Failed to write file at {target}."
+        if not target.is_file():
+            return f"Target path is not a file: {target}."
+        after_bytes = target.read_bytes()
         self._push_undo_record(
             {
                 "kind": "write_file",
@@ -2415,6 +2470,10 @@ $matches | Stop-Process -Force
             return "No folder name was provided."
         existed_before = target.exists()
         target.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            return f"Failed to create folder at {target}."
+        if not target.is_dir():
+            return f"Target path is not a folder: {target}."
         if not existed_before:
             self._push_undo_record(
                 {
@@ -4129,6 +4188,18 @@ $devices | ConvertTo-Json -Depth 4 -Compress
         if not lowered:
             return "https://www.google.com"
 
+        if raw_lowered:
+            cleaned_raw = re.sub(
+                r"\b(?:open|launch|show|start|run|visit|go|to|in|on|new|tab|window|incognito|private|mode|the|a|an|website|site|homepage|home|page|browser)\b",
+                " ",
+                raw_lowered,
+            )
+            cleaned_raw = " ".join(cleaned_raw.split())
+            if cleaned_raw in {"youtube", "youtube.com", "www.youtube.com"}:
+                return "https://www.youtube.com"
+            if cleaned_raw in {"youtube_music", "music.youtube.com"}:
+                return "https://music.youtube.com"
+
         if re.match(r"^https?://", lowered):
             return lowered
         if re.match(r"^(?:www\.)?[a-z0-9-]+\.[a-z0-9.-]+(?:/.*)?$", lowered):
@@ -4150,6 +4221,18 @@ $devices | ConvertTo-Json -Depth 4 -Compress
         if lowered in {"twitter", "twitter.com", "www.twitter.com", "x", "x.com", "www.x.com"}:
             return "https://twitter.com"
 
+        if "youtube" in lowered or "youtube" in raw_lowered:
+            if not re.search(r"\b(search|find|play|watch|video|videos|song|music|channel|profile)\b", raw_lowered):
+                cleaned = re.sub(r"\byoutube\b", " ", lowered)
+                cleaned = re.sub(
+                    r"\b(?:open|launch|show|start|visit|go|to|in|on|new|tab|window|incognito|private|mode|the|a|an|website|site|homepage|home|page|app|application)\b",
+                    " ",
+                    cleaned,
+                )
+                cleaned = " ".join(cleaned.split())
+                if not cleaned:
+                    return "https://www.youtube.com"
+
         if "github" in lowered:
             user = self._extract_site_path(lowered, "github")
             if user:
@@ -4165,6 +4248,15 @@ $devices | ConvertTo-Json -Depth 4 -Compress
             return "https://music.youtube.com"
 
         if "youtube" in lowered or "youtube" in raw_lowered:
+            base_only = re.sub(r"\byoutube\b", " ", lowered)
+            base_only = re.sub(
+                r"\b(?:play|open|run|start|search|find|for|on|in|video|videos|song|music|new|tab|window|incognito|private|mode|next|browser|site|website|app|application|home|homepage)\b",
+                " ",
+                base_only,
+            )
+            base_only = " ".join(base_only.split())
+            if not base_only:
+                return "https://www.youtube.com"
             if "channel" in lowered or "profile" in lowered:
                 handle = self._extract_handle(lowered, "youtube")
                 if handle:

@@ -7,7 +7,7 @@ import time
 
 from .config import VOICE_PRESETS
 from .security import prompt_password_setup
-from .utils import enable_autostart
+from .utils import disable_autostart
 from .voice_auth import enroll_voice
 from .wake_word import WakeWordDetector
 
@@ -263,9 +263,9 @@ def run_first_time_setup(config, voice_engine=None, tts=None):
     else:
         config.update({"voice_sample_path": "", "voice_auth_threshold": 0})
 
-    autostart_result = enable_autostart()
+    autostart_result = disable_autostart()
     print(autostart_result)
-    config.set("auto_start", "enabled" in autostart_result.lower() or "already enabled" in autostart_result.lower())
+    config.set("auto_start", False)
 
     config.set("is_setup_complete", True)
 

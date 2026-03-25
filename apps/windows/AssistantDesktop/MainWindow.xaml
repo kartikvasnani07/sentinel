@@ -613,6 +613,7 @@
                                  VerticalContentAlignment="Center"
                                  FontSize="{Binding ChatFontSizeValue}"
                                  Style="{StaticResource AppTextBox}"
+                                 TextChanged="InputBox_OnTextChanged"
                                  KeyDown="InputBox_OnKeyDown"
                                  Text=""/>
                         <Button Content="Send"
@@ -722,6 +723,12 @@
                         <StackPanel Orientation="Horizontal">
                             <TextBox Width="220" Height="32" Text="{Binding AssistantNameInput}" Style="{StaticResource SettingsTextBox}"/>
                             <Button Content="Apply" Width="70" Height="32" Margin="8,0,0,0" Click="ApplyAssistantName_Click" Style="{StaticResource AppButton}"/>
+                        </StackPanel>
+                        <TextBlock Text="Default create path" Foreground="{StaticResource TextSecondaryBrush}" FontSize="12" Margin="0,12,0,4"/>
+                        <StackPanel Orientation="Horizontal">
+                            <TextBox Width="260" Height="32" Text="{Binding DefaultCreatePathInput}" Style="{StaticResource SettingsTextBox}"/>
+                            <Button Content="Browse" Width="70" Height="32" Margin="8,0,0,0" Click="BrowseDefaultCreatePath_Click" Style="{StaticResource AppButton}"/>
+                            <Button Content="Apply" Width="70" Height="32" Margin="8,0,0,0" Click="ApplyDefaultCreatePath_Click" Style="{StaticResource AppButton}"/>
                         </StackPanel>
                         <TextBlock Text="Voice model" Foreground="{StaticResource TextSecondaryBrush}" FontSize="12" Margin="0,12,0,4"/>
                         <StackPanel Orientation="Horizontal">

@@ -1862,6 +1862,15 @@ def _run_text_mode(
 def run():
     print("Starting Assistant...\n")
     config = AssistantConfig()
+    if config.get("auto_start", False):
+        try:
+            config.set("auto_start", False)
+        except Exception:
+            pass
+    try:
+        disable_autostart()
+    except Exception:
+        pass
     first_time_setup = config.is_first_time_setup()
 
     if (not first_time_setup) and config.get("password_hash"):
