@@ -32,7 +32,7 @@ class WindowsPlatformActions:
 
     def close_all_apps(self):
         script = r"""
-$excluded = @('python', 'python3', 'powershell', 'pwsh', 'cmd', 'conhost')
+$excluded = @('python', 'python3', 'powershell', 'pwsh', 'cmd', 'conhost', 'assistantdesktop', 'assistantgui', 'assistant')
 $closed = @()
 Get-Process -ErrorAction SilentlyContinue | Where-Object {
     $_.MainWindowHandle -ne 0 -and $_.ProcessName -and ($excluded -notcontains $_.ProcessName.ToLower())

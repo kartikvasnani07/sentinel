@@ -11,6 +11,7 @@ class IntentEngine:
         "restart_system",
         "sleep_system",
         "stop_assistant",
+        "run_startup_apps",
         "undo_command",
         "redo_command",
         "open_application",
@@ -605,6 +606,8 @@ class IntentEngine:
         if self._contains_any(tokens, linux_cli_terms):
             scores["run_terminal_command"] += 9
 
+        device_words = {"device", "laptop", "pc", "computer", "system"}
+
         if normalized in {
             "stop",
             "stop yourself",
@@ -628,8 +631,17 @@ class IntentEngine:
             and len(token_set) <= 3
             and not self._contains_any(tokens, self.APP_WORDS | {"app", "application", "browser"})
             and not self._contains_any(tokens, {"process", "processes", "pid"})
+            and not self._contains_any(tokens, device_words)
         ):
             scores["stop_assistant"] += 20
+        if (
+            self._contains_any(tokens, self.ACTION_WORDS["close"])
+            and len(token_set) <= 3
+            and not self._contains_any(tokens, self.APP_WORDS | {"app", "application", "browser"})
+            and not self._contains_any(tokens, {"process", "processes", "pid"})
+            and not self._contains_any(tokens, device_words)
+        ):
+            scores["stop_assistant"] += 18
         if self._contains_any(tokens, {"undo", "revert"}) and (
             self._contains_any(tokens, {"previous", "last", "command", "change", "changes"}) or len(token_set) <= 3
         ):
@@ -663,6 +675,25 @@ class IntentEngine:
             scores["delete_conversation"] += 16
         if self._contains_phrase(normalized, {"new conversation", "new chat", "start new conversation", "start new chat"}):
             scores["new_conversation"] += 15
+        if self._contains_any(tokens, {"open", "launch", "start", "run"}) and self._contains_any(
+            tokens,
+            {"saved", "preferred", "prioritized", "prioritised", "startup", "favorite", "favourite"},
+        ) and self._contains_any(tokens, {"apps", "applications", "programs"}):
+            scores["run_startup_apps"] += 18
+        if self._contains_phrase(
+            normalized,
+            {
+                "open saved apps",
+                "launch saved apps",
+                "open preferred apps",
+                "launch preferred apps",
+                "open prioritized applications",
+                "launch prioritized applications",
+                "open startup apps",
+                "launch startup apps",
+            },
+        ):
+            scores["run_startup_apps"] += 20
         if "terminal" in token_set and self._contains_any(tokens, {"read", "aloud", "say", "speak"}):
             scores["read_terminal"] += 15
         if "voice" in token_set and self._contains_any(tokens, {"auth", "authentication", "verification", "verify"}):
@@ -727,8 +758,28 @@ class IntentEngine:
         ):
             scores["set_wake_sensitivity"] += 16
 
-        if self._contains_any(tokens, {"shutdown", "power"}) or self._contains_phrase(normalized, {"turn off my computer", "turn off device"}):
-            scores["shutdown_system"] += 14
+        if (
+            self._contains_any(tokens, {"shutdown", "power"})
+            or self._contains_phrase(
+                normalized,
+                {
+                    "turn off my computer",
+                    "turn off device",
+                    "turn off my device",
+                    "turn off my laptop",
+                    "turn off my pc",
+                    "turn off my system",
+                    "power off my device",
+                    "power off my laptop",
+                    "power off my pc",
+                    "power off my system",
+                },
+            )
+            or "poweroff" in token_set
+            or "poweroff" in normalized.replace(" ", "")
+            or (self._contains_any(tokens, device_words) and self._contains_any(tokens, {"turn", "off"}))
+        ):
+            scores["shutdown_system"] += 18
         if self._contains_any(tokens, {"restart", "reboot"}):
             scores["restart_system"] += 14
         if self._contains_any(tokens, {"sleep", "suspend"}):

@@ -11,6 +11,13 @@ from http.server import HTTPServer
 
 import requests
 
+try:
+    import numpy as np
+    import sounddevice as sd
+except Exception:  # pragma: no cover - optional
+    np = None
+    sd = None
+
 from .config import AssistantConfig, VOICE_PRESETS, UI_MODES
 from .intent_engine import IntentEngine
 from .llm_engine import LLMEngine
@@ -19,7 +26,7 @@ from .streaming_pipeline import StreamingPipeline
 from .system_actions import SystemActions
 from .tts_engine import TTSEngine
 from .voice_engine import VoiceEngine
-from .utils import disable_autostart
+from .utils import enable_gui_autostart, disable_gui_autostart
 
 
 YES_WORDS = {"yes", "y", "yeah", "yep", "sure", "ok", "okay", "proceed", "confirm", "do it"}
@@ -42,13 +49,11 @@ WORD_RE = re.compile(r"[a-z0-9']+", re.I)
 class AssistantRuntime:
     def __init__(self):
         self.config = AssistantConfig()
-        if self.config.get("auto_start", False):
-            try:
-                self.config.set("auto_start", False)
-            except Exception:
-                pass
         try:
-            disable_autostart()
+            if self.config.get("open_on_startup"):
+                enable_gui_autostart()
+            else:
+                disable_gui_autostart()
         except Exception:
             pass
         self.llm = LLMEngine(online=True)
@@ -81,6 +86,66 @@ class AssistantRuntime:
         self.model_preference = str(self.config.get("model_preference") or "auto").strip().lower()
         self.access_level = str(self.config.get("access_level") or "full").strip().lower()
         self.lock = threading.RLock()
+        self._startup_ran = False
+        self._run_startup_commands()
+
+    def _run_startup_commands(self):
+        if self._startup_ran:
+            return
+        commands = self.config.get("startup_commands") or []
+        if not commands or not self.config.get("open_on_startup"):
+            self._startup_ran = True
+            return
+
+        self._startup_ran = True
+
+        def _runner():
+            if self.config.get("clap_launch_enabled"):
+                detected = self._listen_for_single_clap(timeout=90)
+                if not detected:
+                    return
+            self._run_startup_commands_now(commands)
+
+        thread = threading.Thread(target=_runner, daemon=True, name="startup-commands")
+        thread.start()
+
+    def _run_startup_commands_now(self, commands):
+        for cmd in commands:
+            value = str(cmd or "").strip()
+            if not value:
+                continue
+            try:
+                self.handle(value, confirm=None, allow_split=True)
+            except Exception:
+                continue
+
+    def _listen_for_single_clap(self, timeout=90):
+        if sd is None or np is None:
+            return False
+        sample_rate = 16000
+        window_sec = 0.06
+        frames = int(sample_rate * window_sec)
+        try:
+            with sd.InputStream(samplerate=sample_rate, channels=1, dtype="float32") as stream:
+                noise_samples = []
+                for _ in range(8):
+                    data, _ = stream.read(frames)
+                    rms = float(np.sqrt(np.mean(np.square(data))))
+                    noise_samples.append(rms)
+                    time.sleep(0.01)
+                noise_floor = max(0.008, float(np.median(noise_samples)))
+                threshold = max(0.06, noise_floor * 3.5)
+                start = time.time()
+                while time.time() - start < timeout:
+                    data, _ = stream.read(frames)
+                    peak = float(np.max(np.abs(data)))
+                    rms = float(np.sqrt(np.mean(np.square(data))))
+                    if peak >= threshold and rms > 0.005 and peak / rms > 2.0:
+                        return True
+                    time.sleep(0.01)
+        except Exception:
+            return False
+        return False
 
     def transcribe_once(self, mode="manual"):
         mode = str(mode or "manual").strip().lower()
@@ -173,6 +238,30 @@ class AssistantRuntime:
             normalized.append(part)
         return normalized
 
+    def _force_power_action(self, text):
+        normalized = " ".join(str(text or "").strip().lower().split())
+        if not normalized:
+            return ""
+        tokens = set(WORD_RE.findall(normalized))
+        if {"assistant", "yourself"} & tokens:
+            return ""
+        if "setup" in tokens:
+            return ""
+        device_words = {"device", "laptop", "pc", "computer", "system"}
+        if "restart" in tokens or "reboot" in tokens:
+            if device_words & tokens or "restart" in tokens:
+                return "restart_system"
+        if "sleep" in tokens or "suspend" in tokens:
+            if device_words & tokens or "sleep" in tokens:
+                return "sleep_system"
+        poweroff = "poweroff" in tokens or "poweroff" in normalized.replace(" ", "")
+        turn_off = "turn" in tokens and "off" in tokens
+        power_off = "power" in tokens and "off" in tokens
+        if "shutdown" in tokens or poweroff or power_off or turn_off:
+            if device_words & tokens or "shutdown" in tokens or poweroff or power_off or turn_off:
+                return "shutdown_system"
+        return ""
+
     def _is_query_like(self, text):
         lowered = str(text or "").strip().lower()
         if not lowered:
@@ -217,6 +306,14 @@ class AssistantRuntime:
             return f"Unknown preset '{preset_name}'. Available: {available}"
         self.config.set("voice_preset", key)
         return self.tts.apply_voice_preset(key)
+
+    def _schedule_exit(self, delay=0.6):
+        def _exit():
+            time.sleep(max(0.1, float(delay)))
+            os._exit(0)
+
+        thread = threading.Thread(target=_exit, daemon=True, name="assistant-exit")
+        thread.start()
 
     def _permission_allows(self, action):
         access = (self.access_level or "full").lower()
@@ -880,6 +977,12 @@ class AssistantRuntime:
         if action == "clear_history":
             self.memory.clear()
             return "Conversation history cleared."
+        if action == "run_startup_apps":
+            commands = list(self.config.get("startup_commands") or [])
+            if not commands:
+                return "No startup actions are saved yet."
+            self._run_startup_commands_now(commands)
+            return "Launching saved startup applications."
         if action == "list_history":
             return self._format_history()
         if action == "open_conversation":
@@ -927,6 +1030,28 @@ class AssistantRuntime:
                 cleaned = "desktop"
             self.config.set("default_create_path", cleaned)
             updates["default_create_path"] = cleaned
+        if "open_on_startup" in payload:
+            enabled = bool(payload.get("open_on_startup"))
+            self.config.set("open_on_startup", enabled)
+            try:
+                if enabled:
+                    enable_gui_autostart()
+                else:
+                    disable_gui_autostart()
+            except Exception:
+                pass
+            updates["open_on_startup"] = enabled
+        if "clap_launch_enabled" in payload:
+            enabled = bool(payload.get("clap_launch_enabled"))
+            self.config.set("clap_launch_enabled", enabled)
+            updates["clap_launch_enabled"] = enabled
+        if "startup_commands" in payload:
+            raw = payload.get("startup_commands") or []
+            if not isinstance(raw, list):
+                raw = []
+            cleaned = [str(item).strip() for item in raw if str(item).strip()]
+            self.config.set("startup_commands", cleaned)
+            updates["startup_commands"] = cleaned
         return updates
 
     def handle(self, text, confirm=None, model_preference=None, access_level=None, attachments=None, mode=None, allow_split=True):
@@ -1019,7 +1144,12 @@ class AssistantRuntime:
                 self.pending_batch = []
                 return {"response": "Cancelled.", "needs_confirmation": False}
 
-            if (mode or "").lower() in {"respond", "chat", "generic"}:
+            forced_action = self._force_power_action(text)
+            if forced_action:
+                intent = "system_command"
+                action = forced_action
+                params = {}
+            elif (mode or "").lower() in {"respond", "chat", "generic"}:
                 intent = "conversation"
                 action = None
                 params = {}
@@ -1028,6 +1158,13 @@ class AssistantRuntime:
                 intent = intent_data.get("intent", "conversation")
                 action = intent_data.get("action")
                 params = intent_data.get("parameters", {})
+
+            if intent == "system_command" and action == "stop_assistant":
+                response = "Closing the assistant."
+                self.memory.add("user", text)
+                self.memory.add("assistant", response)
+                self._schedule_exit()
+                return {"response": response, "needs_confirmation": False, "exit_app": True}
 
             if self._should_plan(text, (mode or "").lower()):
                 context = "" if self._should_reset_context(text) else self.memory.get_context()
@@ -1139,10 +1276,13 @@ class AssistantRequestHandler(BaseHTTPRequestHandler):
                     "cloud_ready": cloud_ready,
                     "model_preference": self.runtime.model_preference,
                     "access_level": self.runtime.access_level,
-                    "assistant_name": self.runtime.config.get("assistant_name", "assistant"),
-                    "default_create_path": self.runtime.config.get("default_create_path", ""),
-                    "models": models,
-                }
+                      "assistant_name": self.runtime.config.get("assistant_name", "assistant"),
+                      "default_create_path": self.runtime.config.get("default_create_path", ""),
+                      "open_on_startup": bool(self.runtime.config.get("open_on_startup")),
+                      "clap_launch_enabled": bool(self.runtime.config.get("clap_launch_enabled")),
+                      "startup_commands": list(self.runtime.config.get("startup_commands") or []),
+                      "models": models,
+                  }
             )
             return
         if path == "/api/voices":

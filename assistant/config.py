@@ -171,6 +171,9 @@ _DEFAULTS = {
     "openweather_api_key": "",
     "default_location": "",
     "default_create_path": "",
+    "open_on_startup": False,
+    "clap_launch_enabled": False,
+    "startup_commands": [],
 }
 
 
@@ -276,6 +279,16 @@ class AssistantConfig:
         self._data["openweather_api_key"] = str(self._data.get("openweather_api_key") or "").strip()
         self._data["default_location"] = str(self._data.get("default_location") or "").strip()
         self._data["default_create_path"] = str(self._data.get("default_create_path") or "").strip()
+        self._data["open_on_startup"] = bool(self._data.get("open_on_startup"))
+        startup_commands = self._data.get("startup_commands")
+        if not isinstance(startup_commands, list):
+            startup_commands = []
+        cleaned_commands = []
+        for item in startup_commands:
+            value = str(item or "").strip()
+            if value:
+                cleaned_commands.append(value)
+        self._data["startup_commands"] = cleaned_commands
 
         self._data["voice_auth_threshold"] = _clamp_percentage(
             self._data.get("voice_auth_threshold"),

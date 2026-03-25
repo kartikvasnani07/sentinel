@@ -174,7 +174,8 @@ public record AssistantResponse(
     string response,
     bool needs_confirmation,
     [property: JsonPropertyName("model_used")] string? ModelUsed = null,
-    [property: JsonPropertyName("weather")] AssistantWeather? Weather = null);
+    [property: JsonPropertyName("weather")] AssistantWeather? Weather = null,
+    [property: JsonPropertyName("exit_app")] bool? ExitApp = null);
 
 public record AssistantWeather(
     [property: JsonPropertyName("location")] string? Location,
@@ -206,6 +207,9 @@ public record AssistantStatus(
     [property: JsonPropertyName("access_level")] string? AccessLevel,
     [property: JsonPropertyName("assistant_name")] string? AssistantName,
     [property: JsonPropertyName("default_create_path")] string? DefaultCreatePath,
+    [property: JsonPropertyName("open_on_startup")] bool OpenOnStartup,
+    [property: JsonPropertyName("clap_launch_enabled")] bool ClapLaunchEnabled,
+    [property: JsonPropertyName("startup_commands")] List<string>? StartupCommands,
     [property: JsonPropertyName("models")] List<AssistantModelOption>? Models);
 
 public record AssistantModelOption(

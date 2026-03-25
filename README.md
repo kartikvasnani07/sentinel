@@ -60,6 +60,8 @@ Windows GUI (WPF) — fully wired to the bridge:
 - Target: .NET 8 WPF
 - Run: `dotnet run` inside the project folder
 
+You can optionally auto-start the GUI on login via Settings → “Open on startup”.
+
 Linux GUI (Avalonia) — project scaffold exists, integration still in progress:
 - Project: `apps/linux/AssistantDesktop.Linux`
 - Target: .NET 8 Avalonia
@@ -474,6 +476,7 @@ GUI-specific:
 - Model selector (Auto/Groq/OpenRouter/Ollama + code variants)
 - Access mode selector (read / write / full) which gates system actions
 - Pin button to attach files or folders for context-aware responses
+- Open on startup toggle (Windows GUI) and startup actions list (run commands like “open blender”, “open youtube”, “open file explorer” on launch)
 
 When visual mode is disabled, assistant uses classic text status output.
 During setup/reset and any terminal text-heavy output, visual rendering is cleared first to prevent ASCII overlap.
@@ -588,8 +591,9 @@ This command path returns terminal output directly in the assistant response.
 
 ## Autostart
 
-- Autostart is disabled by default in the current build (CLI will not start on login).
-- If you explicitly want autostart, use the Linux service template below or add a Windows startup entry manually.
+- Autostart is disabled by default in the current build.
+- The GUI “Open on startup” toggle uses a Windows Run entry that launches `assistant.gui_launcher`, which starts the bridge and opens the WPF app.
+- You can still set up CLI autostart manually if desired.
 
 - Linux: use `assistant/platform/linux/assistant.service` as template (edit user/path first), then:
 

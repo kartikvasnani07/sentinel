@@ -48,6 +48,7 @@ def _autostart_task_name():
 
 _AUTOSTART_RUN_KEY = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
 _AUTOSTART_RUN_VALUE = "AIAssistant"
+_AUTOSTART_GUI_RUN_VALUE = "AIAssistantGUI"
 
 
 def random_greeting():
@@ -76,6 +77,12 @@ def _launcher_path():
     appdata = os.getenv("APPDATA", "")
     base = Path(appdata) / "AIAssistant" if appdata else (Path.home() / ".assistant")
     return base / "launch_assistant.cmd"
+
+
+def _gui_launcher_path():
+    appdata = os.getenv("APPDATA", "")
+    base = Path(appdata) / "AIAssistant" if appdata else (Path.home() / ".assistant")
+    return base / "launch_assistant_gui.cmd"
 
 
 def _run_command(args, timeout=10):
@@ -131,6 +138,20 @@ def _is_registry_autostart_enabled():
     return result.returncode == 0
 
 
+def _is_registry_gui_autostart_enabled():
+    result = _run_command(
+        [
+            "reg",
+            "query",
+            _AUTOSTART_RUN_KEY,
+            "/v",
+            _AUTOSTART_GUI_RUN_VALUE,
+        ],
+        timeout=8,
+    )
+    return result.returncode == 0
+
+
 def _set_registry_autostart(command):
     result = _run_command(
         [
@@ -139,6 +160,25 @@ def _set_registry_autostart(command):
             _AUTOSTART_RUN_KEY,
             "/v",
             _AUTOSTART_RUN_VALUE,
+            "/t",
+            "REG_SZ",
+            "/d",
+            command,
+            "/f",
+        ],
+        timeout=10,
+    )
+    return result.returncode == 0, (result.stderr or result.stdout or "").strip()
+
+
+def _set_registry_gui_autostart(command):
+    result = _run_command(
+        [
+            "reg",
+            "add",
+            _AUTOSTART_RUN_KEY,
+            "/v",
+            _AUTOSTART_GUI_RUN_VALUE,
             "/t",
             "REG_SZ",
             "/d",
@@ -165,6 +205,21 @@ def _delete_registry_autostart():
     return result.returncode == 0
 
 
+def _delete_registry_gui_autostart():
+    result = _run_command(
+        [
+            "reg",
+            "delete",
+            _AUTOSTART_RUN_KEY,
+            "/v",
+            _AUTOSTART_GUI_RUN_VALUE,
+            "/f",
+        ],
+        timeout=8,
+    )
+    return result.returncode == 0
+
+
 def _write_launcher_script():
     launcher = _launcher_path()
     launcher.parent.mkdir(parents=True, exist_ok=True)
@@ -182,6 +237,28 @@ def _write_launcher_script():
         "@echo off\n"
         f'cd /d "{assistant_dir}"\n'
         f'"{python_exe}" -m assistant.main\n'
+    )
+    launcher.write_text(script, encoding="utf-8")
+    return launcher
+
+
+def _write_gui_launcher_script():
+    launcher = _gui_launcher_path()
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    assistant_root = Path(__file__).resolve().parent.parent
+    venv_python = assistant_root / "venv" / "Scripts" / "python.exe"
+    configured_python = str(os.getenv("ASSISTANT_PYTHON_EXE", "")).strip()
+    if configured_python:
+        python_exe = configured_python
+    elif venv_python.exists():
+        python_exe = str(venv_python)
+    else:
+        python_exe = str(Path(sys.executable))
+    assistant_dir = str(assistant_root)
+    script = (
+        "@echo off\n"
+        f'cd /d "{assistant_dir}"\n'
+        f'"{python_exe}" -m assistant.gui_launcher\n'
     )
     launcher.write_text(script, encoding="utf-8")
     return launcher
@@ -218,6 +295,10 @@ def is_autostart_enabled():
     return _is_registry_autostart_enabled() or _task_exists() or _shortcut_path().exists()
 
 
+def is_gui_autostart_enabled():
+    return _is_registry_gui_autostart_enabled() or _gui_launcher_path().exists()
+
+
 def enable_autostart():
     try:
         launcher = _write_launcher_script()
@@ -249,6 +330,20 @@ def enable_autostart():
     return f"Could not enable auto-start: {details}"
 
 
+def enable_gui_autostart():
+    try:
+        launcher = _write_gui_launcher_script()
+    except Exception as exc:
+        return f"Could not enable GUI auto-start: {exc}"
+
+    registry_enabled, registry_error = _set_registry_gui_autostart(f'"{launcher}"')
+    if registry_enabled:
+        return "GUI auto-start enabled for immediate launch on login."
+
+    details = (registry_error or "").strip() or "GUI auto-start setup failed."
+    return f"Could not enable GUI auto-start: {details}"
+
+
 def disable_autostart():
     registry_removed = _delete_registry_autostart()
     task_removed = _delete_task()
@@ -275,6 +370,21 @@ def disable_autostart():
     if registry_removed or task_removed or shortcut_removed or launcher_removed:
         return "Auto-start disabled."
     return "Auto-start was not enabled."
+
+
+def disable_gui_autostart():
+    registry_removed = _delete_registry_gui_autostart()
+    launcher_removed = False
+    launcher = _gui_launcher_path()
+    try:
+        if launcher.exists():
+            launcher.unlink()
+            launcher_removed = True
+    except Exception:
+        pass
+    if registry_removed or launcher_removed:
+        return "GUI auto-start disabled."
+    return "GUI auto-start was not enabled."
 
 
 def draw_file_tree(root_path, max_depth=None, max_items=None):

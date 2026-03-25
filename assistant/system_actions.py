@@ -271,6 +271,7 @@ class SystemActions:
             "shutdown_system": self._shutdown_system,
             "restart_system": self._restart_system,
             "sleep_system": self._sleep_system,
+            "stop_assistant": self._stop_assistant,
             "open_application": self._open_application,
             "open_path": self._open_path,
             "close_application": self._close_application,
@@ -2856,6 +2857,9 @@ $matches | Stop-Process -Force
     def _sleep_system(self, params):
         self.platform_actions.sleep_system()
         return "Putting the device to sleep."
+
+    def _stop_assistant(self, params):
+        return "Shutting down the assistant."
 
     def _set_brightness(self, params):
         percent = params.get("percent")

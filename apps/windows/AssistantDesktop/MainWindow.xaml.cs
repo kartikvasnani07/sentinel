@@ -44,6 +44,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private bool _isServerTranscribing;
     private bool _cancelTranscription;
     private bool _isWakeAnimating;
+    private DispatcherTimer? _statusTimer;
+    private bool _statusRefreshInFlight;
+    private DateTime _lastBridgeStartAttempt = DateTime.MinValue;
     private static readonly string[] WakeReplies = new[]
     {
         "I'm here.",
@@ -66,6 +69,9 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private DateTime _lastVoiceAuthSentAt = DateTime.MinValue;
     private DateTime _lastMicSentAt = DateTime.MinValue;
     private DateTime _lastWakeSentAt = DateTime.MinValue;
+    private bool _openOnStartupEnabled;
+    private bool _clapLaunchEnabled;
+    private string _startupCommandInput = "";
 
     public ObservableCollection<ChatMessage> Messages { get; } = new();
     public ObservableCollection<string> PinnedItems { get; } = new();
@@ -84,6 +90,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         new UiOption("plan", "Plan"),
     };
     public ObservableCollection<UiOption> VoicePresetOptions { get; } = new();
+    public ObservableCollection<string> StartupCommands { get; } = new();
 
     private UiOption? _selectedModelOption;
     public UiOption? SelectedModelOption
@@ -263,6 +270,36 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         }
     }
 
+    public bool OpenOnStartupEnabled
+    {
+        get => _openOnStartupEnabled;
+        set
+        {
+            _openOnStartupEnabled = value;
+            OnPropertyChanged();
+        }
+    }
+
+    public bool ClapLaunchEnabled
+    {
+        get => _clapLaunchEnabled;
+        set
+        {
+            _clapLaunchEnabled = value;
+            OnPropertyChanged();
+        }
+    }
+
+    public string StartupCommandInput
+    {
+        get => _startupCommandInput;
+        set
+        {
+            _startupCommandInput = value;
+            OnPropertyChanged();
+        }
+    }
+
     public MainWindow()
     {
         InitializeComponent();
@@ -271,6 +308,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             BringToFront();
             await LoadStatusAsync();
+            StartStatusTimer();
         };
     }
 
@@ -381,6 +419,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             Messages.Add(assistantMessage);
             ScrollChatToEnd();
             _awaitingConfirmation = response.needs_confirmation;
+            var shouldExit = response.ExitApp == true;
             if (_voiceReplyEnabled && !_awaitingConfirmation && !_suppressVoiceForNextSend)
             {
                 await _client.SpeakAsync(response.response);
@@ -388,6 +427,12 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             if (_suppressVoiceForNextSend)
             {
                 _suppressVoiceForNextSend = false;
+            }
+            if (shouldExit)
+            {
+                await Task.Delay(250);
+                System.Windows.Application.Current.Dispatcher.Invoke(() => System.Windows.Application.Current.Shutdown());
+                return;
             }
             if (shouldReturnToWake && !_awaitingConfirmation)
             {
@@ -437,17 +482,21 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             Messages.Add(new ChatMessage($"Status error: {exc.Message}", false));
             StatusText = "Bridge offline";
-            return;
+            status = null;
         }
         if (status is null)
         {
             StatusText = "Bridge offline";
-            var started = await TryStartBridgeAsync();
-            if (!started)
+            if ((DateTime.UtcNow - _lastBridgeStartAttempt).TotalSeconds > 12)
             {
-                return;
+                _lastBridgeStartAttempt = DateTime.UtcNow;
+                var started = await TryStartBridgeAsync();
+                if (started)
+                {
+                    await Task.Delay(600);
+                    status = await _client.GetStatusAsync();
+                }
             }
-            status = await _client.GetStatusAsync();
             if (status is null)
             {
                 StatusText = "Bridge offline";
@@ -486,7 +535,47 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             DefaultCreatePathInput = status.DefaultCreatePath.Trim();
         }
+        OpenOnStartupEnabled = status.OpenOnStartup;
+        ClapLaunchEnabled = status.ClapLaunchEnabled;
+        StartupCommands.Clear();
+        if (status.StartupCommands is not null)
+        {
+            foreach (var item in status.StartupCommands)
+            {
+                var value = item?.Trim();
+                if (!string.IsNullOrWhiteSpace(value))
+                {
+                    StartupCommands.Add(value);
+                }
+            }
+        }
         StartWakeListening();
+    }
+
+    private void StartStatusTimer()
+    {
+        if (_statusTimer is not null)
+        {
+            return;
+        }
+        _statusTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
+        _statusTimer.Tick += async (_, _) =>
+        {
+            if (_statusRefreshInFlight)
+            {
+                return;
+            }
+            _statusRefreshInFlight = true;
+            try
+            {
+                await LoadStatusAsync();
+            }
+            finally
+            {
+                _statusRefreshInFlight = false;
+            }
+        };
+        _statusTimer.Start();
     }
 
     private async Task LoadVoicePresetsAsync()
@@ -526,9 +615,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             try
             {
+                var venvPython = Path.Combine(repoRoot, "venv", "Scripts", "python.exe");
+                var pythonExe = File.Exists(venvPython) ? venvPython : "python";
                 Process.Start(new ProcessStartInfo
                 {
-                    FileName = "python",
+                    FileName = pythonExe,
                     Arguments = "-m assistant.gui_server",
                     UseShellExecute = true,
                     CreateNoWindow = true,
@@ -833,6 +924,58 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             Messages.Add(new ChatMessage("Failed to update default create path.", false));
             ScrollChatToEnd();
         }
+    }
+
+    private async void OpenOnStartup_Toggled(object sender, RoutedEventArgs e)
+    {
+        await SaveStartupSettingsAsync();
+    }
+
+    private async void ClapLaunch_Toggled(object sender, RoutedEventArgs e)
+    {
+        await SaveStartupSettingsAsync();
+    }
+
+    private async void AddStartupCommand_Click(object sender, RoutedEventArgs e)
+    {
+        var command = StartupCommandInput.Trim();
+        if (string.IsNullOrWhiteSpace(command))
+        {
+            return;
+        }
+        StartupCommands.Add(command);
+        StartupCommandInput = "";
+        await SaveStartupSettingsAsync();
+    }
+
+    private async void RemoveStartupCommand_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement element && element.Tag is string command)
+        {
+            StartupCommands.Remove(command);
+            await SaveStartupSettingsAsync();
+        }
+    }
+
+    private async void EditStartupCommand_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement element && element.Tag is string command)
+        {
+            StartupCommands.Remove(command);
+            StartupCommandInput = command;
+            await SaveStartupSettingsAsync();
+        }
+    }
+
+    private async Task SaveStartupSettingsAsync()
+    {
+        var payload = new Dictionary<string, object?>
+        {
+            ["open_on_startup"] = OpenOnStartupEnabled,
+            ["clap_launch_enabled"] = ClapLaunchEnabled,
+            ["startup_commands"] = StartupCommands.ToList(),
+        };
+        await _client.UpdateSettingsAsync(payload);
     }
 
     private async void ApplyVoiceModel_Click(object sender, RoutedEventArgs e)
