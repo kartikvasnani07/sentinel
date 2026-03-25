@@ -72,6 +72,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private bool _openOnStartupEnabled;
     private bool _clapLaunchEnabled;
     private string _startupCommandInput = "";
+    private bool _isLoadingSettings;
+    private bool _hasLoadedSettings;
 
     public ObservableCollection<ChatMessage> Messages { get; } = new();
     public ObservableCollection<string> PinnedItems { get; } = new();
@@ -506,48 +508,57 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
         StatusText = status.CloudReady ? "Online" : "Bridge online (cloud not configured)";
 
-        ModelOptions.Clear();
-        if (status.Models is not null)
+        _isLoadingSettings = true;
+        try
         {
-            foreach (var model in status.Models)
+            ModelOptions.Clear();
+            if (status.Models is not null)
             {
-                ModelOptions.Add(new UiOption(model.id, model.label));
-            }
-        }
-
-        if (ModelOptions.Count == 0)
-        {
-            ModelOptions.Add(new UiOption("auto", "Auto"));
-        }
-
-        SelectedModelOption = ModelOptions.FirstOrDefault(option => option.Id == status.ModelPreference)
-            ?? ModelOptions.FirstOrDefault();
-        SelectedAccessOption = AccessOptions.FirstOrDefault(option => option.Id == status.AccessLevel)
-            ?? AccessOptions.LastOrDefault();
-        SelectedModeOption = ModeOptions.FirstOrDefault();
-        await LoadVoicePresetsAsync();
-        if (!string.IsNullOrWhiteSpace(status.AssistantName))
-        {
-            AssistantNameInput = status.AssistantName.Trim();
-            ConfigureWakeWord(status.AssistantName.Trim());
-        }
-        if (!string.IsNullOrWhiteSpace(status.DefaultCreatePath))
-        {
-            DefaultCreatePathInput = status.DefaultCreatePath.Trim();
-        }
-        OpenOnStartupEnabled = status.OpenOnStartup;
-        ClapLaunchEnabled = status.ClapLaunchEnabled;
-        StartupCommands.Clear();
-        if (status.StartupCommands is not null)
-        {
-            foreach (var item in status.StartupCommands)
-            {
-                var value = item?.Trim();
-                if (!string.IsNullOrWhiteSpace(value))
+                foreach (var model in status.Models)
                 {
-                    StartupCommands.Add(value);
+                    ModelOptions.Add(new UiOption(model.id, model.label));
                 }
             }
+
+            if (ModelOptions.Count == 0)
+            {
+                ModelOptions.Add(new UiOption("auto", "Auto"));
+            }
+
+            SelectedModelOption = ModelOptions.FirstOrDefault(option => option.Id == status.ModelPreference)
+                ?? ModelOptions.FirstOrDefault();
+            SelectedAccessOption = AccessOptions.FirstOrDefault(option => option.Id == status.AccessLevel)
+                ?? AccessOptions.LastOrDefault();
+            SelectedModeOption = ModeOptions.FirstOrDefault();
+            await LoadVoicePresetsAsync();
+            if (!string.IsNullOrWhiteSpace(status.AssistantName))
+            {
+                AssistantNameInput = status.AssistantName.Trim();
+                ConfigureWakeWord(status.AssistantName.Trim());
+            }
+            if (!string.IsNullOrWhiteSpace(status.DefaultCreatePath))
+            {
+                DefaultCreatePathInput = status.DefaultCreatePath.Trim();
+            }
+            OpenOnStartupEnabled = status.OpenOnStartup;
+            ClapLaunchEnabled = status.ClapLaunchEnabled;
+            StartupCommands.Clear();
+            if (status.StartupCommands is not null)
+            {
+                foreach (var item in status.StartupCommands)
+                {
+                    var value = item?.Trim();
+                    if (!string.IsNullOrWhiteSpace(value))
+                    {
+                        StartupCommands.Add(value);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            _isLoadingSettings = false;
+            _hasLoadedSettings = true;
         }
         StartWakeListening();
     }
@@ -928,16 +939,28 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async void OpenOnStartup_Toggled(object sender, RoutedEventArgs e)
     {
+        if (_isLoadingSettings || !_hasLoadedSettings)
+        {
+            return;
+        }
         await SaveStartupSettingsAsync();
     }
 
     private async void ClapLaunch_Toggled(object sender, RoutedEventArgs e)
     {
+        if (_isLoadingSettings || !_hasLoadedSettings)
+        {
+            return;
+        }
         await SaveStartupSettingsAsync();
     }
 
     private async void AddStartupCommand_Click(object sender, RoutedEventArgs e)
     {
+        if (_isLoadingSettings || !_hasLoadedSettings)
+        {
+            return;
+        }
         var command = StartupCommandInput.Trim();
         if (string.IsNullOrWhiteSpace(command))
         {
@@ -950,6 +973,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async void RemoveStartupCommand_Click(object sender, RoutedEventArgs e)
     {
+        if (_isLoadingSettings || !_hasLoadedSettings)
+        {
+            return;
+        }
         if (sender is FrameworkElement element && element.Tag is string command)
         {
             StartupCommands.Remove(command);
@@ -959,6 +986,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async void EditStartupCommand_Click(object sender, RoutedEventArgs e)
     {
+        if (_isLoadingSettings || !_hasLoadedSettings)
+        {
+            return;
+        }
         if (sender is FrameworkElement element && element.Tag is string command)
         {
             StartupCommands.Remove(command);
@@ -969,13 +1000,22 @@ public partial class MainWindow : Window, INotifyPropertyChanged
 
     private async Task SaveStartupSettingsAsync()
     {
+        if (_isLoadingSettings || !_hasLoadedSettings)
+        {
+            return;
+        }
         var payload = new Dictionary<string, object?>
         {
             ["open_on_startup"] = OpenOnStartupEnabled,
             ["clap_launch_enabled"] = ClapLaunchEnabled,
             ["startup_commands"] = StartupCommands.ToList(),
         };
-        await _client.UpdateSettingsAsync(payload);
+        var ok = await _client.UpdateSettingsAsync(payload);
+        if (!ok)
+        {
+            Messages.Add(new ChatMessage("Could not save startup settings (bridge offline).", false));
+            ScrollChatToEnd();
+        }
     }
 
     private async void ApplyVoiceModel_Click(object sender, RoutedEventArgs e)
@@ -1199,6 +1239,15 @@ public partial class MainWindow : Window, INotifyPropertyChanged
                 return;
             }
             var text = transcript?.Text?.Trim() ?? "";
+            if (sendDirectly && string.IsNullOrWhiteSpace(text) && !_cancelTranscription)
+            {
+                var retry = await _client.TranscribeAsync("wake");
+                if (_cancelTranscription)
+                {
+                    return;
+                }
+                text = retry?.Text?.Trim() ?? "";
+            }
             if (string.IsNullOrWhiteSpace(text))
             {
                 if (sendDirectly)

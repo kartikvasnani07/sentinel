@@ -150,6 +150,15 @@ class AssistantRuntime:
     def transcribe_once(self, mode="manual"):
         mode = str(mode or "manual").strip().lower()
         fast_start = mode == "wake"
+        max_duration = 18.0
+        silence_duration = 0.8
+        min_duration = 0.4
+        start_timeout = 6.0
+        if fast_start:
+            max_duration = 25.0
+            silence_duration = 1.1
+            min_duration = 0.6
+            start_timeout = 10.0
         if fast_start:
             time.sleep(0.35)
         try:
@@ -158,10 +167,10 @@ class AssistantRuntime:
             pass
         try:
             audio = self.voice.record_until_silence(
-                max_duration=18.0,
-                silence_duration=0.8,
-                min_duration=0.4,
-                start_timeout=6.0,
+                max_duration=max_duration,
+                silence_duration=silence_duration,
+                min_duration=min_duration,
+                start_timeout=start_timeout,
                 preroll_duration=0.5,
                 block_duration=0.05,
                 fast_start=fast_start,
