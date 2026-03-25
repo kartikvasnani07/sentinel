@@ -21,6 +21,7 @@ It supports:
 - Cloud + local fallback for LLM, STT, and TTS
 - English-only runtime language (intent-first parsing, not rigid templates)
 - Confirmation prompts accept keyboard or voice responses
+- Startup actions (auto-run or clap-triggered launch of saved app sequences)
 
 ## Core Pipeline
 
@@ -32,6 +33,7 @@ It supports:
 6. LLM handles non-system conversation and coding generation.
 7. Weather uses Open‑Meteo (no API key required).
 8. TTS speaks response (Edge-TTS -> Piper -> Linux CLI TTS -> pyttsx3 fallback).
+9. Wake-word responses use the selected voice preset; manual mic transcribes into the textbox for review.
 
 ## GUI Apps (Desktop + Android)
 
@@ -59,6 +61,7 @@ Windows GUI (WPF) — fully wired to the bridge:
 - Project: `apps/windows/AssistantDesktop`
 - Target: .NET 8 WPF
 - Run: `dotnet run` inside the project folder
+- The WPF app will auto-start the local bridge if it is offline and refreshes bridge status periodically.
 
 You can optionally auto-start the GUI on login via Settings → “Open on startup”.
 
@@ -477,6 +480,7 @@ GUI-specific:
 - Access mode selector (read / write / full) which gates system actions
 - Pin button to attach files or folders for context-aware responses
 - Open on startup toggle (Windows GUI) and startup actions list (run commands like “open blender”, “open youtube”, “open file explorer” on launch)
+- Clap-to-launch toggle (single clap) to trigger saved startup actions instead of running them immediately
 
 When visual mode is disabled, assistant uses classic text status output.
 During setup/reset and any terminal text-heavy output, visual rendering is cleared first to prevent ASCII overlap.
@@ -486,6 +490,8 @@ During setup/reset and any terminal text-heavy output, visual rendering is clear
 - `open vlc`
 - `close camera`
 - `close all apps`
+- `launch saved applications`
+- `launch saved sequences`
 - `shutdown device`
 - `restart my computer`
 - `list all the background processes`
@@ -593,6 +599,7 @@ This command path returns terminal output directly in the assistant response.
 
 - Autostart is disabled by default in the current build.
 - The GUI “Open on startup” toggle uses a Windows Run entry that launches `assistant.gui_launcher`, which starts the bridge and opens the WPF app.
+- Optional: enable the clap-to-launch toggle to run saved startup actions only after a single clap is detected.
 - You can still set up CLI autostart manually if desired.
 
 - Linux: use `assistant/platform/linux/assistant.service` as template (edit user/path first), then:
