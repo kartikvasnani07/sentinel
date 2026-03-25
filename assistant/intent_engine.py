@@ -677,8 +677,8 @@ class IntentEngine:
             scores["new_conversation"] += 15
         if self._contains_any(tokens, {"open", "launch", "start", "run"}) and self._contains_any(
             tokens,
-            {"saved", "preferred", "prioritized", "prioritised", "startup", "favorite", "favourite"},
-        ) and self._contains_any(tokens, {"apps", "applications", "programs"}):
+            {"saved", "preferred", "prioritized", "prioritised", "startup", "favorite", "favourite", "sequence", "sequences"},
+        ) and self._contains_any(tokens, {"apps", "applications", "programs", "sequence", "sequences"}):
             scores["run_startup_apps"] += 18
         if self._contains_phrase(
             normalized,
@@ -691,6 +691,10 @@ class IntentEngine:
                 "launch prioritized applications",
                 "open startup apps",
                 "launch startup apps",
+                "open saved sequences",
+                "launch saved sequences",
+                "open startup sequences",
+                "launch startup sequences",
             },
         ):
             scores["run_startup_apps"] += 20
@@ -965,6 +969,8 @@ class IntentEngine:
                 scores["open_application"] += 12
             if explicit_app_request or self._contains_any(tokens, self.APP_WORDS | {"app", "application", "browser"}):
                 scores["open_application"] += 4
+            if "file" in token_set and "explorer" in token_set:
+                scores["open_application"] += 20
 
         if "play" in token_set and (self._is_file_context(normalized, tokens) or self._is_folder_context(tokens) or "directory" in token_set or "folder" in token_set):
             scores["open_path"] += 16

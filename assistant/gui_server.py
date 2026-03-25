@@ -110,14 +110,22 @@ class AssistantRuntime:
         thread.start()
 
     def _run_startup_commands_now(self, commands):
-        for cmd in commands:
-            value = str(cmd or "").strip()
-            if not value:
-                continue
-            try:
-                self.handle(value, confirm=None, allow_split=True)
-            except Exception:
-                continue
+        self.system.session_context["startup_sequence"] = True
+        try:
+            for cmd in commands:
+                value = str(cmd or "").strip()
+                if not value:
+                    continue
+                try:
+                    lowered = value.lower()
+                    if "file explorer" in lowered or lowered.strip() == "explorer":
+                        self.system.execute("open_application", {"application": "file explorer", "raw_text": value})
+                        continue
+                    self.handle(value, confirm=None, allow_split=True)
+                except Exception:
+                    continue
+        finally:
+            self.system.session_context.pop("startup_sequence", None)
 
     def _listen_for_single_clap(self, timeout=90):
         if sd is None or np is None:
@@ -160,7 +168,7 @@ class AssistantRuntime:
             min_duration = 0.6
             start_timeout = 10.0
         if fast_start:
-            time.sleep(0.35)
+            time.sleep(0.15)
         try:
             self.tts.stop()
         except Exception:

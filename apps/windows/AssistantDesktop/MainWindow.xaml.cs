@@ -26,6 +26,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     private Grammar? _dictationGrammar;
     private bool _recognitionStarted;
     private bool _isListening;
+    private bool _isRecording;
     private string _micButtonText = "Mic";
     private string _lastVoiceText = "";
     private DateTime _lastVoiceCommandAt = DateTime.MinValue;
@@ -152,6 +153,16 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         set
         {
             _isListening = value;
+            OnPropertyChanged();
+        }
+    }
+
+    public bool IsRecording
+    {
+        get => _isRecording;
+        set
+        {
+            _isRecording = value;
             OnPropertyChanged();
         }
     }
@@ -375,6 +386,8 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             return;
         }
         var shouldReturnToWake = IsListening && !_manualMicMode && _wakeTriggeredSession;
+        var previousStatus = StatusText;
+        StatusText = "Generating";
         Messages.Add(new ChatMessage(text, true));
         ScrollChatToEnd();
         bool? confirm = null;
@@ -449,6 +462,14 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             Messages.Add(new ChatMessage($"Bridge error: {exc.Message}", false));
             StatusText = "Bridge offline";
+            return;
+        }
+        finally
+        {
+            if (StatusText == "Generating")
+            {
+                StatusText = previousStatus;
+            }
         }
     }
 
@@ -1229,8 +1250,18 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _wakeTriggeredSession = sendDirectly;
         _voiceReplyEnabled = sendDirectly;
         IsListening = true;
-        MicButtonText = "Stop";
-        StatusText = "Listening";
+        if (fromWake)
+        {
+            MicButtonText = "Mic";
+            StatusText = "Listening";
+            IsRecording = false;
+        }
+        else
+        {
+            MicButtonText = "Stop";
+            StatusText = "Recording";
+            IsRecording = true;
+        }
         try
         {
             var transcript = await _client.TranscribeAsync(sendDirectly ? "wake" : "manual");
@@ -1300,6 +1331,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         SetGrammarMode(wakeEnabled: true, dictationEnabled: false);
         StartRecognitionLoop();
         IsListening = false;
+        IsRecording = false;
         MicButtonText = "Mic";
         StatusText = _lastStatus;
     }
@@ -1331,6 +1363,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _autoSendBlocked = true;
         _suppressVoiceForNextSend = true;
         IsListening = false;
+        IsRecording = false;
         MicButtonText = "Mic";
         StatusText = _lastStatus;
         BeginWakeListening();
@@ -1344,6 +1377,7 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         _autoSendBlocked = false;
         _autoSendTimer?.Stop();
         IsListening = false;
+        IsRecording = false;
         MicButtonText = "Mic";
         StatusText = _lastStatus;
         BeginWakeListening();

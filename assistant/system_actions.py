@@ -2045,6 +2045,8 @@ $matches | Stop-Process -Force
         incognito = bool(params.get("incognito", False))
         new_tab = bool(params.get("new_tab", False))
         new_window = bool(params.get("new_window", False))
+        if self.session_context.get("startup_sequence") and not any([incognito, new_tab, new_window]):
+            new_tab = True
 
         if not any([incognito, new_tab, new_window]):
             if self._focus_browser_and_navigate(url, browser or None):
@@ -4327,10 +4329,27 @@ $devices | ConvertTo-Json -Depth 4 -Compress
     def _extract_site_path(self, text, site_name):
         lowered = self._normalize_query(text)
         lowered = lowered.replace(f"{site_name}/", f"{site_name} /")
+        noise_tokens = {
+            "in",
+            "on",
+            "with",
+            "using",
+            "via",
+            "browser",
+            "app",
+            "application",
+            "brave",
+            "chrome",
+            "edge",
+            "firefox",
+            "safari",
+        }
         if f"{site_name} /" in lowered:
             after = lowered.split(f"{site_name} /", 1)[1]
             candidate = after.strip().replace(" ", "")
             if candidate in {"website", "site", "homepage", "home", "page", "app", "application"}:
+                return ""
+            if candidate in noise_tokens:
                 return ""
             return candidate
         match = re.search(rf"{site_name}\s+([a-z0-9_./@-]+)$", lowered)
@@ -4338,11 +4357,16 @@ $devices | ConvertTo-Json -Depth 4 -Compress
             candidate = match.group(1).strip().lstrip("/")
             if candidate in {"website", "site", "homepage", "home", "page", "app", "application"}:
                 return ""
+            if candidate in noise_tokens:
+                return ""
             return candidate
         if site_name == "github":
             match = re.search(r"\bgithub(?:\s+slash)?\s+([a-z0-9_.-]+)", lowered)
             if match:
-                return match.group(1).strip()
+                candidate = match.group(1).strip()
+                if candidate in noise_tokens:
+                    return ""
+                return candidate
         if site_name == "youtube":
             match = re.search(r"\bopen\s+([a-z0-9_.-]+)\s+youtube", lowered)
             if match:

@@ -634,7 +634,7 @@
                                     <Setter Property="Background" Value="#1F2431"/>
                                     <Setter Property="Foreground" Value="{StaticResource TextSecondaryBrush}"/>
                                     <Style.Triggers>
-                                        <DataTrigger Binding="{Binding IsListening}" Value="True">
+                                        <DataTrigger Binding="{Binding IsRecording}" Value="True">
                                             <Setter Property="Background" Value="{StaticResource AccentBrush}"/>
                                             <Setter Property="Foreground" Value="#0B1118"/>
                                         </DataTrigger>
@@ -649,7 +649,7 @@
                                     <TextBlock.Style>
                                         <Style TargetType="TextBlock">
                                             <Style.Triggers>
-                                                <DataTrigger Binding="{Binding IsListening}" Value="True">
+                                                <DataTrigger Binding="{Binding IsRecording}" Value="True">
                                                     <Setter Property="Visibility" Value="Collapsed"/>
                                                 </DataTrigger>
                                             </Style.Triggers>
@@ -664,7 +664,7 @@
                                     <StackPanel.Style>
                                         <Style TargetType="StackPanel">
                                             <Style.Triggers>
-                                                <DataTrigger Binding="{Binding IsListening}" Value="True">
+                                                <DataTrigger Binding="{Binding IsRecording}" Value="True">
                                                     <Setter Property="Visibility" Value="Visible"/>
                                                 </DataTrigger>
                                             </Style.Triggers>
