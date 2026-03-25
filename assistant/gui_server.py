@@ -1377,7 +1377,11 @@ class AssistantRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "No text provided."}, status=400)
                 return
             try:
-                self.runtime.tts.speak(str(text), replace=True, interrupt=True)
+                fast = bool(data.get("fast") or data.get("prefer_local"))
+                if fast:
+                    self.runtime.tts.speak_fast(str(text), replace=True, interrupt=True)
+                else:
+                    self.runtime.tts.speak(str(text), replace=True, interrupt=True)
             except Exception as exc:
                 self._send_json({"error": str(exc)}, status=500)
                 return

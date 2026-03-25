@@ -132,11 +132,14 @@
     <Grid Margin="0">
         <Grid.ColumnDefinitions>
             <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="Auto"/>
             <ColumnDefinition Width="*"/>
         </Grid.ColumnDefinitions>
 
         <Border Grid.Column="0"
                 Width="260"
+                MinWidth="220"
+                MaxWidth="420"
                 Background="#10131A"
                 BorderBrush="{StaticResource CardBorderBrush}"
                 BorderThickness="0,0,1,0"
@@ -245,7 +248,17 @@
             </Grid>
         </Border>
 
-        <Grid Grid.Column="1" Margin="32">
+        <GridSplitter Grid.Column="1"
+                      Width="6"
+                      Background="#0F141D"
+                      HorizontalAlignment="Stretch"
+                      VerticalAlignment="Stretch"
+                      ResizeBehavior="PreviousAndNext"
+                      ResizeDirection="Columns"
+                      ShowsPreview="True"
+                      Visibility="{Binding IsMenuOpen, Converter={StaticResource BoolToVisibility}}"/>
+
+        <Grid Grid.Column="2" Margin="32">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
             <RowDefinition Height="*"/>
@@ -572,8 +585,23 @@
                         </ItemsControl.ItemTemplate>
                     </ItemsControl>
 
-                    <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,12,0,0" VerticalAlignment="Center">
-                        <Button x:Name="PinButton" Content="Pin" Width="60" Height="38" Click="Pin_Click" Style="{StaticResource AppButton}">
+                    <Grid Grid.Row="2" Margin="0,12,0,0" VerticalAlignment="Center">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="Auto"/>
+                        </Grid.ColumnDefinitions>
+                        <Button x:Name="PinButton"
+                                Grid.Column="0"
+                                Content="Pin"
+                                Width="60"
+                                Height="38"
+                                Click="Pin_Click"
+                                Style="{StaticResource AppButton}">
                             <Button.ContextMenu>
                                 <ContextMenu>
                                     <MenuItem Header="Pin File" Click="PinFile_Click"/>
@@ -583,6 +611,7 @@
                             </Button.ContextMenu>
                         </Button>
                         <ComboBox x:Name="ModelSelector"
+                                  Grid.Column="1"
                                   Width="160"
                                   Height="38"
                                   Margin="10,0,0,0"
@@ -591,6 +620,7 @@
                                   SelectedItem="{Binding SelectedModelOption}"
                                   DisplayMemberPath="Label"/>
                         <ComboBox x:Name="AccessSelector"
+                                  Grid.Column="2"
                                   Width="130"
                                   Height="38"
                                   Margin="10,0,0,0"
@@ -599,6 +629,7 @@
                                   SelectedItem="{Binding SelectedAccessOption}"
                                   DisplayMemberPath="Label"/>
                         <ComboBox x:Name="ModeSelector"
+                                  Grid.Column="3"
                                   Width="140"
                                   Height="38"
                                   Margin="10,0,0,0"
@@ -607,7 +638,8 @@
                                   SelectedItem="{Binding SelectedModeOption}"
                                   DisplayMemberPath="Label"/>
                         <TextBox x:Name="InputBox"
-                                 Width="430"
+                                 Grid.Column="4"
+                                 MinWidth="220"
                                  Height="46"
                                  Margin="10,0,0,0"
                                  VerticalContentAlignment="Center"
@@ -616,7 +648,8 @@
                                  TextChanged="InputBox_OnTextChanged"
                                  KeyDown="InputBox_OnKeyDown"
                                  Text=""/>
-                        <Button Content="Send"
+                        <Button Grid.Column="5"
+                                Content="Send"
                                 Width="90"
                                 Height="46"
                                 Margin="12,0,0,0"
@@ -625,7 +658,8 @@
                                 BorderThickness="0"
                                 Style="{StaticResource AppButton}"
                                 Click="Send_Click"/>
-                        <Button Width="80"
+                        <Button Grid.Column="6"
+                                Width="80"
                                 Height="46"
                                 Margin="12,0,0,0"
                                 Click="Mic_Click">
@@ -693,7 +727,7 @@
                                 </StackPanel>
                             </Grid>
                         </Button>
-                    </StackPanel>
+                    </Grid>
                 </Grid>
             </Border>
         </Grid>

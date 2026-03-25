@@ -138,9 +138,9 @@ public class AssistantClient
         }
     }
 
-    public async Task<bool> SpeakAsync(string text)
+    public async Task<bool> SpeakAsync(string text, bool fast = false)
     {
-        var payload = new Dictionary<string, object?> { ["text"] = text };
+        var payload = new Dictionary<string, object?> { ["text"] = text, ["fast"] = fast };
         var json = JsonSerializer.Serialize(payload);
         var response = await _http.PostAsync("/api/speak", new StringContent(json, Encoding.UTF8, "application/json"));
         return response.IsSuccessStatusCode;

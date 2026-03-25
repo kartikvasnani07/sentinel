@@ -435,7 +435,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             ScrollChatToEnd();
             _awaitingConfirmation = response.needs_confirmation;
             var shouldExit = response.ExitApp == true;
-            if (_voiceReplyEnabled && !_awaitingConfirmation && !_suppressVoiceForNextSend)
+            var shouldSpeak = (_voiceReplyEnabled || _wakeTriggeredSession)
+                && !_awaitingConfirmation
+                && !_suppressVoiceForNextSend;
+            if (shouldSpeak)
             {
                 await _client.SpeakAsync(response.response);
             }
@@ -527,7 +530,10 @@ public partial class MainWindow : Window, INotifyPropertyChanged
             }
         }
 
-        StatusText = status.CloudReady ? "Online" : "Bridge online (cloud not configured)";
+        if (!IsListening && !IsRecording && StatusText != "Generating")
+        {
+            StatusText = status.CloudReady ? "Online" : "Bridge online (cloud not configured)";
+        }
 
         _isLoadingSettings = true;
         try
@@ -1046,7 +1052,20 @@ public partial class MainWindow : Window, INotifyPropertyChanged
         {
             return;
         }
-        await SendTextAsync($"change voice model to {model}");
+        var payload = new Dictionary<string, object?>
+        {
+            ["voice_preset"] = model,
+        };
+        var ok = await _client.UpdateSettingsAsync(payload);
+        if (!ok)
+        {
+            Messages.Add(new ChatMessage("Could not update voice model (bridge offline).", false));
+            ScrollChatToEnd();
+            return;
+        }
+        await LoadVoicePresetsAsync();
+        Messages.Add(new ChatMessage($"Voice model set to {model}.", false));
+        ScrollChatToEnd();
     }
 
     private async void VoiceAuth_Toggled(object sender, RoutedEventArgs e)
@@ -1340,6 +1359,11 @@ public partial class MainWindow : Window, INotifyPropertyChanged
     {
         StartWakeAnimationPulse();
         var ack = WakeReplies[_random.Next(WakeReplies.Length)];
+        StatusText = "Listening";
+        IsListening = true;
+        IsRecording = false;
+        MicButtonText = "Mic";
+        _suppressVoiceForNextSend = false;
         _ = SpeakWakeAckAsync(ack);
         _ = StartServerTranscriptionAsync(sendDirectly: true, fromWake: true);
     }

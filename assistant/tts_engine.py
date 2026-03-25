@@ -204,7 +204,21 @@ class TTSEngine:
         if do_replace:
             self._drain_pending_queue()
 
-        self.queue.put(text)
+        self.queue.put({"text": text, "prefer_local": False})
+
+    def speak_fast(self, text, replace=False, interrupt=False):
+        text = (text or "").strip()
+        if not text:
+            return
+
+        do_replace = replace or self.low_latency_mode
+        do_interrupt = interrupt or (do_replace and self.interrupt_on_new_speech)
+        if do_interrupt:
+            self._interrupt_playback()
+        if do_replace:
+            self._drain_pending_queue()
+
+        self.queue.put({"text": text, "prefer_local": True})
 
     def wait_until_done(self, timeout=5.0):
         if timeout is None:
@@ -443,28 +457,53 @@ class TTSEngine:
 
     def _process_queue(self):
         while self.running:
-            text = self.queue.get()
-            if text is None:
+            item = self.queue.get()
+            if item is None:
                 self.queue.task_done()
                 break
+
+            if isinstance(item, dict):
+                text = str(item.get("text") or "").strip()
+                prefer_local = bool(item.get("prefer_local"))
+            else:
+                text = str(item or "").strip()
+                prefer_local = False
+            if not text:
+                self.queue.task_done()
+                continue
 
             self.stop_event.clear()
             self.speaking_event.set()
             try:
-                self._edge_speak(text)
+                if prefer_local:
+                    try:
+                        if self.is_linux:
+                            try:
+                                self._linux_cli_speak(text)
+                                return
+                            except Exception:
+                                pass
+                        self._local_speak(text)
+                    except Exception:
+                        try:
+                            self._piper_speak(text)
+                        except Exception:
+                            self._edge_speak(text)
+                else:
+                    self._edge_speak(text)
             except Exception as edge_error:
                 try:
                     self._piper_speak(text)
                 except Exception as piper_error:
                     self.piper_last_error = str(piper_error)
                     self.piper_disabled = True
-                    
+
                     # Condense the error message so it doesn't spam the terminal
                     p_err = str(piper_error).replace("\n", " ").strip()
                     if len(p_err) > 60:
                         p_err = p_err[:57] + "..."
                     print(f"  [TTS Fallback] Edge/Piper failed ({p_err}) -> Using Pyttsx3.")
-                    
+
                     try:
                         if self.is_linux:
                             try:
